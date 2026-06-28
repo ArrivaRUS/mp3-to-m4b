@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Группировка + нарезка</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased; min-height: 100vh; padding: 40px 24px; color: #EAF6FA;
+    display: flex; flex-wrap: wrap; gap: 40px; justify-content: center; align-items: flex-start;
+  }
+  .stage-label { width: 100%; text-align: center; color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; }
+  .col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .caption { color: #7e93a0; font-size: 12.5px; text-align: center; max-width: 440px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  /* ---- grouping dialog (sheet) ---- */
+  .sheet { width: 440px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 80% at 50% -8%, #14202A 0%, #0E1822 42%, #0a1018 70%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.08); box-shadow: 0 28px 70px -22px rgba(0,0,0,.85); }
+  .sheet-head { padding: 22px 24px 6px; text-align: center; }
+  .sheet-icon { width: 48px; height: 48px; border-radius: 13px; margin: 0 auto 14px;
+    background: rgba(34,181,224,.12); border: 1px solid rgba(34,181,224,.3); display: flex; align-items: center; justify-content: center; }
+  .sheet-head h2 { font-size: 18px; font-weight: 700; letter-spacing: -.3px; }
+  .sheet-head p { font-size: 12.5px; color: #7e93a0; margin-top: 6px; line-height: 1.45; }
+  .file-strip { margin: 14px 24px 0; padding: 10px 12px; border-radius: 10px; background: #0a1018; border: 1px solid rgba(255,255,255,.06);
+    font-size: 11.5px; color: #9fb2bd; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .file-chip { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 3px 8px; }
+  .file-more { color: #6E8390; }
+
+  .choices { padding: 16px 24px 6px; display: flex; flex-direction: column; gap: 10px; }
+  .choice { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); }
+  .choice.sel { border-color: rgba(34,181,224,.6); background: rgba(34,181,224,.1); box-shadow: inset 0 0 0 1px rgba(34,181,224,.3); }
+  .choice-ic { width: 42px; height: 42px; border-radius: 10px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+    background: rgba(34,181,224,.12); }
+  .choice.sel .choice-ic { background: rgba(34,181,224,.2); }
+  .choice-body { flex: 1 1 auto; }
+  .choice-title { font-size: 14px; font-weight: 700; color: #EAF6FA; }
+  .choice-sub { font-size: 12px; color: #7e93a0; margin-top: 2px; }
+  .choice-radio { width: 20px; height: 20px; border-radius: 50%; border: 2px solid rgba(255,255,255,.2); flex: 0 0 auto; position: relative; }
+  .choice.sel .choice-radio { border-color: #22B5E0; }
+  .choice.sel .choice-radio::after { content: ''; position: absolute; inset: 3px; border-radius: 50%; background: #22B5E0; }
+
+  .sheet-actions { padding: 14px 24px 20px; display: flex; gap: 10px; }
+  .btn-ghost { flex: 0 0 auto; padding: 11px 18px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+    color: #cfe0e7; font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btn-primary { flex: 1 1 auto; padding: 11px 18px; border-radius: 10px; border: none; cursor: pointer; font-family: inherit;
+    background: linear-gradient(135deg,#34E0D2 0%,#22B5E0 45%,#4A6BFF 100%); color: #06121a; font-size: 14px; font-weight: 700;
+    box-shadow: 0 10px 24px -8px rgba(34,181,224,.6); display: inline-flex; align-items: center; justify-content: center; gap: 7px; }
+
+  /* ---- split-enabled panel ---- */
+  .panel { width: 300px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 80% at 50% -6%, #14202A 0%, #0E1822 42%, #0a1018 70%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07); box-shadow: 0 20px 50px -20px rgba(0,0,0,.8); padding: 18px; }
+  .sec-cap { font-size: 9px; font-weight: 700; color: #6E8390; letter-spacing: 1.2px; margin-bottom: 8px; }
+  .split-row { display: flex; align-items: center; justify-content: space-between; }
+  .toggle { width: 40px; height: 23px; border-radius: 12px; background: rgba(255,255,255,.1); position: relative; cursor: pointer; flex: 0 0 auto; }
+  .toggle.on { background: linear-gradient(135deg,#22B5E0,#4A6BFF); }
+  .toggle i { position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+  .toggle.on i { left: 19px; }
+  .threshold { margin-top: 14px; }
+  .lbl { font-size: 11px; color: #7e93a0; margin-bottom: 6px; display: block; }
+  .slider { height: 6px; border-radius: 4px; background: rgba(255,255,255,.1); position: relative; }
+  .slider .fill { position:absolute; left:0; top:0; bottom:0; width: 55%; border-radius: 4px; background: linear-gradient(90deg,#22B5E0,#4A6BFF); }
+  .slider .knob { position: absolute; left: 55%; top: 50%; transform: translate(-50%,-50%); width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+  .thr-val { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; color: #7e93a0; font-variant-numeric: tabular-nums; }
+  .thr-val b { color: #EAF6FA; font-size: 13px; }
+  .split-preview { margin-top: 14px; padding: 12px 14px; border-radius: 11px; background: rgba(74,107,255,.08); border: 1px solid rgba(74,107,255,.2); }
+  .sp-big { font-size: 16px; font-weight: 700; color: #4A6BFF; font-variant-numeric: tabular-nums; }
+  .sp-parts { display: flex; gap: 6px; margin-top: 10px; }
+  .sp-part { flex: 1 1 0; height: 30px; border-radius: 7px; background: linear-gradient(135deg,#22B5E0,#4A6BFF); display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; color:#06121a; }
+  .sp-sub { font-size: 11px; color: #7e93a0; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="stage-label">ГРУППИРОВКА (S4) + НАРЕЗКА вкл (S3, правый блок)</div>
+
+<!-- grouping dialog -->
+<div class="col">
+<div class="sheet">
+  <div class="sheet-head">
+    <div class="sheet-icon">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#22B5E0" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+    </div>
+    <h2>Найдены отдельные файлы</h2>
+    <p>3 mp3 лежат прямо в корне папки.<br>Собрать их в одну книгу или по отдельности?</p>
+  </div>
+  <div class="file-strip">
+    <span class="file-chip mono">глава-1.mp3</span>
+    <span class="file-chip mono">глава-2.mp3</span>
+    <span class="file-chip mono">глава-3.mp3</span>
+  </div>
+  <div class="choices">
+    <div class="choice sel">
+      <div class="choice-ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#22B5E0" stroke-width="2"><path d="M3 5h6M3 10h6M3 15h6"/><path d="M13 10h8M17 6l4 4-4 4"/></svg></div>
+      <div class="choice-body"><div class="choice-title">Объединить в одну книгу</div><div class="choice-sub">3 главы → один .m4b</div></div>
+      <div class="choice-radio"></div>
+    </div>
+    <div class="choice">
+      <div class="choice-ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#22B5E0" stroke-width="2"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/></svg></div>
+      <div class="choice-body"><div class="choice-title">Собрать по отдельности</div><div class="choice-sub">3 отдельные книги по одному файлу</div></div>
+      <div class="choice-radio"></div>
+    </div>
+  </div>
+  <div class="sheet-actions">
+    <button class="btn-ghost">Отмена</button>
+    <button class="btn-primary">Продолжить <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#06121a" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+  </div>
+</div>
+<div class="caption">S4 · default — выбор «объединить» подсвечен по умолчанию (частый кейс плоского сборника). Загрузка: «Найдено N файлов…» при пакетном копировании; «Продолжить» disabled пока дочитывает.</div>
+</div>
+
+<!-- split enabled panel -->
+<div class="col">
+<div class="panel">
+  <div class="split-row">
+    <div><div class="sec-cap" style="margin:0;">НАРЕЗКА НА ЧАСТИ</div><div style="font-size:11px;color:#34E0D2;margin-top:3px;font-weight:600;">Включена</div></div>
+    <div class="toggle on"><i></i></div>
+  </div>
+  <div class="threshold">
+    <label class="lbl">Порог размера части</label>
+    <div class="slider"><div class="fill"></div><div class="knob"></div></div>
+    <div class="thr-val"><span>100 МБ</span><b>300 МБ</b><span>700 МБ</span></div>
+  </div>
+  <div class="split-preview">
+    <div class="sp-big">≈ 4 части по ~295 МБ</div>
+    <div class="sp-parts"><div class="sp-part">1</div><div class="sp-part">2</div><div class="sp-part">3</div><div class="sp-part">4</div></div>
+    <div class="sp-sub">Режем по границам глав (главу не делим). «Часть N из 4» в каждом файле.</div>
+  </div>
+</div>
+<div class="caption">S3 · нарезка <b>вкл</b> — предпросмотр «≈ N частей по ~X МБ». E17: если порог меньше главы — «части будут крупнее порога (минимум — глава)».</div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Setup (установка)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh; display: flex; flex-wrap: wrap; gap: 48px;
+    justify-content: center; align-items: flex-start; padding: 48px 24px; color: #EAF6FA;
+  }
+  .stage-label { width: 100%; text-align: center; color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; }
+  .col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .caption { color: #7e93a0; font-size: 12.5px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  /* ---- window shell (cold audio palette) ---- */
+  .win {
+    position: relative; width: 400px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% -10%, #14202A 0%, #0E1822 40%, #0a1018 66%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07);
+    box-shadow: 0 24px 60px -20px rgba(0,0,0,.8), 0 0 0 .5px rgba(255,255,255,.04);
+  }
+
+  /* ---- header ---- */
+  .hdr { display: flex; align-items: center; gap: 12px; padding: 18px 18px 14px; }
+  .app-icon {
+    position: relative; width: 40px; height: 40px; border-radius: 11px; flex: 0 0 auto; overflow: hidden;
+    background: radial-gradient(120% 120% at 50% 28%, #15212B 0%, #0C141C 60%, #070B10 100%);
+    box-shadow: 0 6px 16px -4px rgba(34,181,224,.45), inset 0 1px 0 rgba(255,255,255,.18);
+  }
+  .app-icon svg { display: block; }
+  .hdr-title { flex: 1 1 auto; min-width: 0; }
+  .hdr-title h1 { font-size: 17px; font-weight: 700; color: #EAF6FA; letter-spacing: -.2px; line-height: 1.1; }
+  .hdr-title p { font-size: 12px; color: #7e93a0; margin-top: 2px; }
+  .hdr-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  .icon-btn {
+    width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.06);
+  }
+
+  .card { background: #11161d; border: 1px solid rgba(255,255,255,.06); }
+  .hairline { height: 1px; background: rgba(255,255,255,.05); margin: 0 16px; }
+  .cap { font-size: 9px; font-weight: 700; color: #6E8390; letter-spacing: 1.2px; }
+
+  /* ---- welcome ---- */
+  .welcome { text-align: center; padding: 14px 28px 4px; }
+  .welcome h2 { font-size: 19px; font-weight: 700; color: #EAF6FA; letter-spacing: -.3px; }
+  .welcome p { font-size: 12.5px; color: #7e93a0; margin-top: 6px; line-height: 1.45; }
+
+  /* ---- wizard steps ---- */
+  .wizard { margin: 18px 14px 12px; border-radius: 16px; padding: 6px 0; }
+  .step { display: flex; align-items: flex-start; gap: 12px; padding: 15px 16px; }
+  .step-num {
+    width: 26px; height: 26px; flex: 0 0 auto; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+  }
+  .step-ok { background: rgba(52,224,210,.14); border: 1px solid rgba(52,224,210,.4); }
+  .step-bad { background: rgba(255,99,99,.13); border: 1px solid rgba(255,99,99,.4); color: #FF6B6B; }
+  .step-cur { background: rgba(34,181,224,.14); border: 1px solid rgba(34,181,224,.45); color: #22B5E0; }
+  .step-body { flex: 1 1 auto; min-width: 0; }
+  .step-title { font-size: 14px; color: #EAF6FA; font-weight: 600; margin-top: 3px; }
+  .step-ok-sub { font-size: 11.5px; color: #34E0D2; margin-top: 2px; }
+  .step-bad-sub { font-size: 11.5px; color: #FF8B8B; margin-top: 2px; }
+
+  .install-box {
+    margin-top: 9px; padding: 10px 12px; border-radius: 10px; background: #0a1018; border: 1px solid rgba(255,255,255,.07);
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .install-box .mono { font-size: 12px; color: #EAF6FA; }
+  .copy-btn { padding: 5px 9px; border-radius: 7px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+    color: #9fb2bd; font-size: 11px; font-weight: 600; font-family: inherit; cursor: pointer; flex: 0 0 auto; }
+  .recheck { margin-top: 9px; padding: 9px 13px; border-radius: 10px; border: 1px solid rgba(34,181,224,.4);
+    background: rgba(34,181,224,.12); color: #34E0D2; font-size: 12.5px; font-weight: 600; font-family: inherit; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 7px; }
+
+  .field { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+  .field-input {
+    flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 7px; padding: 9px 11px;
+    border-radius: 10px; background: #0a1018; border: 1px solid rgba(255,255,255,.08);
+  }
+  .field-input .mono { font-size: 11.5px; color: #EAF6FA; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .field-btn {
+    flex: 0 0 auto; padding: 9px 13px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.05); color: #EAF6FA; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
+  }
+
+  .step-disabled { opacity: .42; }
+
+  .footnote { display: flex; align-items: flex-start; gap: 8px; padding: 4px 20px 16px; }
+  .footnote div { font-size: 11px; color: #7e93a0; line-height: 1.45; }
+  .footnote svg { flex: 0 0 auto; margin-top: 1px; }
+
+  .footer { display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+    border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,11,16,.5); }
+  .foot-dot { width: 7px; height: 7px; border-radius: 50%; background: #34E0D2; box-shadow: 0 0 7px #34E0D2; flex: 0 0 auto; }
+  .foot-dot.off { background: #5a6b76; box-shadow: none; }
+  .foot-txt { font-size: 12px; color: #7e93a0; flex: 1 1 auto; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 9px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.05);
+    color: #EAF6FA; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btn[disabled] { opacity: .4; cursor: default; }
+  .credit { padding: 9px 16px 13px; text-align: center; font-size: 11px; color: #5a6b76; letter-spacing: .1px; }
+  .credit a { color: #5B9DF9; text-decoration: none; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="stage-label">SETUP · S1 — два состояния (нет движка / готово к работе)</div>
+
+<!-- ===== STATE A — нет ffmpeg (error / блок) ===== -->
+<div class="col">
+<div class="win">
+  <div class="hdr">
+    <div class="app-icon"><svg width="40" height="40" viewBox="0 0 40 40" id="ic"></svg></div>
+    <div class="hdr-title"><h1>mp3-to-m4b</h1><p>Сборка аудиокниг MP3 → M4B</p></div>
+    <div class="hdr-actions"><div class="icon-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M12 4v3M12 17v3M4 12h3M17 12h3M6.3 6.3l2.1 2.1M15.6 15.6l2.1 2.1M17.7 6.3l-2.1 2.1M8.4 15.6l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></div></div>
+  </div>
+
+  <div class="welcome">
+    <h2>Нужен движок ffmpeg</h2>
+    <p>Сборку .m4b делает ffmpeg. Установите его<br>одной командой и нажмите «Проверить снова».</p>
+  </div>
+
+  <div class="wizard card">
+    <div class="step">
+      <div class="step-num step-bad">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#FF6B6B" stroke-width="3"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </div>
+      <div class="step-body">
+        <div class="cap">ДВИЖОК</div>
+        <div class="step-title">ffmpeg не найден</div>
+        <div class="step-bad-sub">Без него сборка недоступна</div>
+        <div class="install-box">
+          <span class="mono">brew install ffmpeg</span>
+          <button class="copy-btn">Копировать</button>
+        </div>
+        <button class="recheck">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M21 12a9 9 0 11-2.6-6.4M21 4v5h-5"/></svg>
+          Проверить снова
+        </button>
+      </div>
+    </div>
+
+    <div class="hairline" style="margin:0 16px;"></div>
+
+    <div class="step step-disabled">
+      <div class="step-num" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:#7e93a0;">2</div>
+      <div class="step-body">
+        <div class="cap">ОТСЛЕЖИВАЕМАЯ ПАПКА</div>
+        <div class="step-title">Доступно после установки движка</div>
+        <div class="field">
+          <div class="field-input"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#5a6b76" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg><span class="mono" style="color:#7e93a0;">~/Desktop/mp3-to-m4b</span></div>
+          <button class="field-btn">Сменить…</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="foot-dot off"></span>
+    <span class="foot-txt">Ожидание движка</span>
+    <button class="btn" disabled><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7e93a0" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>Открыть папку</button>
+  </div>
+  <div class="credit">mp3-to-m4b 0.1.0 · by Alex Kovalev · <a href="#">GitHub</a></div>
+</div>
+<div class="caption">Состояние: <b>error</b> — нет ffmpeg (шаг 2 disabled)</div>
+</div>
+
+<!-- ===== STATE B — готово к работе (success) ===== -->
+<div class="col">
+<div class="win">
+  <div class="hdr">
+    <div class="app-icon"><svg width="40" height="40" viewBox="0 0 40 40" class="ic2"></svg></div>
+    <div class="hdr-title"><h1>mp3-to-m4b</h1><p>Сборка аудиокниг MP3 → M4B</p></div>
+    <div class="hdr-actions"><div class="icon-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M12 4v3M12 17v3M4 12h3M17 12h3M6.3 6.3l2.1 2.1M15.6 15.6l2.1 2.1M17.7 6.3l-2.1 2.1M8.4 15.6l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></div></div>
+  </div>
+
+  <div class="welcome">
+    <h2>Готово к работе</h2>
+    <p>Слежу за папкой ниже — кидайте в неё папку-сборник<br>с mp3, рядом появится .m4b с главами.</p>
+  </div>
+
+  <div class="wizard card">
+    <div class="step">
+      <div class="step-num step-ok"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg></div>
+      <div class="step-body">
+        <div class="cap">ДВИЖОК</div>
+        <div class="step-title">ffmpeg 7.1 найден</div>
+        <div class="step-ok-sub">Готов к сборке</div>
+      </div>
+    </div>
+
+    <div class="hairline" style="margin:0 16px;"></div>
+
+    <div class="step">
+      <div class="step-num step-ok"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg></div>
+      <div class="step-body">
+        <div class="cap">ОТСЛЕЖИВАЕМАЯ ПАПКА</div>
+        <div class="field">
+          <div class="field-input"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7e93a0" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg><span class="mono">~/Desktop/mp3-to-m4b</span></div>
+          <button class="field-btn">Сменить…</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7e93a0" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v.01M12 11v5"/></svg>
+    <div>При папке в Desktop / Documents может понадобиться разовый Full Disk Access.</div>
+  </div>
+
+  <div class="footer">
+    <span class="foot-dot"></span>
+    <span class="foot-txt">Отслеживание активно</span>
+    <button class="btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>Открыть папку</button>
+  </div>
+  <div class="credit">mp3-to-m4b 0.1.0 · by Alex Kovalev · <a href="#">GitHub</a></div>
+</div>
+<div class="caption">Состояние: <b>success</b> — оба шага зелёные</div>
+</div>
+
+<script>
+// App icon: book leaf + play (cold audio gradient), scaled into a 40x40 squircle.
+const ICON = `
+  <defs>
+    <linearGradient id="bp-audio" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%" stop-color="#34E0D2"/><stop offset="46%" stop-color="#22B5E0"/><stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(20,20)">
+    <path d="M0 -8.5 C-1.7 -9.7 -4 -10 -6.4 -9.6 C-7.4 -9.4 -8 -8.7 -8 -7.7 L-8 7.4 C-8 8.3 -7.3 8.9 -6.4 8.7 C-4 8.3 -1.7 8.6 0 9.8 Z" fill="url(#bp-audio)"/>
+    <path d="M0 -8.5 C1.7 -9.7 4 -10 6.4 -9.6 C7.4 -9.4 8 -8.7 8 -7.7 L8 7.4 C8 8.3 7.3 8.9 6.4 8.7 C4 8.3 1.7 8.6 0 9.8 Z" fill="url(#bp-audio)" opacity=".93"/>
+    <g stroke="#fff" stroke-opacity=".42" stroke-width="1.1" stroke-linecap="round"><line x1="-5.5" y1="-5.6" x2="-1.6" y2="-5.2"/><line x1="1.8" y1="-5.2" x2="5.6" y2="-5.6"/></g>
+    <path d="M-2 -2.6 L-2 4.4 L3.9 0.9 Z" fill="#EAFBFF"/>
+  </g>`;
+document.getElementById('ic').innerHTML = ICON;
+document.querySelectorAll('.ic2').forEach(s => s.innerHTML = ICON);
+</script>
+</body>
+</html>

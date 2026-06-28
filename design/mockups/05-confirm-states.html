@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Окно подтверждения: состояния</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased; min-height: 100vh; padding: 40px 24px; color: #EAF6FA;
+    display: flex; flex-direction: column; align-items: center; gap: 30px;
+  }
+  .stage-label { color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; text-align: center; }
+  .caption { color: #7e93a0; font-size: 12.5px; text-align: center; margin-top: 8px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .win {
+    width: 560px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 80% at 50% -6%, #14202A 0%, #0E1822 40%, #0a1018 66%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07); box-shadow: 0 24px 60px -22px rgba(0,0,0,.85);
+  }
+  .hdr { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .app-icon { width: 30px; height: 30px; border-radius: 8px; flex: 0 0 auto; overflow: hidden;
+    background: radial-gradient(120% 120% at 50% 28%, #15212B, #070B10); box-shadow: inset 0 1px 0 rgba(255,255,255,.18); }
+  .hdr h1 { font-size: 15px; font-weight: 700; flex: 1 1 auto; }
+  .hdr .sub { font-size: 11px; color: #7e93a0; }
+
+  .content { padding: 18px 20px; }
+  .row2 { display: grid; grid-template-columns: 1fr 200px; gap: 18px; align-items: start; }
+  .lbl { font-size: 11px; color: #7e93a0; margin-bottom: 5px; display: block; }
+  .inp { width: 100%; padding: 10px 12px; border-radius: 10px; background: #0a1018; border: 1px solid rgba(255,255,255,.1);
+    color: #EAF6FA; font-size: 14px; font-family: inherit; font-weight: 600; }
+  .inp.invalid { border-color: rgba(255,99,99,.55); box-shadow: 0 0 0 3px rgba(255,99,99,.12); }
+  .inp::placeholder { color: #4a5862; }
+  .inline-err { font-size: 11.5px; color: #FF8B8B; margin-top: 6px; display: flex; align-items: center; gap: 5px; }
+
+  .mini-cover { width: 100%; aspect-ratio: 1/1; border-radius: 10px; background: linear-gradient(135deg,#34E0D2,#22B5E0 50%,#4A6BFF);
+    position: relative; box-shadow: 0 6px 18px -6px rgba(0,0,0,.6); display:flex; flex-direction:column; justify-content:flex-end; padding:12px; }
+  .mini-cover .ct { font-size: 14px; font-weight: 800; color: #fff; text-shadow:0 2px 6px rgba(0,0,0,.4); }
+  .mini-cover .ca { font-size: 10px; color: rgba(255,255,255,.85); margin-top:2px; }
+
+  /* error banner */
+  .banner { display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-radius: 12px; margin-bottom: 16px;
+    background: rgba(255,99,99,.1); border: 1px solid rgba(255,99,99,.3); }
+  .banner.warn { background: rgba(255,180,84,.1); border-color: rgba(255,180,84,.3); }
+  .banner svg { flex: 0 0 auto; }
+  .banner .bt { flex: 1 1 auto; }
+  .banner .bt-title { font-size: 13px; font-weight: 700; color: #EAF6FA; }
+  .banner .bt-sub { font-size: 11.5px; color: #9fb2bd; margin-top: 2px; }
+  .banner-actions { display: flex; gap: 7px; flex: 0 0 auto; }
+  .bbtn { padding: 7px 12px; border-radius: 8px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: #EAF6FA; }
+  .bbtn.primary { border-color: rgba(255,99,99,.5); background: rgba(255,99,99,.16); color: #FFD0D0; }
+
+  /* converting progress */
+  .conv-wrap { padding: 8px 0 4px; }
+  .conv-title { font-size: 14px; font-weight: 700; color: #EAF6FA; display:flex; align-items:center; gap:8px; }
+  .conv-title .pulse { width: 8px; height: 8px; border-radius: 50%; background: #34E0D2; box-shadow: 0 0 8px #34E0D2; animation: pl 1.2s ease-in-out infinite; }
+  @keyframes pl { 0%,100%{opacity:1;} 50%{opacity:.35;} }
+  .conv-sub { font-size: 12px; color: #9fb2bd; margin-top: 4px; }
+  .progress-track { height: 8px; border-radius: 5px; background: rgba(255,255,255,.08); overflow: hidden; margin-top: 14px; }
+  .progress-fill { height: 100%; width: 58%; border-radius: 5px; background: linear-gradient(90deg,#34E0D2,#22B5E0 60%,#4A6BFF);
+    box-shadow: 0 0 12px rgba(34,181,224,.5); }
+  .conv-meta { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11.5px; color: #7e93a0; font-variant-numeric: tabular-nums; }
+  .conv-meta b { color: #EAF6FA; }
+
+  .actions { display: flex; align-items: center; gap: 10px; padding: 14px 20px; border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,11,16,.5); }
+  .spacer { margin-right: auto; }
+  .btn-ghost { padding: 10px 16px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+    color: #cfe0e7; font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btn-skip { color: #8a99a3; border-color: rgba(255,255,255,.08); }
+  .btn-cancel { color: #FFB0B0; border-color: rgba(255,99,99,.3); background: rgba(255,99,99,.1); }
+  .btn-primary { padding: 10px 22px; border-radius: 10px; border: none; cursor: pointer; font-family: inherit;
+    background: linear-gradient(135deg,#34E0D2 0%,#22B5E0 45%,#4A6BFF 100%); color: #06121a; font-size: 14px; font-weight: 700;
+    box-shadow: 0 10px 24px -8px rgba(34,181,224,.6); display: inline-flex; align-items: center; gap: 7px; }
+  .btn-primary[disabled] { background: rgba(255,255,255,.08); color: #5a6b76; box-shadow: none; cursor: default; }
+  .hint { font-size: 11.5px; color: #FF8B8B; margin-right: 12px; }
+</style>
+</head>
+<body>
+
+<!-- ===== STATE: disabled (empty title) ===== -->
+<div>
+  <div class="stage-label">S3 · СОСТОЯНИЕ — disabled («Собрать» при пустом названии)</div>
+  <div class="win" style="margin-top:12px;">
+    <div class="hdr"><div class="app-icon"><svg width="30" height="30" viewBox="0 0 40 40" class="ic"></svg></div><h1>Подтверждение книги</h1><span class="sub">1 из 1</span></div>
+    <div class="content">
+      <div class="row2">
+        <div>
+          <label class="lbl">Автор</label>
+          <input class="inp" style="font-weight:500;margin-bottom:14px;" value="Неизвестен" placeholder="Автор (необязательно)">
+          <label class="lbl">Название</label>
+          <input class="inp invalid" value="" placeholder="Введите название книги">
+          <div class="inline-err"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#FF8B8B" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>Название обязательно — из него получится имя файла .m4b</div>
+        </div>
+        <div>
+          <label class="lbl">Обложка</label>
+          <div class="mini-cover"><div class="ct">—</div><div class="ca">без названия</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <span class="spacer"></span>
+      <span class="hint">Введите название</span>
+      <button class="btn-ghost btn-skip">Пропустить</button>
+      <button class="btn-primary" disabled><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#5a6b76" stroke-width="2.4"><path d="M5 4l14 8-14 8z"/></svg>Собрать</button>
+    </div>
+  </div>
+  <div class="caption">Кнопка серая + подсказка; пустое название блокирует сборку (Acceptance F4).</div>
+</div>
+
+<!-- ===== STATE: converting (progress) ===== -->
+<div>
+  <div class="stage-label">S3 · СОСТОЯНИЕ — converting (идёт сборка)</div>
+  <div class="win" style="margin-top:12px;">
+    <div class="hdr"><div class="app-icon"><svg width="30" height="30" viewBox="0 0 40 40" class="ic"></svg></div><h1>Сборка книги</h1><span class="sub">Война и мир</span></div>
+    <div class="content">
+      <div class="row2">
+        <div class="conv-wrap">
+          <div class="conv-title"><span class="pulse"></span>Собираю .m4b…</div>
+          <div class="conv-sub">Глава <b style="color:#EAF6FA;">7</b> из 12 · кодирование AAC 192k</div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+          <div class="conv-meta"><span>Готово <b>7 / 12</b> глав</span><span>осталось ~2 мин</span></div>
+        </div>
+        <div>
+          <label class="lbl">Обложка</label>
+          <div class="mini-cover"><div class="ct">Война и мир</div><div class="ca">Лев Толстой</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <span class="spacer" style="font-size:11.5px;color:#7e93a0;">Поля заблокированы на время сборки</span>
+      <button class="btn-ghost btn-cancel"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#FFB0B0" stroke-width="2" style="vertical-align:-2px;margin-right:5px;"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Отмена</button>
+    </div>
+  </div>
+  <div class="caption">Прогресс по главам; «Отмена» (Should) гасит ffmpeg и удаляет temp → cancelled (исходники целы).</div>
+</div>
+
+<!-- ===== STATE: error — broken mp3 ===== -->
+<div>
+  <div class="stage-label">S3 · СОСТОЯНИЕ — error (битый mp3, E3)</div>
+  <div class="win" style="margin-top:12px;">
+    <div class="hdr"><div class="app-icon"><svg width="30" height="30" viewBox="0 0 40 40" class="ic"></svg></div><h1>Подтверждение книги</h1><span class="sub">1 из 2</span></div>
+    <div class="content">
+      <div class="banner warn">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFB454" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9l-8 14A2 2 0 004 21h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z"/></svg>
+        <div class="bt"><div class="bt-title">Файл «07.mp3» не читается</div><div class="bt-sub">Можно собрать книгу без этой главы (останется 11) или пропустить книгу.</div></div>
+        <div class="banner-actions">
+          <button class="bbtn">Пропустить книгу</button>
+          <button class="bbtn primary" style="border-color:rgba(255,180,84,.5);background:rgba(255,180,84,.16);color:#FFE3B8;">Собрать без неё</button>
+        </div>
+      </div>
+      <div class="row2">
+        <div>
+          <label class="lbl">Автор</label>
+          <input class="inp" style="font-weight:500;margin-bottom:14px;" value="Фёдор Достоевский">
+          <label class="lbl">Название</label>
+          <input class="inp" value="Идиот">
+        </div>
+        <div>
+          <label class="lbl">Обложка</label>
+          <div class="mini-cover" style="background:linear-gradient(160deg,#5b2a6e,#15102a);"><div class="ct">Идиот</div><div class="ca">Ф. Достоевский</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <span class="spacer"></span>
+      <button class="btn-ghost btn-skip">Пропустить</button>
+      <button class="btn-ghost">Позже в очередь</button>
+      <button class="btn-primary"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#06121a" stroke-width="2.4"><path d="M5 4l14 8-14 8z"/></svg>Собрать 11 глав</button>
+    </div>
+  </div>
+  <div class="caption">Баннер ошибки сверху + понятный выбор; остальное окно работает как обычно.</div>
+</div>
+
+<!-- ===== STATE: error — no disk space (during build) ===== -->
+<div>
+  <div class="stage-label">S3 · СОСТОЯНИЕ — error (нет места на диске, E5)</div>
+  <div class="win" style="margin-top:12px;">
+    <div class="hdr"><div class="app-icon"><svg width="30" height="30" viewBox="0 0 40 40" class="ic"></svg></div><h1>Сборка прервана</h1><span class="sub">Война и мир</span></div>
+    <div class="content">
+      <div class="banner">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FF6B6B" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg>
+        <div class="bt"><div class="bt-title">Не хватает места на диске</div><div class="bt-sub">Нужно ещё ~0.4 ГБ. Частичный файл удалён, исходники целы. Освободите место и повторите.</div></div>
+        <div class="banner-actions">
+          <button class="bbtn">Пропустить</button>
+          <button class="bbtn primary">Повторить</button>
+        </div>
+      </div>
+      <div class="row2">
+        <div>
+          <label class="lbl">Автор</label>
+          <input class="inp" style="font-weight:500;margin-bottom:14px;" value="Лев Толстой">
+          <label class="lbl">Название</label>
+          <input class="inp" value="Война и мир">
+        </div>
+        <div>
+          <label class="lbl">Обложка</label>
+          <div class="mini-cover"><div class="ct">Война и мир</div><div class="ca">Лев Толстой</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="actions">
+      <span class="spacer"></span>
+      <button class="btn-ghost btn-skip">Пропустить</button>
+      <button class="btn-primary"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#06121a" stroke-width="2.4"><path d="M21 12a9 9 0 11-2.6-6.4M21 4v5h-5"/></svg>Повторить</button>
+    </div>
+  </div>
+  <div class="caption">Атомарность: полу-.m4b не остаётся (I1/F7). Та же модель ошибки — в строке очереди S5.</div>
+</div>
+
+<script>
+const ICON = `
+  <defs><linearGradient id="bp-a" x1="14%" y1="8%" x2="86%" y2="96%">
+    <stop offset="0%" stop-color="#34E0D2"/><stop offset="46%" stop-color="#22B5E0"/><stop offset="100%" stop-color="#4A6BFF"/></linearGradient></defs>
+  <g transform="translate(20,20)">
+    <path d="M0 -8.5 C-1.7 -9.7 -4 -10 -6.4 -9.6 C-7.4 -9.4 -8 -8.7 -8 -7.7 L-8 7.4 C-8 8.3 -7.3 8.9 -6.4 8.7 C-4 8.3 -1.7 8.6 0 9.8 Z" fill="url(#bp-a)"/>
+    <path d="M0 -8.5 C1.7 -9.7 4 -10 6.4 -9.6 C7.4 -9.4 8 -8.7 8 -7.7 L8 7.4 C8 8.3 7.3 8.9 6.4 8.7 C4 8.3 1.7 8.6 0 9.8 Z" fill="url(#bp-a)" opacity=".93"/>
+    <g stroke="#fff" stroke-opacity=".42" stroke-width="1.1" stroke-linecap="round"><line x1="-5.5" y1="-5.6" x2="-1.6" y2="-5.2"/><line x1="1.8" y1="-5.2" x2="5.6" y2="-5.6"/></g>
+    <path d="M-2 -2.6 L-2 4.4 L3.9 0.9 Z" fill="#EAFBFF"/>
+  </g>`;
+document.querySelectorAll('.ic').forEach(s => s.innerHTML = ICON);
+</script>
+</body>
+</html>

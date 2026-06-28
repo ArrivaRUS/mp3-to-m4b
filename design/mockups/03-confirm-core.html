@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Окно подтверждения (ЯДРО, D4)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 40px 24px; color: #EAF6FA;
+  }
+  .stage-label { color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; text-align: center; }
+  .caption { color: #7e93a0; font-size: 12.5px; text-align: center; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .win {
+    position: relative; width: 640px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 70% at 50% -6%, #14202A 0%, #0E1822 38%, #0a1018 64%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07);
+    box-shadow: 0 30px 70px -22px rgba(0,0,0,.85), 0 0 0 .5px rgba(255,255,255,.04);
+  }
+
+  /* header */
+  .hdr { display: flex; align-items: center; gap: 12px; padding: 16px 20px 14px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .app-icon { position: relative; width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto; overflow: hidden;
+    background: radial-gradient(120% 120% at 50% 28%, #15212B 0%, #0C141C 60%, #070B10 100%);
+    box-shadow: 0 5px 14px -4px rgba(34,181,224,.45), inset 0 1px 0 rgba(255,255,255,.18); }
+  .hdr-title { flex: 1 1 auto; min-width: 0; }
+  .hdr-title h1 { font-size: 16px; font-weight: 700; color: #EAF6FA; letter-spacing: -.2px; }
+  .hdr-title p { font-size: 11px; color: #7e93a0; margin-top: 1px; }
+  .q-counter { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; border-radius: 8px;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.08); font-size: 12px; color: #9fb2bd; flex: 0 0 auto; }
+  .q-counter b { color: #EAF6FA; font-weight: 700; }
+
+  /* body 2 columns — grid items stretch to equal height; left is a flex column
+     so the chapter list can grow to fill the leftover space under the fields. */
+  .body { display: grid; grid-template-columns: 1fr 280px; gap: 0; align-items: stretch; }
+  .col-l { padding: 18px 18px 18px 20px; border-right: 1px solid rgba(255,255,255,.05); display: flex; flex-direction: column; }
+  .col-r { padding: 18px 20px 18px 18px; }
+  .sec-cap { font-size: 9px; font-weight: 700; color: #6E8390; letter-spacing: 1.2px; margin-bottom: 8px; }
+
+  /* fields */
+  .field-l { margin-bottom: 14px; }
+  .lbl { font-size: 11px; color: #7e93a0; margin-bottom: 5px; display: block; }
+  .inp { width: 100%; padding: 10px 12px; border-radius: 10px; background: #0a1018; border: 1px solid rgba(255,255,255,.1);
+    color: #EAF6FA; font-size: 14px; font-family: inherit; font-weight: 600; }
+  .inp:focus { outline: none; border-color: rgba(34,181,224,.55); box-shadow: 0 0 0 3px rgba(34,181,224,.14); }
+  .inp.author { font-weight: 500; }
+
+  /* chapters */
+  .ch-head { display: flex; align-items: baseline; justify-content: space-between; margin: 18px 0 8px; }
+  .ch-head .sec-cap { margin: 0; }
+  .ch-head .total { font-size: 11px; color: #7e93a0; }
+  /* grows to fill the left column so the bottom-left never sits empty; the right
+     column is the taller one, so the list stretches down to its level (12 chapters
+     fit without scroll). The max-height caps very-long lists into an internal
+     scroll instead of pushing the window unbounded — mirrors the native window's
+     screen-height cap + scrolling variable section. */
+  .ch-list { border-radius: 12px; background: #0c121a; border: 1px solid rgba(255,255,255,.06); overflow-y: auto;
+    flex: 1 1 auto; min-height: 180px; max-height: 470px; }
+  .ch { display: grid; grid-template-columns: 26px minmax(0,1fr) auto; align-items: center; gap: 10px; padding: 9px 12px;
+    border-bottom: 1px solid rgba(255,255,255,.04); }
+  .ch:last-child { border-bottom: none; }
+  .ch-n { font-size: 11px; color: #5a6b76; text-align: right; font-variant-numeric: tabular-nums; }
+  .ch-name { font-size: 13px; color: #EAF6FA; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ch-name:hover { color: #34E0D2; cursor: text; }
+  .ch-dur { font-size: 11.5px; color: #7e93a0; font-variant-numeric: tabular-nums; }
+
+  /* cover */
+  .cover-box { width: 100%; aspect-ratio: 1/1; border-radius: 12px; overflow: hidden; position: relative;
+    box-shadow: 0 8px 24px -8px rgba(0,0,0,.7); border: 1px solid rgba(255,255,255,.08); }
+  .cover-grad { width: 100%; height: 100%; background: linear-gradient(135deg,#34E0D2 0%,#22B5E0 48%,#4A6BFF 100%); position: relative; display: flex; flex-direction: column; justify-content: flex-end; padding: 16px; }
+  .cover-grad .ct { font-size: 18px; font-weight: 800; color: #fff; letter-spacing: -.3px; line-height: 1.1; text-shadow: 0 2px 8px rgba(0,0,0,.35); }
+  .cover-grad .ca { font-size: 12px; color: rgba(255,255,255,.85); margin-top: 4px; font-weight: 600; }
+  .cover-spine { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; background: linear-gradient(90deg, rgba(0,0,0,.32), rgba(255,255,255,.1), rgba(0,0,0,0)); }
+  .cover-badge { position: absolute; top: 10px; left: 10px; display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 9px; border-radius: 7px; background: rgba(52,224,210,.18); border: 1px solid rgba(52,224,210,.5); backdrop-filter: blur(8px); }
+  .cover-badge span { width: 5px; height: 5px; border-radius: 50%; background: #34E0D2; }
+  .cover-badge b { font-size: 10px; font-weight: 700; color: #EAFBFF; letter-spacing: .3px; }
+  .cover-actions { display: flex; gap: 7px; margin-top: 10px; }
+  .cv-btn { flex: 1 1 auto; padding: 8px; border-radius: 9px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+    color: #cfe0e7; font-size: 11.5px; font-weight: 600; font-family: inherit; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+
+  /* quality */
+  .block { margin-top: 18px; }
+  /* compact quality box — one dense cluster: bitrate row + channels/SR row */
+  .quality { border: 1px solid rgba(255,255,255,.08); border-radius: 12px; background: #0c121a; padding: 11px 12px 12px; }
+  .q-line { display: flex; align-items: center; gap: 9px; }
+  .q-line + .q-line { margin-top: 9px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.05); }
+  .q-name { font-size: 11px; color: #7e93a0; flex: 0 0 auto; width: 48px; }
+  .q-presets { display: flex; gap: 5px; flex: 1 1 auto; }
+  .q-presets .preset { flex: 1 1 0; padding: 6px 0; border-radius: 7px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.04);
+    color: #9fb2bd; font-size: 11.5px; font-weight: 600; font-family: inherit; cursor: pointer; font-variant-numeric: tabular-nums; text-align: center; }
+  .q-presets .preset.on { border-color: rgba(34,181,224,.6); background: rgba(34,181,224,.16); color: #EAF6FA; box-shadow: inset 0 0 0 1px rgba(34,181,224,.3); }
+  .seg { display: flex; border-radius: 7px; border: 1px solid rgba(255,255,255,.1); overflow: hidden; flex: 1 1 0; min-width: 0; }
+  .seg button { flex: 1 1 0; padding: 6px 2px; background: transparent; border: none; color: #9fb2bd; font-size: 11.5px; font-weight: 600; font-family: inherit; cursor: pointer; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .seg button.on { background: rgba(34,181,224,.16); color: #EAF6FA; }
+  .seg button + button { border-left: 1px solid rgba(255,255,255,.1); }
+  .q-sr { flex: 1 1 0; display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .q-suffix { font-size: 10.5px; color: #5a6b76; flex: 0 0 auto; }
+
+  /* split toggle */
+  .split-row { display: flex; align-items: center; justify-content: space-between; }
+  .toggle { width: 40px; height: 23px; border-radius: 12px; background: rgba(255,255,255,.1); position: relative; cursor: pointer; flex: 0 0 auto; }
+  .toggle.on { background: linear-gradient(135deg,#22B5E0,#4A6BFF); }
+  .toggle i { position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #fff; transition: .15s; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+  .toggle.on i { left: 19px; }
+  .split-preview { font-size: 11.5px; color: #7e93a0; margin-top: 8px; }
+
+  /* estimate */
+  .estimate { margin-top: 18px; padding: 12px 14px; border-radius: 11px; background: rgba(34,181,224,.07); border: 1px solid rgba(34,181,224,.18); }
+  .est-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #EAF6FA; }
+  .est-row .label { color: #7e93a0; font-size: 11px; }
+  .est-big { font-size: 17px; font-weight: 700; color: #34E0D2; font-variant-numeric: tabular-nums; }
+  .est-sub { font-size: 11px; color: #7e93a0; margin-top: 4px; }
+
+  /* footer actions */
+  .actions { display: flex; align-items: center; gap: 10px; padding: 14px 20px; border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,11,16,.5); }
+  .apply-all { font-size: 12px; color: #34E0D2; font-weight: 600; cursor: pointer; margin-right: auto; display: inline-flex; align-items: center; gap: 6px; }
+  .btn-ghost { padding: 10px 16px; border-radius: 10px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.05);
+    color: #cfe0e7; font-size: 13px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btn-skip { color: #8a99a3; border-color: rgba(255,255,255,.08); }
+  .btn-primary { padding: 10px 22px; border-radius: 10px; border: none; cursor: pointer; font-family: inherit;
+    background: linear-gradient(135deg,#34E0D2 0%,#22B5E0 45%,#4A6BFF 100%); color: #06121a; font-size: 14px; font-weight: 700;
+    box-shadow: 0 10px 24px -8px rgba(34,181,224,.6), inset 0 1px 0 rgba(255,255,255,.4); display: inline-flex; align-items: center; gap: 7px; }
+</style>
+</head>
+<body>
+<div class="stage-label">★ ОКНО ПОДТВЕРЖДЕНИЯ · S3 (ЯДРО, D4) — default / pending-confirm</div>
+
+<div class="win">
+  <!-- HEADER -->
+  <div class="hdr">
+    <div class="app-icon"><svg width="34" height="34" viewBox="0 0 40 40" class="ic"></svg></div>
+    <div class="hdr-title"><h1>Подтверждение книги</h1><p>Проверьте качество и обложку — сборка стартует только по «Собрать»</p></div>
+    <div class="q-counter"><b>1</b> из 3</div>
+  </div>
+
+  <!-- BODY -->
+  <div class="body">
+    <!-- LEFT: what -->
+    <div class="col-l">
+      <div class="sec-cap">КНИГА</div>
+      <div class="field-l">
+        <label class="lbl">Автор</label>
+        <input class="inp author" value="Лев Толстой">
+      </div>
+      <div class="field-l">
+        <label class="lbl">Название</label>
+        <input class="inp" value="Война и мир">
+      </div>
+
+      <div class="ch-head">
+        <div class="sec-cap">ГЛАВЫ</div>
+        <div class="total tnum">12 глав · ~14 ч 20 мин</div>
+      </div>
+      <div class="ch-list">
+        <div class="ch"><span class="ch-n">1</span><span class="ch-name">Глава первая</span><span class="ch-dur">1:12:40</span></div>
+        <div class="ch"><span class="ch-n">2</span><span class="ch-name">Глава вторая</span><span class="ch-dur">1:08:15</span></div>
+        <div class="ch"><span class="ch-n">3</span><span class="ch-name">Глава третья</span><span class="ch-dur">1:21:03</span></div>
+        <div class="ch"><span class="ch-n">4</span><span class="ch-name">Глава четвёртая</span><span class="ch-dur">1:05:51</span></div>
+        <div class="ch"><span class="ch-n">5</span><span class="ch-name">Глава пятая</span><span class="ch-dur">1:18:22</span></div>
+        <div class="ch"><span class="ch-n">6</span><span class="ch-name">Глава шестая</span><span class="ch-dur">1:02:44</span></div>
+        <div class="ch"><span class="ch-n">7</span><span class="ch-name">Глава седьмая</span><span class="ch-dur">1:11:09</span></div>
+        <div class="ch"><span class="ch-n">8</span><span class="ch-name">Глава восьмая</span><span class="ch-dur">1:09:58</span></div>
+        <div class="ch"><span class="ch-n">9</span><span class="ch-name">Глава девятая</span><span class="ch-dur">1:14:30</span></div>
+        <div class="ch"><span class="ch-n">10</span><span class="ch-name">Глава десятая</span><span class="ch-dur">1:07:12</span></div>
+        <div class="ch"><span class="ch-n">11</span><span class="ch-name">Глава одиннадцатая</span><span class="ch-dur">1:13:48</span></div>
+        <div class="ch"><span class="ch-n">12</span><span class="ch-name">Эпилог</span><span class="ch-dur">1:15:18</span></div>
+      </div>
+    </div>
+
+    <!-- RIGHT: how -->
+    <div class="col-r">
+      <div class="sec-cap">ОБЛОЖКА</div>
+      <div class="cover-box">
+        <div class="cover-grad">
+          <div class="cover-spine"></div>
+          <div class="cover-badge"><span></span><b>ИЗ ФАЙЛА</b></div>
+          <div class="ct">Война и мир</div>
+          <div class="ca">Лев Толстой</div>
+        </div>
+      </div>
+      <div class="cover-actions">
+        <button class="cv-btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#cfe0e7" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>Искать в сети</button>
+        <button class="cv-btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#cfe0e7" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>Заменить</button>
+      </div>
+
+      <div class="block">
+        <div class="sec-cap">КАЧЕСТВО</div>
+        <div class="quality">
+          <div class="q-line">
+            <span class="q-name">Битрейт</span>
+            <div class="q-presets">
+              <button class="preset">64</button>
+              <button class="preset">96</button>
+              <button class="preset">128</button>
+              <button class="preset on">192</button>
+              <button class="preset">256</button>
+            </div>
+          </div>
+          <div class="q-line">
+            <div class="seg"><button class="on">Стерео</button><button>Моно</button></div>
+            <div class="q-sr"><div class="seg"><button class="on">44.1</button><button>48</button></div><span class="q-suffix">кГц</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="block">
+        <div class="split-row">
+          <div><div class="sec-cap" style="margin:0;">НАРЕЗКА НА ЧАСТИ</div><div style="font-size:11px;color:#7e93a0;margin-top:3px;">Выключена — один файл</div></div>
+          <div class="toggle"><i></i></div>
+        </div>
+      </div>
+
+      <div class="estimate">
+        <div class="est-row"><span class="est-big">≈ 1.18 ГБ</span></div>
+        <div class="est-sub">14 ч 20 мин · 12 глав · один .m4b · AAC 192k стерео</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ACTIONS -->
+  <div class="actions">
+    <span class="apply-all"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>Применить параметры ко всем (3)</span>
+    <button class="btn-ghost btn-skip">Пропустить</button>
+    <button class="btn-ghost">Позже в очередь</button>
+    <button class="btn-primary"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#06121a" stroke-width="2.4"><path d="M5 4l14 8-14 8z"/></svg>Собрать</button>
+  </div>
+</div>
+<div class="caption">Состояние: <b>default / pending-confirm</b> · обложка <b>from-mp3</b> («ИЗ ФАЙЛА») · «Собрать» активна</div>
+
+<script>
+const ICON = `
+  <defs><linearGradient id="bp-a" x1="14%" y1="8%" x2="86%" y2="96%">
+    <stop offset="0%" stop-color="#34E0D2"/><stop offset="46%" stop-color="#22B5E0"/><stop offset="100%" stop-color="#4A6BFF"/></linearGradient></defs>
+  <g transform="translate(20,20)">
+    <path d="M0 -8.5 C-1.7 -9.7 -4 -10 -6.4 -9.6 C-7.4 -9.4 -8 -8.7 -8 -7.7 L-8 7.4 C-8 8.3 -7.3 8.9 -6.4 8.7 C-4 8.3 -1.7 8.6 0 9.8 Z" fill="url(#bp-a)"/>
+    <path d="M0 -8.5 C1.7 -9.7 4 -10 6.4 -9.6 C7.4 -9.4 8 -8.7 8 -7.7 L8 7.4 C8 8.3 7.3 8.9 6.4 8.7 C4 8.3 1.7 8.6 0 9.8 Z" fill="url(#bp-a)" opacity=".93"/>
+    <g stroke="#fff" stroke-opacity=".42" stroke-width="1.1" stroke-linecap="round"><line x1="-5.5" y1="-5.6" x2="-1.6" y2="-5.2"/><line x1="1.8" y1="-5.2" x2="5.6" y2="-5.6"/></g>
+    <path d="M-2 -2.6 L-2 4.4 L3.9 0.9 Z" fill="#EAFBFF"/>
+  </g>`;
+document.querySelectorAll('.ic').forEach(s => s.innerHTML = ICON);
+</script>
+</body>
+</html>

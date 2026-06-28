@@ -1,0 +1,56 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon (small/optimised) — open book with play">
+  <!-- Simplified variant for 16–48 px (Dock at small zoom / favicon).
+       Same panel + book + play, but page lines removed and the book + play scaled up
+       and bolder so the silhouette stays crisp when tiny. Use icon-app.svg at >=64 px. -->
+  <defs>
+    <radialGradient id="is-bg" cx="50%" cy="40%" r="92%">
+      <stop offset="0%"  stop-color="#15212B"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <linearGradient id="is-audio" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="46%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="is-audio2" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%"  stop-color="#2BC8C6"/>
+      <stop offset="46%" stop-color="#1EA6D2"/>
+      <stop offset="100%" stop-color="#3F5DF0"/>
+    </linearGradient>
+    <linearGradient id="is-play" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"  stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DDFBFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- full-bleed dark panel (opaque corners) -->
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#is-bg)"/>
+
+  <!-- BOOK scaled ~1.18x about centre; bolder, no page lines -->
+  <g transform="matrix(1.18,0,0,1.18,-92.16,-92.16)">
+    <!-- left leaf -->
+    <path d="M512 318
+             C 466 282, 404 272, 344 282
+             C 318 286, 304 306, 304 332
+             L 304 706
+             C 304 730, 324 745, 348 740
+             C 404 730, 466 738, 512 772
+             Z" fill="url(#is-audio)"/>
+    <!-- right leaf -->
+    <path d="M512 318
+             C 558 282, 620 272, 680 282
+             C 706 286, 720 306, 720 332
+             L 720 706
+             C 720 730, 700 745, 676 740
+             C 620 730, 558 738, 512 772
+             Z" fill="url(#is-audio2)"/>
+    <!-- spine seam -->
+    <rect x="507" y="318" width="10" height="448" rx="5" fill="#0A0F16" opacity="0.4"/>
+
+    <!-- bigger dark disc + play for small-size clarity -->
+    <circle cx="512" cy="548" r="128" fill="#0B1118" opacity="0.6"/>
+    <path d="M466 478 L466 618 L590 548 Z" fill="url(#is-play)"/>
+  </g>
+</svg>

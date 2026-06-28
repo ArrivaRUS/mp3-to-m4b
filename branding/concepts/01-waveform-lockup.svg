@@ -1,0 +1,49 @@
+<svg width="860" height="220" viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b wordmark — waveform">
+  <defs>
+    <radialGradient id="wfl-bg" cx="50%" cy="42%" r="80%">
+      <stop offset="0%" stop-color="#0F1820"/>
+      <stop offset="100%" stop-color="#080C11"/>
+    </radialGradient>
+    <linearGradient id="wfl-audio" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="100%" stop-color="#22B5E0"/>
+    </linearGradient>
+    <linearGradient id="wfl-m4b" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="wfl-mini" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#5BF0E2"/>
+      <stop offset="100%" stop-color="#2FC4F0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="220" rx="30" fill="url(#wfl-bg)"/>
+
+  <!-- mini mark: compact waveform (icon recap), left -->
+  <g transform="translate(40,62)" fill="url(#wfl-audio)">
+    <rect x="0"  y="38" width="14" height="24" rx="7"/>
+    <rect x="22" y="22" width="14" height="56" rx="7"/>
+    <rect x="44" y="6"  width="15" height="88" rx="7.5" fill="url(#wfl-mini)"/>
+    <rect x="67" y="20" width="14" height="60" rx="7"/>
+    <rect x="89" y="34" width="14" height="32" rx="7"/>
+  </g>
+
+  <!-- text: SF Pro / system sans, bold, tight tracking -->
+  <style>
+    .wm { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 700; }
+  </style>
+
+  <text x="178" y="128" class="wm" font-size="68" fill="#EAF6FA" letter-spacing="-2">mp3</text>
+
+  <!-- arrow: morph from mp3 to m4b -->
+  <g>
+    <path d="M356 94 L408 94" stroke="url(#wfl-audio)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M396 80 L414 94 L396 108" stroke="url(#wfl-audio)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+
+  <text x="436" y="128" class="wm" font-size="68" fill="url(#wfl-m4b)" letter-spacing="-2">m4b</text>
+
+  <!-- caps micro-label with tracking (latin, ASCII-safe) -->
+  <text x="180" y="168" class="wm" font-size="15" fill="#6E8390" letter-spacing="6" font-weight="600">MP3 &#8594; M4B AUDIOBOOK BUILDER</text>
+</svg>

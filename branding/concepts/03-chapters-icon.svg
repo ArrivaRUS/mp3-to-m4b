@@ -1,0 +1,68 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon — chapters merging into one book">
+  <defs>
+    <radialGradient id="ch-bg" cx="50%" cy="38%" r="92%">
+      <stop offset="0%"  stop-color="#14202A"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <radialGradient id="ch-edgeglow" cx="52%" cy="52%" r="62%">
+      <stop offset="60%" stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#136B86" stop-opacity="0.48"/>
+    </radialGradient>
+
+    <linearGradient id="ch-audio" x1="10%" y1="10%" x2="92%" y2="92%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="50%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="ch-spine" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"  stop-color="#5BF0E2"/>
+      <stop offset="100%" stop-color="#3D7BFF"/>
+    </linearGradient>
+
+    <filter id="ch-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="ch-softshadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="12" stdDeviation="20" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#ch-bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#ch-edgeglow)"/>
+  <path d="M512 96 C 180 96, 60 300, 60 540 C 60 360, 180 200, 512 200 C 844 200, 964 360, 964 540 C 964 300, 844 96, 512 96 Z"
+        fill="#FFFFFF" opacity="0.05"/>
+
+  <ellipse cx="512" cy="512" rx="360" ry="300" fill="#1FB8D8" opacity="0.26" filter="url(#ch-glow)"/>
+  <ellipse cx="640" cy="540" rx="180" ry="220" fill="#4A6BFF" opacity="0.20" filter="url(#ch-glow)"/>
+
+  <!-- SYMBOL: left column of chapter segments (separate mp3s) merge into one tall book-spine on the right -->
+  <g filter="url(#ch-softshadow)">
+    <!-- chapter segments (stacked, separated) -->
+    <g fill="url(#ch-audio)">
+      <rect x="276" y="300" width="200" height="78" rx="24"/>
+      <rect x="276" y="396" width="200" height="78" rx="24"/>
+      <rect x="276" y="492" width="200" height="78" rx="24"/>
+      <rect x="276" y="588" width="200" height="78" rx="24"/>
+      <rect x="276" y="684" width="200" height="78" rx="24"/>
+    </g>
+    <!-- connectors hinting the merge -->
+    <g fill="#34E0D2" opacity="0.55">
+      <rect x="476" y="330" width="64" height="18" rx="9"/>
+      <rect x="476" y="426" width="64" height="18" rx="9"/>
+      <rect x="476" y="522" width="64" height="18" rx="9"/>
+      <rect x="476" y="618" width="64" height="18" rx="9"/>
+      <rect x="476" y="714" width="64" height="18" rx="9"/>
+    </g>
+
+    <!-- the assembled book spine (one m4b) -->
+    <rect x="540" y="300" width="208" height="462" rx="30" fill="url(#ch-spine)"/>
+    <!-- spine inner sheen -->
+    <rect x="540" y="300" width="208" height="120" rx="30" fill="#FFFFFF" opacity="0.16"/>
+    <!-- play notch on the spine -->
+    <path d="M612 478 L612 584 L700 531 Z" fill="#0C141C" opacity="0.85"/>
+    <path d="M620 494 L620 568 L682 531 Z" fill="#EAFBFF"/>
+  </g>
+</svg>

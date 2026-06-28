@@ -1,0 +1,49 @@
+<svg width="860" height="220" viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b wordmark — chapters">
+  <defs>
+    <radialGradient id="chl-bg" cx="50%" cy="42%" r="80%">
+      <stop offset="0%" stop-color="#101A22"/>
+      <stop offset="100%" stop-color="#080C11"/>
+    </radialGradient>
+    <linearGradient id="chl-audio" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="100%" stop-color="#22B5E0"/>
+    </linearGradient>
+    <linearGradient id="chl-m4b" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="chl-spine" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#5BF0E2"/>
+      <stop offset="100%" stop-color="#3D7BFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="220" rx="30" fill="url(#chl-bg)"/>
+
+  <!-- mini mark: chapter segments + spine -->
+  <g transform="translate(40,58)">
+    <g fill="url(#chl-audio)">
+      <rect x="0" y="4"  width="46" height="18" rx="6"/>
+      <rect x="0" y="30" width="46" height="18" rx="6"/>
+      <rect x="0" y="56" width="46" height="18" rx="6"/>
+      <rect x="0" y="82" width="46" height="18" rx="6"/>
+    </g>
+    <rect x="58" y="4" width="46" height="96" rx="9" fill="url(#chl-spine)"/>
+    <path d="M74 36 L74 68 L98 52 Z" fill="#0E1820"/>
+  </g>
+
+  <style>
+    .wm { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 700; }
+  </style>
+
+  <text x="172" y="128" class="wm" font-size="68" fill="#EAF6FA" letter-spacing="-2">mp3</text>
+
+  <g>
+    <path d="M350 94 L402 94" stroke="url(#chl-audio)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M390 80 L408 94 L390 108" stroke="url(#chl-audio)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+
+  <text x="430" y="128" class="wm" font-size="68" fill="url(#chl-m4b)" letter-spacing="-2">m4b</text>
+
+  <text x="174" y="168" class="wm" font-size="15" fill="#6E8390" letter-spacing="6" font-weight="600">MP3 &#8594; M4B AUDIOBOOK BUILDER</text>
+</svg>

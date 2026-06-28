@@ -1,0 +1,40 @@
+<svg width="860" height="220" viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b wordmark — book with play">
+  <defs>
+    <radialGradient id="bpl-bg" cx="50%" cy="42%" r="80%">
+      <stop offset="0%" stop-color="#101A22"/>
+      <stop offset="100%" stop-color="#080C11"/>
+    </radialGradient>
+    <linearGradient id="bpl-audio" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="100%" stop-color="#22B5E0"/>
+    </linearGradient>
+    <linearGradient id="bpl-m4b" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="220" rx="30" fill="url(#bpl-bg)"/>
+
+  <!-- mini mark: small open book with play -->
+  <g transform="translate(40,66)">
+    <path d="M44 14 C 36 8, 24 6, 12 8 C 8 9, 6 13, 6 18 L 6 78 C 6 82, 9 85, 13 84 C 24 82, 36 86, 44 92 Z" fill="url(#bpl-audio)"/>
+    <path d="M44 14 C 52 8, 64 6, 76 8 C 80 9, 82 13, 82 18 L 82 78 C 82 82, 79 85, 75 84 C 64 82, 52 86, 44 92 Z" fill="url(#bpl-audio)" opacity="0.92"/>
+    <path d="M34 38 L34 66 L60 52 Z" fill="#EAFBFF"/>
+  </g>
+
+  <style>
+    .wm { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 700; }
+  </style>
+
+  <text x="166" y="128" class="wm" font-size="68" fill="#EAF6FA" letter-spacing="-2">mp3</text>
+
+  <g>
+    <path d="M344 94 L396 94" stroke="url(#bpl-audio)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M384 80 L402 94 L384 108" stroke="url(#bpl-audio)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+
+  <text x="424" y="128" class="wm" font-size="68" fill="url(#bpl-m4b)" letter-spacing="-2">m4b</text>
+
+  <text x="168" y="168" class="wm" font-size="15" fill="#6E8390" letter-spacing="6" font-weight="600">MP3 &#8594; M4B AUDIOBOOK BUILDER</text>
+</svg>

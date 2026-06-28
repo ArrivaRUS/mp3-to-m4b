@@ -1,0 +1,66 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon — waveform">
+  <defs>
+    <!-- deep dark panel base, indigo at edges (full-bleed, system rounds it on Tahoe) -->
+    <radialGradient id="wf-bg" cx="50%" cy="38%" r="92%">
+      <stop offset="0%"  stop-color="#14202A"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <radialGradient id="wf-edgeglow" cx="50%" cy="50%" r="62%">
+      <stop offset="60%" stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#0E6E86" stop-opacity="0.5"/>
+    </radialGradient>
+
+    <!-- signature audio gradient: cyan -> teal -> indigo -->
+    <linearGradient id="wf-audio" x1="12%" y1="6%" x2="88%" y2="96%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="42%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <!-- accent gradient for the tall center bar -->
+    <linearGradient id="wf-accent" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"  stop-color="#5BF0E2"/>
+      <stop offset="100%" stop-color="#2FC4F0"/>
+    </linearGradient>
+
+    <filter id="wf-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="22" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="wf-softshadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="12" stdDeviation="20" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- FULL-BLEED background: opaque dark corners guaranteed -->
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#wf-bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#wf-edgeglow)"/>
+  <!-- top inner highlight rim (kept inside the square) -->
+  <path d="M512 96 C 180 96, 60 300, 60 540 C 60 360, 180 200, 512 200 C 844 200, 964 360, 964 540 C 964 300, 844 96, 512 96 Z"
+        fill="#FFFFFF" opacity="0.05"/>
+
+  <!-- glow bloom behind symbol -->
+  <ellipse cx="512" cy="512" rx="380" ry="300" fill="#1FB8D8" opacity="0.28" filter="url(#wf-glow)"/>
+  <ellipse cx="600" cy="540" rx="220" ry="200" fill="#4A6BFF" opacity="0.20" filter="url(#wf-glow)"/>
+
+  <!-- SYMBOL: waveform — symmetric bars around the vertical center, solid rounded fills.
+       Heights chosen so the silhouette reads as audio and stays clear at small sizes. -->
+  <g filter="url(#wf-softshadow)">
+    <!-- side bars (audio gradient) -->
+    <g fill="url(#wf-audio)">
+      <rect x="232" y="452" width="64" height="120" rx="32"/>
+      <rect x="328" y="392" width="64" height="240" rx="32"/>
+      <rect x="424" y="316" width="64" height="392" rx="32"/>
+      <!-- center accent bar (tallest) -->
+      <rect x="520" y="280" width="68" height="464" rx="34" fill="url(#wf-accent)"/>
+      <rect x="620" y="356" width="64" height="312" rx="32"/>
+      <rect x="716" y="412" width="64" height="200" rx="32"/>
+    </g>
+    <!-- subtle inner sheen on center bar -->
+    <rect x="520" y="280" width="68" height="120" rx="34" fill="#FFFFFF" opacity="0.18"/>
+  </g>
+
+  <!-- baseline groove (suggests a playhead / track line) -->
+  <rect x="200" y="756" width="624" height="10" rx="5" fill="#FFFFFF" opacity="0.10"/>
+</svg>

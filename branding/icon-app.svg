@@ -1,0 +1,103 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon — open book with play (audiobook)">
+  <defs>
+    <!-- deep dark panel base, indigo at edges (full-bleed; system rounds corners on macOS) -->
+    <radialGradient id="ia-bg" cx="50%" cy="38%" r="92%">
+      <stop offset="0%"  stop-color="#15212B"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <radialGradient id="ia-edgeglow" cx="50%" cy="54%" r="60%">
+      <stop offset="60%" stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#136B86" stop-opacity="0.42"/>
+    </radialGradient>
+    <!-- subtle TOP-EDGE highlight (replaces the old crescent "eyebrow"): straight, fades fast -->
+    <linearGradient id="ia-toprim" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="14%"  stop-color="#FFFFFF" stop-opacity="0.03"/>
+      <stop offset="26%"  stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- signature audio gradient: cyan -> teal -> indigo -->
+    <linearGradient id="ia-audio" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="46%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <!-- right leaf slightly deeper for page depth -->
+    <linearGradient id="ia-audio2" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%"  stop-color="#2BC8C6"/>
+      <stop offset="46%" stop-color="#1EA6D2"/>
+      <stop offset="100%" stop-color="#3F5DF0"/>
+    </linearGradient>
+    <!-- bright play triangle -->
+    <linearGradient id="ia-play" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"  stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DDFBFF"/>
+    </linearGradient>
+
+    <!-- bloom glow for blooms only (large) -->
+    <filter id="ia-bloom" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <!-- tight glow for the play triangle (was 22 -> now 8, so it doesn't wash onto pages) -->
+    <filter id="ia-playglow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="ia-softshadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="14" stdDeviation="22" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- FULL-BLEED background: opaque dark corners guaranteed by the solid base rect -->
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#ia-bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#ia-edgeglow)"/>
+  <!-- straight top-edge sheen, no crescent -->
+  <rect x="0" y="0" width="1024" height="320" fill="url(#ia-toprim)"/>
+
+  <!-- glow blooms behind symbol (blur-only ellipses) -->
+  <ellipse cx="512" cy="520" rx="360" ry="320" fill="#1FB8D8" opacity="0.26" filter="url(#ia-bloom)"/>
+  <ellipse cx="600" cy="560" rx="200" ry="200" fill="#4A6BFF" opacity="0.20" filter="url(#ia-bloom)"/>
+
+  <!-- SYMBOL: open book leaf (family link) + play triangle rising from the spine -->
+  <g filter="url(#ia-softshadow)">
+    <!-- left leaf -->
+    <path d="M512 322
+             C 470 290, 410 280, 352 290
+             C 328 294, 314 312, 314 336
+             L 314 700
+             C 314 722, 332 736, 354 732
+             C 410 722, 470 730, 512 760
+             Z" fill="url(#ia-audio)"/>
+    <!-- right leaf -->
+    <path d="M512 322
+             C 554 290, 614 280, 672 290
+             C 696 294, 710 312, 710 336
+             L 710 700
+             C 710 722, 692 736, 670 732
+             C 614 722, 554 730, 512 760
+             Z" fill="url(#ia-audio2)"/>
+
+    <!-- spine seam -->
+    <rect x="508" y="322" width="8" height="430" rx="4" fill="#0A0F16" opacity="0.35"/>
+
+    <!-- page lines (left) — kept clear of the spine/play -->
+    <g stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="14" stroke-linecap="round">
+      <line x1="372" y1="392" x2="456" y2="399"/>
+      <line x1="372" y1="452" x2="452" y2="459"/>
+    </g>
+    <!-- page lines (right) — SHORTENED on the inner end so the play never overlaps them -->
+    <g stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="14" stroke-linecap="round">
+      <line x1="612" y1="395" x2="652" y2="391"/>
+      <line x1="612" y1="455" x2="652" y2="451"/>
+    </g>
+
+    <!-- dark backing disc so the play reads as a separate element over the spine -->
+    <circle cx="512" cy="546" r="104" fill="#0B1118" opacity="0.55"/>
+    <!-- play triangle, centered on the spine, tighter glow -->
+    <g filter="url(#ia-playglow)">
+      <path d="M474 482 L474 610 L586 546 Z" fill="url(#ia-play)"/>
+    </g>
+  </g>
+</svg>

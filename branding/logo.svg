@@ -1,0 +1,71 @@
+<svg width="880" height="220" viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b — open book with play, wordmark">
+  <defs>
+    <radialGradient id="lg-bg" cx="50%" cy="42%" r="82%">
+      <stop offset="0%" stop-color="#101A22"/>
+      <stop offset="100%" stop-color="#080C11"/>
+    </radialGradient>
+    <!-- mark gradients -->
+    <linearGradient id="lg-audio" x1="10%" y1="6%" x2="90%" y2="96%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="46%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="lg-audio2" x1="10%" y1="6%" x2="90%" y2="96%">
+      <stop offset="0%"  stop-color="#2BC8C6"/>
+      <stop offset="46%" stop-color="#1EA6D2"/>
+      <stop offset="100%" stop-color="#3F5DF0"/>
+    </linearGradient>
+    <!-- wordmark m4b gradient (teal -> indigo, mirrors family two-tone) -->
+    <linearGradient id="lg-m4b" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="lg-arrow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#34E0D2"/>
+      <stop offset="100%" stop-color="#22B5E0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="880" height="220" rx="30" fill="url(#lg-bg)"/>
+
+  <!-- MARK: compact open book + play (recap of icon-app symbol), left, on a rounded tile -->
+  <g transform="translate(36,46)">
+    <rect x="0" y="0" width="128" height="128" rx="30" fill="#0E1A22"/>
+    <g transform="translate(64,64) scale(0.95) translate(-64,-64)">
+      <!-- left leaf -->
+      <path d="M64 28 C 56 22, 42 20, 28 22 C 24 22.6, 21 25, 21 28.5 L 21 92
+               C 21 95.5, 24 98, 27.6 97.4 C 41 95, 55 96.6, 64 102 Z" fill="url(#lg-audio)"/>
+      <!-- right leaf -->
+      <path d="M64 28 C 72 22, 86 20, 100 22 C 104 22.6, 107 25, 107 28.5 L 107 92
+               C 107 95.5, 104 98, 100.4 97.4 C 87 95, 73 96.6, 64 102 Z" fill="url(#lg-audio2)"/>
+      <!-- spine seam -->
+      <rect x="62.5" y="28" width="3" height="70" rx="1.5" fill="#0A0F16" opacity="0.35"/>
+      <!-- page lines -->
+      <g stroke="#FFFFFF" stroke-opacity="0.40" stroke-width="3.4" stroke-linecap="round">
+        <line x1="33" y1="40" x2="49" y2="41.4"/>
+        <line x1="79" y1="41.4" x2="95" y2="40"/>
+      </g>
+      <!-- dark disc + play -->
+      <circle cx="64" cy="64" r="20" fill="#0B1118" opacity="0.55"/>
+      <path d="M56 53 L56 75 L75 64 Z" fill="#EAFBFF"/>
+    </g>
+  </g>
+
+  <!-- text: SF Pro Display / system sans, bold, tight tracking -->
+  <style>
+    .wm { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 700; }
+  </style>
+
+  <text x="196" y="126" class="wm" font-size="70" fill="#EAF6FA" letter-spacing="-2">mp3</text>
+
+  <!-- morph arrow mp3 -> m4b -->
+  <g>
+    <path d="M380 92 L432 92" stroke="url(#lg-arrow)" stroke-width="10" stroke-linecap="round"/>
+    <path d="M420 78 L438 92 L420 106" stroke="url(#lg-arrow)" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+
+  <text x="460" y="126" class="wm" font-size="70" fill="url(#lg-m4b)" letter-spacing="-2">m4b</text>
+
+  <!-- caps micro-label (latin, ASCII-safe) -->
+  <text x="198" y="166" class="wm" font-size="15" fill="#6E8390" letter-spacing="6" font-weight="600">MP3 &#8594; M4B AUDIOBOOK BUILDER</text>
+</svg>

@@ -1,0 +1,74 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon — M4B monogram">
+  <defs>
+    <radialGradient id="mg-bg" cx="50%" cy="38%" r="92%">
+      <stop offset="0%"  stop-color="#15212B"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <radialGradient id="mg-edgeglow" cx="50%" cy="52%" r="62%">
+      <stop offset="60%" stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#136B86" stop-opacity="0.5"/>
+    </radialGradient>
+
+    <linearGradient id="mg-audio" x1="14%" y1="10%" x2="86%" y2="92%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="48%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <linearGradient id="mg-wave" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+
+    <filter id="mg-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="20" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="mg-softshadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="14" stdDeviation="22" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#mg-bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#mg-edgeglow)"/>
+  <path d="M512 96 C 180 96, 60 300, 60 540 C 60 360, 180 200, 512 200 C 844 200, 964 360, 964 540 C 964 300, 844 96, 512 96 Z"
+        fill="#FFFFFF" opacity="0.05"/>
+
+  <ellipse cx="512" cy="486" rx="360" ry="300" fill="#1FB8D8" opacity="0.26" filter="url(#mg-glow)"/>
+  <ellipse cx="600" cy="520" rx="200" ry="200" fill="#4A6BFF" opacity="0.20" filter="url(#mg-glow)"/>
+
+  <!-- SYMBOL: bold "4" monogram (solid, geometric) with a play triangle carved into the counter -->
+  <g filter="url(#mg-softshadow)">
+    <!-- the "4": diagonal stem + vertical stem + crossbar, drawn as one solid shape -->
+    <path d="M560 250
+             L660 250
+             L660 690
+             L560 690
+             L560 560
+             L300 560
+             L300 470
+             L520 250
+             Z
+             M560 470
+             L560 360
+             L450 470
+             Z"
+          fill="url(#mg-audio)" fill-rule="evenodd"/>
+
+    <!-- play triangle nested in the open counter (upper-left triangular space of the 4) -->
+    <path d="M408 432 L408 510 L474 471 Z" fill="#EAFBFF" filter="url(#mg-glow)"/>
+  </g>
+
+  <!-- waveform underline (audio signature, solid bars) -->
+  <g fill="url(#mg-wave)">
+    <rect x="316" y="742" width="26" height="40" rx="13"/>
+    <rect x="362" y="722" width="26" height="80" rx="13"/>
+    <rect x="408" y="700" width="26" height="124" rx="13"/>
+    <rect x="454" y="730" width="26" height="64" rx="13"/>
+    <rect x="500" y="712" width="26" height="100" rx="13"/>
+    <rect x="546" y="734" width="26" height="56" rx="13"/>
+    <rect x="592" y="720" width="26" height="84" rx="13"/>
+    <rect x="638" y="744" width="26" height="36" rx="13"/>
+  </g>
+</svg>

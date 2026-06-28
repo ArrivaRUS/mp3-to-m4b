@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Status (статус)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh; display: flex; flex-wrap: wrap; gap: 48px;
+    justify-content: center; align-items: flex-start; padding: 48px 24px; color: #EAF6FA;
+  }
+  .stage-label { width: 100%; text-align: center; color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; }
+  .col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .caption { color: #7e93a0; font-size: 12.5px; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .win {
+    position: relative; width: 400px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% -10%, #14202A 0%, #0E1822 40%, #0a1018 66%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07);
+    box-shadow: 0 24px 60px -20px rgba(0,0,0,.8), 0 0 0 .5px rgba(255,255,255,.04);
+  }
+
+  .hdr { display: flex; align-items: center; gap: 12px; padding: 18px 18px 14px; }
+  .app-icon { position: relative; width: 40px; height: 40px; border-radius: 11px; flex: 0 0 auto; overflow: hidden;
+    background: radial-gradient(120% 120% at 50% 28%, #15212B 0%, #0C141C 60%, #070B10 100%);
+    box-shadow: 0 6px 16px -4px rgba(34,181,224,.45), inset 0 1px 0 rgba(255,255,255,.18); }
+  .hdr-title { flex: 1 1 auto; min-width: 0; }
+  .hdr-title h1 { font-size: 17px; font-weight: 700; color: #EAF6FA; letter-spacing: -.2px; line-height: 1.1; }
+  .hdr-title p { font-size: 12px; color: #7e93a0; margin-top: 2px; }
+  .hdr-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  .icon-btn { width: 28px; height: 28px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.06); }
+
+  .card { background: #11161d; border: 1px solid rgba(255,255,255,.06); }
+  .hairline { height: 1px; background: rgba(255,255,255,.05); margin: 0 14px; }
+  .cap { font-size: 9px; font-weight: 700; color: #6E8390; letter-spacing: 1.2px; }
+
+  /* hero */
+  .hero { margin: 4px 14px 12px; padding: 18px; border-radius: 16px; box-shadow: inset 0 1px 0 rgba(255,255,255,.03); }
+  .hero-row { display: flex; align-items: center; gap: 18px; }
+  .ring-wrap { position: relative; width: 104px; height: 104px; flex: 0 0 auto; }
+  .ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 7px;
+    background: rgba(52,224,210,.12); border: 1px solid rgba(52,224,210,.28); }
+  .pill-dot { width: 6px; height: 6px; border-radius: 50%; background: #34E0D2; box-shadow: 0 0 6px #34E0D2; }
+  .pill-txt { font-size: 11px; font-weight: 700; color: #34E0D2; letter-spacing: .2px; }
+  .hero-path { font-size: 13px; color: #9fb2bd; margin-top: 10px; display: flex; align-items: center; gap: 6px; }
+  .hero-path .mono { font-size: 12px; color: #EAF6FA; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hero-metric { margin-top: 8px; font-size: 24px; font-weight: 700; color: #EAF6FA; letter-spacing: -.4px; line-height: 1; }
+  .hero-metric span { font-size: 13px; font-weight: 500; color: #7e93a0; }
+  .hero-sub { font-size: 11px; color: #7e93a0; margin-top: 6px; }
+  .hero-sub b { color: #9fb2bd; font-weight: 400; }
+
+  /* stat cards */
+  .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 0 14px 12px; }
+  .stat { padding: 11px 11px 12px; border-radius: 13px; }
+  .stat-val { font-size: 21px; font-weight: 700; margin-top: 5px; line-height: 1; }
+  .stat-sub { font-size: 9.5px; color: #6E8390; margin-top: 3px; }
+  .bar { margin-top: 8px; height: 3px; border-radius: 2px; background: rgba(255,255,255,.07); overflow: hidden; }
+  .bar > i { display: block; height: 100%; }
+
+  /* group rows */
+  .group { margin: 0 14px 12px; border-radius: 14px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 11px; padding: 12px 14px; }
+  .row-ic { width: 28px; height: 28px; border-radius: 8px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; }
+  .row-label { flex: 1 1 auto; min-width: 0; font-size: 13px; color: #EAF6FA; }
+  .row-sub { font-size: 11px; color: #7e93a0; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .link { font-size: 12px; font-weight: 600; color: #34E0D2; flex: 0 0 auto; }
+  .badge-ok { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 7px;
+    background: rgba(52,224,210,.12); border: 1px solid rgba(52,224,210,.28); }
+  .badge-ok span { width: 5px; height: 5px; border-radius: 50%; background: #34E0D2; }
+  .badge-ok b { font-size: 11px; font-weight: 600; color: #34E0D2; }
+  .count-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px;
+    background: linear-gradient(135deg, #22B5E0, #4A6BFF); color: #fff; font-size: 11px; font-weight: 700; flex: 0 0 auto; }
+  .chev { flex: 0 0 auto; margin-left: 2px; }
+
+  /* details list (recent books) */
+  .details { margin: 0 14px 12px; border-radius: 14px; padding: 13px 14px 8px; }
+  .details-hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .clear-btn { display: inline-flex; align-items: center; gap: 3px; padding: 1px 5px; border-radius: 6px;
+    border: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.03); color: #6E8390;
+    font-size: 9px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .book { display: grid; grid-template-columns: 22px minmax(0,1fr) auto; align-items: center; column-gap: 10px; padding: 8px 0;
+    border-bottom: 1px solid rgba(255,255,255,.045); }
+  .book:last-child { border-bottom: none; }
+  .book-cov { width: 22px; height: 22px; border-radius: 5px; flex: 0 0 auto; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.5); }
+  .book-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; font-size: 12px; color: #EAF6FA; }
+  .book-name small { color: #6E8390; font-size: 10.5px; margin-left: 6px; }
+  .book-time { color: #6E8390; text-align: right; font-size: 11px; }
+  .book.err .book-name { color: #8a99a3; }
+  .book .warn { color: #FFB454; }
+
+  .footer { display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+    border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,11,16,.5); }
+  .foot-dot { width: 7px; height: 7px; border-radius: 50%; background: #34E0D2; box-shadow: 0 0 7px #34E0D2; flex: 0 0 auto; }
+  .foot-txt { font-size: 12px; color: #7e93a0; flex: 1 1 auto; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 9px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.05);
+    color: #EAF6FA; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .btn-icon { width: 32px; height: 32px; border-radius: 9px; border: 1px solid rgba(255,255,255,.1);
+    background: rgba(255,255,255,.05); display: flex; align-items: center; justify-content: center; cursor: pointer; flex: 0 0 auto; }
+  .credit { padding: 9px 16px 13px; text-align: center; font-size: 11px; color: #5a6b76; letter-spacing: .1px; }
+  .credit a { color: #5B9DF9; text-decoration: none; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="stage-label">STATUS · S2 — «дом» приложения (есть пачка в работе)</div>
+
+<div class="col">
+<div class="win">
+  <!-- HEADER -->
+  <div class="hdr">
+    <div class="app-icon"><svg width="40" height="40" viewBox="0 0 40 40" class="ic"></svg></div>
+    <div class="hdr-title"><h1>mp3-to-m4b</h1><p>Сборка аудиокниг MP3 → M4B</p></div>
+    <div class="hdr-actions">
+      <div class="icon-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M12 4v3M12 17v3M4 12h3M17 12h3M6.3 6.3l2.1 2.1M15.6 15.6l2.1 2.1M17.7 6.3l-2.1 2.1M8.4 15.6l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></div>
+    </div>
+  </div>
+
+  <!-- HERO: progress ring + status -->
+  <div class="hero card">
+    <div class="hero-row">
+      <div class="ring-wrap">
+        <svg width="104" height="104" viewBox="0 0 104 104">
+          <defs><linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#34E0D2"/><stop offset="50%" stop-color="#22B5E0"/><stop offset="100%" stop-color="#4A6BFF"/>
+          </linearGradient></defs>
+          <circle cx="52" cy="52" r="44" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="8"/>
+          <!-- 2/3 batch (M/N) -->
+          <circle cx="52" cy="52" r="44" fill="none" stroke="url(#ringGrad)" stroke-width="8" stroke-linecap="round"
+            transform="rotate(-90 52 52)" stroke-dasharray="276.5" stroke-dashoffset="92" style="filter:drop-shadow(0 0 6px rgba(34,181,224,.5));"/>
+        </svg>
+        <div class="ring-center">
+          <div class="tnum" style="font-size:20px;font-weight:700;color:#34E0D2;">2/3</div>
+        </div>
+      </div>
+      <div style="flex:1 1 auto;min-width:0;">
+        <div class="pill"><span class="pill-dot"></span><span class="pill-txt">АКТИВНО</span></div>
+        <div class="hero-path">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#7e93a0" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+          <span class="mono">~/Desktop/mp3-to-m4b</span>
+        </div>
+        <div class="hero-metric tnum">142 <span>книги</span></div>
+        <div class="hero-sub">Сейчас: <b>Война и мир</b> · глава 7 из 12</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- STAT CARDS -->
+  <div class="stats">
+    <div class="stat card"><div class="cap">СОБРАНО</div><div class="stat-val tnum" style="color:#34E0D2;">142</div><div class="stat-sub">всего</div><div class="bar"><i style="width:100%;background:linear-gradient(90deg,#34E0D2,#22B5E0);"></i></div></div>
+    <div class="stat card"><div class="cap">ЗА СЕГОДНЯ</div><div class="stat-val tnum" style="color:#4A6BFF;">6</div><div class="stat-sub">книг</div><div class="bar"><i style="width:34%;background:linear-gradient(90deg,#22B5E0,#4A6BFF);"></i></div></div>
+    <div class="stat card"><div class="cap">FFMPEG</div><div class="stat-val tnum" style="color:#34E0D2;display:flex;align-items:center;gap:3px;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg>7.1</div><div class="stat-sub">движок</div><div class="bar"><i style="width:100%;background:linear-gradient(90deg,#1d9e96,#34E0D2);"></i></div></div>
+  </div>
+
+  <!-- GROUP ROWS -->
+  <div class="group card">
+    <div class="row">
+      <div class="row-ic" style="background:rgba(52,224,210,.12);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg></div>
+      <div class="row-label">Фоновый агент</div>
+      <div class="badge-ok"><span></span><b>Активен</b></div>
+    </div>
+    <div class="hairline"></div>
+    <div class="row">
+      <div class="row-ic" style="background:rgba(34,181,224,.12);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#22B5E0" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg></div>
+      <div style="flex:1 1 auto;min-width:0;">
+        <div class="row-label" style="flex:none;">Отслеживаемая папка</div>
+        <div class="row-sub mono">~/Desktop/mp3-to-m4b</div>
+      </div>
+      <span class="link">Сменить</span>
+    </div>
+    <div class="hairline"></div>
+    <div class="row">
+      <div class="row-ic" style="background:rgba(74,107,255,.12);"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#4A6BFF" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+      <div class="row-label">Очередь подтверждения</div>
+      <div class="count-badge">2</div>
+      <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#6E8390" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+    </div>
+  </div>
+
+  <!-- DETAILS: recent books -->
+  <div class="details card">
+    <div class="details-hd"><div class="cap">ПОСЛЕДНИЕ СОБРАННЫЕ КНИГИ</div>
+      <button class="clear-btn"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M9 7V5a1 1 0 011-1h4a1 1 0 011 1v2M6 7l1 13a1 1 0 001 1h8a1 1 0 001-1l1-13"/></svg>Очистить</button>
+    </div>
+    <div>
+      <div class="book"><span class="book-cov cov1"></span><span class="book-name">Анна Каренина.m4b <small>· 12 глав</small></span><span class="book-time tnum">12:04</span></div>
+      <div class="book"><span class="book-cov cov2"></span><span class="book-name">Мастер и Маргарита.m4b <small>· 2 части</small></span><span class="book-time tnum">11:40</span></div>
+      <div class="book"><span class="book-cov cov3"></span><span class="book-name">Преступление и наказание.m4b <small>· 8 глав</small></span><span class="book-time tnum">10:58</span></div>
+      <div class="book err"><span class="book-cov" style="background:rgba(255,180,84,.14);display:flex;align-items:center;justify-content:center;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#FFB454" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9l-8 14A2 2 0 004 21h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z"/></svg></span><span class="book-name">Идиот <small class="warn">· битый файл 03.mp3</small></span><span class="book-time tnum">10:11</span></div>
+      <div class="book"><span class="book-cov cov4"></span><span class="book-name">Отцы и дети.m4b <small>· 6 глав</small></span><span class="book-time tnum">09:20</span></div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <div class="footer">
+    <span class="foot-dot"></span>
+    <span class="foot-txt">Агент работает</span>
+    <button class="btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>Открыть папку</button>
+    <button class="btn-icon" aria-label="Настройки"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M12 4v3M12 17v3M4 12h3M17 12h3M6.3 6.3l2.1 2.1M15.6 15.6l2.1 2.1M17.7 6.3l-2.1 2.1M8.4 15.6l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></button>
+  </div>
+  <div class="credit">mp3-to-m4b 0.1.0 · by Alex Kovalev · <a href="#">GitHub</a></div>
+</div>
+<div class="caption">Состояние: <b>active</b> — пачка 2/3, есть ошибочная книга в истории</div>
+</div>
+
+<script>
+const ICON = `
+  <defs><linearGradient id="bp-a" x1="14%" y1="8%" x2="86%" y2="96%">
+    <stop offset="0%" stop-color="#34E0D2"/><stop offset="46%" stop-color="#22B5E0"/><stop offset="100%" stop-color="#4A6BFF"/></linearGradient></defs>
+  <g transform="translate(20,20)">
+    <path d="M0 -8.5 C-1.7 -9.7 -4 -10 -6.4 -9.6 C-7.4 -9.4 -8 -8.7 -8 -7.7 L-8 7.4 C-8 8.3 -7.3 8.9 -6.4 8.7 C-4 8.3 -1.7 8.6 0 9.8 Z" fill="url(#bp-a)"/>
+    <path d="M0 -8.5 C1.7 -9.7 4 -10 6.4 -9.6 C7.4 -9.4 8 -8.7 8 -7.7 L8 7.4 C8 8.3 7.3 8.9 6.4 8.7 C4 8.3 1.7 8.6 0 9.8 Z" fill="url(#bp-a)" opacity=".93"/>
+    <g stroke="#fff" stroke-opacity=".42" stroke-width="1.1" stroke-linecap="round"><line x1="-5.5" y1="-5.6" x2="-1.6" y2="-5.2"/><line x1="1.8" y1="-5.2" x2="5.6" y2="-5.6"/></g>
+    <path d="M-2 -2.6 L-2 4.4 L3.9 0.9 Z" fill="#EAFBFF"/>
+  </g>`;
+document.querySelectorAll('.ic').forEach(s => s.innerHTML = ICON);
+
+// mini covers (gradients echoing book covers)
+const grads = {
+  cov1: ['#3A2E6E','#241C44'], cov2: ['#6E2A3A','#3A1620'], cov3: ['#1D6E5A','#0C2E2A'], cov4: ['#2A3A6E','#16203A']
+};
+for (const [k,v] of Object.entries(grads)) {
+  document.querySelectorAll('.'+k).forEach(e => e.style.background = `linear-gradient(135deg, ${v[0]}, ${v[1]})`);
+}
+</script>
+</body>
+</html>

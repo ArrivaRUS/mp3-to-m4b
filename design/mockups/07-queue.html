@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mp3-to-m4b — Очередь (S5)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #050709;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased; min-height: 100vh; padding: 40px 24px; color: #EAF6FA;
+    display: flex; flex-wrap: wrap; gap: 40px; justify-content: center; align-items: flex-start;
+  }
+  .stage-label { width: 100%; text-align: center; color: #6E8390; font-size: 12px; letter-spacing: 2px; font-weight: 600; }
+  .col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .caption { color: #7e93a0; font-size: 12.5px; text-align: center; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .tnum { font-variant-numeric: tabular-nums; }
+
+  .win { width: 400px; border-radius: 16px; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% -10%, #14202A 0%, #0E1822 40%, #0a1018 66%, #070B10 100%);
+    border: 1px solid rgba(255,255,255,.07); box-shadow: 0 24px 60px -20px rgba(0,0,0,.8); }
+
+  /* header with back + batch progress */
+  .hdr { display: flex; align-items: center; gap: 11px; padding: 16px 18px 14px; }
+  .back-btn { width: 30px; height: 30px; border-radius: 8px; border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.05);
+    display: flex; align-items: center; justify-content: center; cursor: pointer; flex: 0 0 auto; }
+  .hdr-title { flex: 1 1 auto; }
+  .hdr-title h1 { font-size: 16px; font-weight: 700; }
+  .hdr-title p { font-size: 11px; color: #7e93a0; margin-top: 1px; }
+  .batch-chip { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 9px;
+    background: rgba(34,181,224,.1); border: 1px solid rgba(34,181,224,.25); flex: 0 0 auto; }
+  .batch-chip .ring { width: 16px; height: 16px; }
+  .batch-chip b { font-size: 12px; color: #EAF6FA; font-variant-numeric: tabular-nums; }
+
+  .sec { padding: 6px 14px 0; }
+  .sec-cap { font-size: 9px; font-weight: 700; color: #6E8390; letter-spacing: 1.2px; margin: 10px 4px 8px; display:flex; align-items:center; gap:6px; }
+  .sec-cap .n { background: rgba(255,255,255,.07); border-radius: 8px; padding: 1px 7px; color: #9fb2bd; }
+
+  .qrow { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border-radius: 12px;
+    background: #11161d; border: 1px solid rgba(255,255,255,.06); margin-bottom: 8px; }
+  .qcov { width: 38px; height: 38px; border-radius: 8px; flex: 0 0 auto; overflow: hidden; box-shadow: 0 2px 6px rgba(0,0,0,.5); position: relative; }
+  .qbody { flex: 1 1 auto; min-width: 0; }
+  .qtitle { font-size: 13px; font-weight: 600; color: #EAF6FA; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qsub { font-size: 11px; color: #7e93a0; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .qsub.err { color: #FFB454; }
+  .qsub.ok { color: #34E0D2; }
+  .qbtn { flex: 0 0 auto; padding: 7px 13px; border-radius: 9px; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer;
+    border: 1px solid rgba(34,181,224,.4); background: rgba(34,181,224,.14); color: #34E0D2; }
+  .qbtn.ghost { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.05); color: #cfe0e7; }
+  .qbtn.warn { border-color: rgba(255,180,84,.4); background: rgba(255,180,84,.12); color: #FFB454; }
+  .qprog { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+  .qprog .mini-track { width: 70px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .qprog .mini-fill { height: 100%; width: 58%; background: linear-gradient(90deg,#34E0D2,#4A6BFF); border-radius: 3px; }
+  .qprog .pct { font-size: 11px; color: #9fb2bd; font-variant-numeric: tabular-nums; }
+  .qstatus-ic { width: 26px; height: 26px; border-radius: 7px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; }
+
+  .confirm-all { margin: 2px 4px 10px; padding: 9px; border-radius: 10px; text-align: center; cursor: pointer;
+    border: 1px dashed rgba(34,181,224,.35); background: rgba(34,181,224,.06); color: #34E0D2; font-size: 12px; font-weight: 600; }
+
+  .footer { display: flex; align-items: center; gap: 10px; padding: 13px 16px; margin-top: 6px;
+    border-top: 1px solid rgba(255,255,255,.06); background: rgba(7,11,16,.5); }
+  .foot-dot { width: 7px; height: 7px; border-radius: 50%; background: #34E0D2; box-shadow: 0 0 7px #34E0D2; flex: 0 0 auto; }
+  .foot-txt { font-size: 12px; color: #7e93a0; flex: 1 1 auto; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 9px;
+    border: 1px solid rgba(255,255,255,.1); background: rgba(255,255,255,.05); color: #EAF6FA; font-size: 12px; font-weight: 600; font-family: inherit; cursor: pointer; }
+  .credit { padding: 9px 16px 13px; text-align: center; font-size: 11px; color: #5a6b76; }
+  .credit a { color: #5B9DF9; text-decoration: none; font-weight: 600; }
+
+  /* empty */
+  .empty { padding: 60px 30px; text-align: center; }
+  .empty-ic { width: 60px; height: 60px; border-radius: 16px; margin: 0 auto 18px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.07);
+    display: flex; align-items: center; justify-content: center; }
+  .empty h3 { font-size: 15px; font-weight: 600; color: #cfe0e7; }
+  .empty p { font-size: 12.5px; color: #7e93a0; margin-top: 8px; line-height: 1.45; }
+</style>
+</head>
+<body>
+<div class="stage-label">ОЧЕРЕДЬ · S5 — две секции (ожидает подтверждения / в работе) + empty</div>
+
+<!-- main queue with content -->
+<div class="col">
+<div class="win">
+  <div class="hdr">
+    <button class="back-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg></button>
+    <div class="hdr-title"><h1>Очередь</h1><p>Пачка из 5 книг</p></div>
+    <div class="batch-chip">
+      <svg class="ring" width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="rgba(255,255,255,.1)" stroke-width="2.4"/><circle cx="8" cy="8" r="6" fill="none" stroke="#34E0D2" stroke-width="2.4" stroke-linecap="round" transform="rotate(-90 8 8)" stroke-dasharray="37.7" stroke-dashoffset="15"/></svg>
+      <b>2 / 5</b>
+    </div>
+  </div>
+
+  <div class="sec">
+    <!-- waiting -->
+    <div class="sec-cap">ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ <span class="n">2</span></div>
+    <div class="confirm-all">Подтвердить все по очереди →</div>
+
+    <div class="qrow">
+      <span class="qcov" style="background:linear-gradient(135deg,#3a2e6e,#15102a);"></span>
+      <div class="qbody"><div class="qtitle">Анна Каренина</div><div class="qsub">Лев Толстой · 8 глав · ~9 ч</div></div>
+      <button class="qbtn">Подтвердить</button>
+    </div>
+    <div class="qrow">
+      <span class="qcov" style="background:linear-gradient(160deg,#1d6e5a,#0c2e2a);display:flex;align-items:center;justify-content:center;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.6)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      </span>
+      <div class="qbody"><div class="qtitle">Мёртвые души</div><div class="qsub">Гоголь · 11 глав · обложка: ищу…</div></div>
+      <button class="qbtn">Подтвердить</button>
+    </div>
+
+    <!-- in progress / done / error / cancelled -->
+    <div class="sec-cap" style="margin-top:16px;">В РАБОТЕ И ГОТОВО <span class="n">3</span></div>
+
+    <div class="qrow">
+      <span class="qcov" style="background:linear-gradient(135deg,#34E0D2,#4A6BFF);"></span>
+      <div class="qbody"><div class="qtitle">Война и мир</div><div class="qsub">Глава 7 из 12 · собираю…</div></div>
+      <div class="qprog"><div class="mini-track"><div class="mini-fill"></div></div><span class="pct">58%</span></div>
+    </div>
+
+    <div class="qrow">
+      <span class="qstatus-ic" style="background:rgba(52,224,210,.14);"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg></span>
+      <div class="qbody"><div class="qtitle">Преступление и наказание</div><div class="qsub ok">Готово · 8 глав · 11:40</div></div>
+      <button class="qbtn ghost">Открыть</button>
+    </div>
+
+    <div class="qrow">
+      <span class="qstatus-ic" style="background:rgba(255,180,84,.14);"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#FFB454" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 3.9l-8 14A2 2 0 004 21h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z"/></svg></span>
+      <div class="qbody"><div class="qtitle">Идиот</div><div class="qsub err">Битый файл 03.mp3</div></div>
+      <button class="qbtn warn">Повторить</button>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="foot-dot"></span>
+    <span class="foot-txt">Собираю 2 из 5</span>
+    <button class="btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>Открыть папку</button>
+  </div>
+  <div class="credit">mp3-to-m4b 0.1.0 · by Alex Kovalev · <a href="#">GitHub</a></div>
+</div>
+<div class="caption">Состояние: <b>active</b> — 2 ждут подтверждения, 1 собирается, 1 готов, 1 с ошибкой</div>
+</div>
+
+<!-- empty queue -->
+<div class="col">
+<div class="win">
+  <div class="hdr">
+    <button class="back-btn"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9fb2bd" stroke-width="2"><path d="M15 6l-6 6 6 6"/></svg></button>
+    <div class="hdr-title"><h1>Очередь</h1><p>Нет активных книг</p></div>
+  </div>
+  <div class="empty">
+    <div class="empty-ic"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#6E8390" stroke-width="1.6"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><path d="M12 11v4M10 13h4"/></svg></div>
+    <h3>Очередь пуста</h3>
+    <p>Киньте папку-сборник с mp3 в отслеживаемую папку — книга появится здесь и всплывёт на подтверждение.</p>
+  </div>
+  <div class="footer">
+    <span class="foot-dot"></span>
+    <span class="foot-txt">Агент работает</span>
+    <button class="btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#34E0D2" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>Открыть папку</button>
+  </div>
+  <div class="credit">mp3-to-m4b 0.1.0 · by Alex Kovalev · <a href="#">GitHub</a></div>
+</div>
+<div class="caption">Состояние: <b>empty</b> — дружелюбная подсказка «что делать»</div>
+</div>
+
+</body>
+</html>

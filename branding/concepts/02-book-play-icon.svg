@@ -1,0 +1,78 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b app icon — book with play">
+  <defs>
+    <radialGradient id="bp-bg" cx="50%" cy="38%" r="92%">
+      <stop offset="0%"  stop-color="#15212B"/>
+      <stop offset="55%" stop-color="#0C141C"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <radialGradient id="bp-edgeglow" cx="50%" cy="52%" r="62%">
+      <stop offset="60%" stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#136B86" stop-opacity="0.5"/>
+    </radialGradient>
+
+    <!-- signature audio gradient on the book covers -->
+    <linearGradient id="bp-audio" x1="14%" y1="8%" x2="86%" y2="96%">
+      <stop offset="0%"  stop-color="#34E0D2"/>
+      <stop offset="46%" stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <!-- bright play triangle -->
+    <linearGradient id="bp-play" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DDFBFF"/>
+    </linearGradient>
+
+    <filter id="bp-glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="22" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="bp-softshadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="14" stdDeviation="22" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" fill="#070B10"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bp-bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bp-edgeglow)"/>
+  <path d="M512 96 C 180 96, 60 300, 60 540 C 60 360, 180 200, 512 200 C 844 200, 964 360, 964 540 C 964 300, 844 96, 512 96 Z"
+        fill="#FFFFFF" opacity="0.05"/>
+
+  <ellipse cx="512" cy="520" rx="360" ry="320" fill="#1FB8D8" opacity="0.26" filter="url(#bp-glow)"/>
+  <ellipse cx="600" cy="560" rx="200" ry="200" fill="#4A6BFF" opacity="0.20" filter="url(#bp-glow)"/>
+
+  <!-- SYMBOL: open book leaf (family link), play triangle rising from the spine -->
+  <g filter="url(#bp-softshadow)">
+    <!-- left leaf -->
+    <path d="M512 322
+             C 470 290, 410 280, 352 290
+             C 328 294, 314 312, 314 336
+             L 314 700
+             C 314 722, 332 736, 354 732
+             C 410 722, 470 730, 512 760
+             Z" fill="url(#bp-audio)"/>
+    <!-- right leaf -->
+    <path d="M512 322
+             C 554 290, 614 280, 672 290
+             C 696 294, 710 312, 710 336
+             L 710 700
+             C 710 722, 692 736, 670 732
+             C 614 722, 554 730, 512 760
+             Z" fill="url(#bp-audio)" opacity="0.94"/>
+
+    <!-- page lines (left) -->
+    <g stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="14" stroke-linecap="round">
+      <line x1="372" y1="392" x2="466" y2="400"/>
+      <line x1="372" y1="452" x2="462" y2="460"/>
+    </g>
+    <!-- page lines (right) -->
+    <g stroke="#FFFFFF" stroke-opacity="0.42" stroke-width="14" stroke-linecap="round">
+      <line x1="558" y1="400" x2="652" y2="392"/>
+      <line x1="562" y1="460" x2="652" y2="452"/>
+    </g>
+
+    <!-- play triangle in the spine, glowing -->
+    <g filter="url(#bp-glow)">
+      <path d="M468 470 L468 622 L596 546 Z" fill="url(#bp-play)"/>
+    </g>
+  </g>
+</svg>

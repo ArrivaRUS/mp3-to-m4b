@@ -1,0 +1,25 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b mono mark — open book with play (single colour)">
+  <!-- Single-colour mark. Identity via solid book + play knocked out as negative space.
+       Uses ONE fill (currentColor); recolour by setting `color` on the <svg> or the fill below.
+       Solid fills only (no thin strokes / filters) so it survives small sizes & 1-bit contexts. -->
+  <g fill="#0A1016" fill-rule="evenodd">
+    <!-- BOOK as one solid silhouette (both leaves), with page-line slots + play knocked out -->
+    <path d="
+      M256 150
+      C 226 128, 184 121, 142 128
+      C 130 130, 122 140, 122 152
+      L 122 372
+      C 122 386, 134 395, 148 392
+      C 184 386, 226 392, 256 414
+      C 286 392, 328 386, 364 392
+      C 378 395, 390 386, 390 372
+      L 390 152
+      C 390 140, 382 130, 370 128
+      C 328 121, 286 128, 256 150
+      Z
+      M168 196 L232 202 L232 220 L168 214 Z
+      M344 196 L280 202 L280 220 L344 214 Z
+      M214 232 L214 320 L298 276 Z
+    "/>
+  </g>
+</svg>
