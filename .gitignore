@@ -1,0 +1,15 @@
+.DS_Store
+*.log
+
+# Build artifacts (binaries are not committed; .dmg ships via GitHub Releases)
+build/dist/
+*.app
+*.dmg
+*.dmg.sha256
+
+# Produced audiobooks / large media (never commit outputs)
+*.m4b
+
+# Secrets
+tokens_and_keys.md
+tokens_and_keys.env
