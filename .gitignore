@@ -13,3 +13,6 @@ build/dist/
 # Secrets
 tokens_and_keys.md
 tokens_and_keys.env
+
+# Local time-tracking (not in git)
+time.local.md
