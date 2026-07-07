@@ -11,4 +11,4 @@ This package is intentionally small at M0.1: only the protocol skeleton exists.
 Real ffprobe/ffmpeg logic lands in M0.5+ (see ``plans.md``).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.9"

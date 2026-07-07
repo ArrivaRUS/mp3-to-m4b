@@ -46,8 +46,9 @@ Claude независимо пришёл к «агент — единствен�
 - **Гарантии:**
   - **I2 структурно:** ffmpeg-сборка живёт ИСКЛЮЧИТЕЛЬНО в обработчике `confirm-build` после валидации
     (`status==pending-confirm` && `source_rev` совпал && `confirm_token` верный). Сканер НИКОГДА не зовёт build.
-  - Идемпотентность: `book_id`=sha256(пути), `source_rev`=fingerprint(relpath,size,mtime_ns,duration);
-    устаревшая правка → `confirm_rejected_stale`; дубль команды → по `idempotency_key`.
+  - Идемпотентность: `book_id`=sha256(пути), `source_rev`=fingerprint(relpath,size,mtime_ns) — **БЕЗ
+    duration** (probe-данные НЕ входят в ревизию, иначе каждый скан перевзводил бы `confirm_token`; уточнено
+    на M0.5); устаревшая правка → `confirm_rejected_stale`; дубль команды → по `idempotency_key`.
   - Сбои: malformed json → `queue/commands/bad/` (без сборки); рестарт в `converting` без живого pid →
     `error: interrupted` + чистка temp; gate-тест в `events.jsonl`: нет `build_started` без `confirm_accepted`.
 

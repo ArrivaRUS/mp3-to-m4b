@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.9}"
 BUNDLE_ID="com.arrivarus.mp3tom4b"
 APP_NAME="mp3-to-m4b"
 MIN_MACOS="11.0"
@@ -51,12 +51,17 @@ APP="$STAGE_ROOT/$APP_NAME.app"
 # AppKit/SwiftUI window; Tokens.swift is the design-token source of truth;
 # StateModel.swift is the read-only view of the agent's state.json + manifests
 # (M0.3); EngineClient.swift is the app's WRITE side — it drops confirm-build
-# commands into queue/commands/ (M0.4). Further reader screens are added later.
+# commands into queue/commands/ (M0.4); QueueView.swift is the "Очередь" screen
+# (spec §7). Further reader screens are added later.
 SWIFT_SRCS=(
   "$REPO_DIR/app/main.swift"
   "$REPO_DIR/app/Tokens.swift"
   "$REPO_DIR/app/StateModel.swift"
   "$REPO_DIR/app/EngineClient.swift"
+  "$REPO_DIR/app/EngineClient+Status.swift"
+  "$REPO_DIR/app/QueueView.swift"
+  "$REPO_DIR/app/StatusView.swift"
+  "$REPO_DIR/app/SetupView.swift"
 )
 ICON_SVG="$REPO_DIR/branding/icon-app.svg"
 
@@ -100,12 +105,17 @@ chmod 0755 "$MACOS/$APP_NAME"
 rm -rf "$BIN_TMP"
 lipo -info "$MACOS/$APP_NAME" | sed 's/^/    /'
 
-# --- bundle the engine: python agent package + FDA runner ------------------
+# --- bundle the engine: python agent package + FDA runner + installer ------
 # The app is a reader; the agent (this python package) is the engine and single
 # writer. We ship both inside the bundle so the installer can stage them to App
 # Support. The runner is the stable FDA target → `exec python3 -m agent`.
-echo "==> copying engine (agent/ + runner.sh) into Resources"
+# packaging/installer.sh is bundled too: it resolves runner.sh + agent/ as its
+# SIBLINGS (its find_runner/find_agent_dir check "$SELF_DIR"), so dropping all
+# three into Resources lets a "do shell script <installer.sh>" front-end (the
+# applet, or the app's Setup screen) install the background agent from the bundle.
+echo "==> copying engine (agent/ + runner.sh + installer.sh) into Resources"
 install -m 0755 "$REPO_DIR/bin/runner.sh" "$RES/runner.sh"
+install -m 0755 "$REPO_DIR/packaging/installer.sh" "$RES/installer.sh"
 # Copy the python package verbatim (skip __pycache__ / pyc).
 AGENT_DST="$RES/agent"
 rm -rf "$AGENT_DST"

@@ -16,3 +16,7 @@ tokens_and_keys.env
 
 # Local time-tracking (not in git)
 time.local.md
+
+# Python bytecode
+__pycache__/
+*.pyc

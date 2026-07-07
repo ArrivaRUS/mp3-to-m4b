@@ -1,0 +1,180 @@
+<svg width="960" height="440" viewBox="0 0 960 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="mp3-to-m4b DMG installer background">
+  <defs>
+    <!-- deep dark premium panel, cool-tinted center, near-black edges (brand:
+         color.bg.panel.center #15212B -> mid #0C141C -> edge #070B10).
+         userSpaceOnUse over the full 960x440 canvas so the cool core stays
+         anchored near center and the gradient darkens smoothly to every edge. -->
+    <radialGradient id="bg-base" gradientUnits="userSpaceOnUse" cx="460" cy="160" r="560">
+      <stop offset="0%"   stop-color="#15212B"/>
+      <stop offset="42%"  stop-color="#0F1922"/>
+      <stop offset="74%"  stop-color="#0A121A"/>
+      <stop offset="100%" stop-color="#070B10"/>
+    </radialGradient>
+    <!-- subtle teal/indigo edge glow (matches icon edge-glow #136B86): transparent
+         in the middle, cool bloom toward the far corners of the wide canvas -->
+    <radialGradient id="bg-edge" gradientUnits="userSpaceOnUse" cx="460" cy="200" r="520">
+      <stop offset="58%"  stop-color="#0E5A66" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#136B86" stop-opacity="0.42"/>
+    </radialGradient>
+    <!-- cool bloom that sits behind the arrow / center (cyan -> indigo, our audio tone) -->
+    <radialGradient id="bg-coolbloom" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"   stop-color="#1FB8D8" stop-opacity="0.26"/>
+      <stop offset="55%"  stop-color="#4A6BFF" stop-opacity="0.11"/>
+      <stop offset="100%" stop-color="#4A6BFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- signature audio gradient: cyan -> teal -> indigo (gradient.brand) -->
+    <linearGradient id="audio" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#34E0D2"/>
+      <stop offset="46%"  stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <!-- right leaf slightly deeper for page depth (gradient.brand.deep) -->
+    <linearGradient id="audio2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#2BC8C6"/>
+      <stop offset="46%"  stop-color="#1EA6D2"/>
+      <stop offset="100%" stop-color="#3F5DF0"/>
+    </linearGradient>
+    <!-- horizontal audio gradient for the arrow glyphs -->
+    <linearGradient id="audio-h" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#34E0D2"/>
+      <stop offset="50%"  stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+    <!-- wordmark m4b gradient (teal -> indigo, mirrors family two-tone) -->
+    <linearGradient id="wm-m4b" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#22B5E0"/>
+      <stop offset="100%" stop-color="#4A6BFF"/>
+    </linearGradient>
+
+    <!-- cool off-white "shelf" plate body: soft top sheen -> pale cyan-tinted white.
+         Finder draws captions in DARK system text on light macOS; a light plate keeps
+         that text readable on the dark panel. Kept cool (not warm-beige like fb2). -->
+    <linearGradient id="plate-fill" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#FBFEFF"/>
+      <stop offset="55%"  stop-color="#EEF7FA"/>
+      <stop offset="100%" stop-color="#DEEEF3"/>
+    </linearGradient>
+
+    <filter id="glow-s" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="3.2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <!-- soft cool halo behind the label shelves so they sit on the dark panel gracefully -->
+    <filter id="plate-halo" x="-60%" y="-120%" width="220%" height="340%">
+      <feGaussianBlur stdDeviation="4.5"/>
+    </filter>
+  </defs>
+
+  <style>
+    .sans { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  </style>
+
+  <!-- ===================== BACKGROUND (960x440 — wider+taller than the macOS 26 window ~920x408, dark to every edge) ===================== -->
+  <rect x="0" y="0" width="960" height="440" fill="#070B10"/>
+  <rect x="0" y="0" width="960" height="440" fill="url(#bg-base)"/>
+  <rect x="0" y="0" width="960" height="440" fill="url(#bg-edge)"/>
+  <!-- cool bloom centered behind the drag path (~460,200) -->
+  <ellipse cx="460" cy="200" rx="430" ry="190" fill="url(#bg-coolbloom)"/>
+  <!-- 1px inner hairline frame for a 'premium window' feel -->
+  <rect x="0.5" y="0.5" width="959" height="439" fill="none" stroke="#FFFFFF" stroke-opacity="0.06" rx="0"/>
+  <!-- faint top highlight band -->
+  <rect x="0" y="0" width="960" height="84" fill="#FFFFFF" opacity="0.022"/>
+
+  <!-- ===================== HEADER (brand, centered on x=460) ===================== -->
+  <!-- mini book+play mark, sits just left of "mp3", sized to the wordmark row.
+       Recap of icon-app symbol (open book leaf + play). Glyph local box y:-10..74
+       (h=84), x:-4..104 (w=108), vertical center at local y=32. At scale 0.31 → ~26px
+       tall; placed so its optical center lands on the text optical center (~y59.5,
+       midway between cap-top ~49 and baseline 70) and its right edge sits ~14px left of
+       "mp3" (ink left edge x=384). translate-y=49 → spans y47..72; translate-x=338 →
+       right edge ~370. Reads level with the "mp3 -> m4b" line, not towering over it. -->
+  <g transform="translate(338,49) scale(0.31)" filter="url(#glow-s)">
+    <!-- left leaf -->
+    <path d="M50 0 C 40 -8, 22 -10, 4 -8 C -1 -7.4, -4 -5, -4 -1.5 L -4 64
+             C -4 67.5, -1 70, 2.6 69.4 C 22 67, 40 68.6, 50 74 Z" fill="url(#audio)"/>
+    <!-- right leaf -->
+    <path d="M50 0 C 60 -8, 78 -10, 96 -8 C 101 -7.4, 104 -5, 104 -1.5 L 104 64
+             C 104 67.5, 101 70, 97.4 69.4 C 78 67, 60 68.6, 50 74 Z" fill="url(#audio2)"/>
+    <!-- spine seam -->
+    <rect x="48" y="0" width="4" height="70" rx="2" fill="#0A0F16" opacity="0.35"/>
+    <!-- dark disc + play -->
+    <circle cx="50" cy="36" r="20" fill="#0B1118" opacity="0.55"/>
+    <path d="M42 25 L42 47 L61 36 Z" fill="#EAFBFF"/>
+  </g>
+
+  <!-- wordmark: mp3 -> m4b (group spans x ~382..538, center 460).
+       Baseline lifted 70 -> 67 (~3px up) so the wordmark sits slightly ABOVE the icon's
+       vertical center (optical tuning per human). Icon (translate 338,49 scale 0.31) stays;
+       the arrow below is lifted the same 3px to stay centered on the raised line. -->
+  <text x="382" y="67" class="sans" font-size="30" font-weight="700" letter-spacing="-1" fill="#EAF6FA">mp3</text>
+  <!-- arrow glyph OPTICALLY centered in the gap between "mp3" and "m4b".
+       "mp3" right=436, "m4b" left=472 → geometric midpoint 454. But the ">" chevron opens
+       its shoulders toward mp3 (left), so at equal pixel gaps it READS shoved toward mp3.
+       Optical fix: shifted the whole glyph +3px right (x only; y unchanged) so it LOOKS
+       centered by eye, not by pixel geometry. Compact + solid stroke, brand h-gradient. -->
+  <g filter="url(#glow-s)">
+    <path d="M446.5 57 L457.5 57" stroke="url(#audio-h)" stroke-width="5.2" stroke-linecap="round"/>
+    <path d="M454.5 52 L461 57 L454.5 62" stroke="url(#audio-h)" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+  <text x="471" y="67" class="sans" font-size="30" font-weight="700" letter-spacing="-1" fill="url(#wm-m4b)">m4b</text>
+
+  <!-- ===================== DRAG HINT (above the arrow, centered) ===================== -->
+  <text x="460" y="112" class="sans" font-size="13.5" font-weight="600" letter-spacing="0.4"
+        text-anchor="middle" fill="#EAF6FA">Перетащите приложение в «Программы»</text>
+
+  <!-- ===================== DRAG ZONE ===================== -->
+  <!-- App icon slot hint: center (290,190), 120px icon -->
+  <g opacity="0.9">
+    <rect x="228" y="128" width="124" height="124" rx="26"
+          fill="#FFFFFF" fill-opacity="0.018"
+          stroke="#FFFFFF" stroke-opacity="0.13" stroke-width="1.5"
+          stroke-dasharray="5 6"/>
+  </g>
+
+  <!-- /Applications slot hint: center (630,190), 120px icon -->
+  <g opacity="0.9">
+    <rect x="568" y="128" width="124" height="124" rx="26"
+          fill="#FFFFFF" fill-opacity="0.018"
+          stroke="#FFFFFF" stroke-opacity="0.13" stroke-width="1.5"
+          stroke-dasharray="5 6"/>
+  </g>
+
+  <!-- big drag arrow — SOLID FILLED (no filter). cairosvg drops thin filtered strokes
+       (feMerge glitch, lessons cairosvg-thin-stroke); a filled shape renders reliably
+       and reads as one arrow. Centered on x=460 between the icon edges (350 / 570). -->
+  <path d="M382 184.5 L498 184.5 L498 173 L538 190 L498 207 L498 195.5 L382 195.5 Z"
+        fill="url(#audio-h)"/>
+
+  <!-- ===================== LABEL SHELVES ===================== -->
+  <!-- Finder draws each icon's caption centered under the icon (~x=290 / x=630, y~250-268).
+       These cool light plates sit beneath that DARK system text so it stays readable.     -->
+
+  <!-- shelf under app name (center x=290), 180 wide for full "mp3-to-m4b.app".
+       Caption is drawn low (center ~270); plate centered on y=270 (258..282, h=24). -->
+  <g>
+    <rect x="200" y="258" width="180" height="24" rx="12"
+          fill="#CFEAF2" fill-opacity="0.30" filter="url(#plate-halo)"/>
+    <rect x="200" y="258" width="180" height="24" rx="12" fill="url(#plate-fill)" fill-opacity="0.92"/>
+    <rect x="200.5" y="258.5" width="179" height="23" rx="11.5"
+          fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1"/>
+  </g>
+
+  <!-- shelf under "Applications" (center x=630), 125 wide; centered on caption y=270 -->
+  <g>
+    <rect x="567.5" y="258" width="125" height="24" rx="12"
+          fill="#CFEAF2" fill-opacity="0.30" filter="url(#plate-halo)"/>
+    <rect x="567.5" y="258" width="125" height="24" rx="12" fill="url(#plate-fill)" fill-opacity="0.92"/>
+    <rect x="568" y="258.5" width="124" height="23" rx="11.5"
+          fill="none" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1"/>
+  </g>
+
+  <!-- ===================== FOOTER (first-run instruction, centered on x=460) ===================== -->
+  <!-- divider hairline (width 580, centered: 170..750) -->
+  <line x1="170" y1="292" x2="750" y2="292" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1"/>
+
+  <text x="460" y="312" class="sans" font-size="12.5" font-weight="600" letter-spacing="0.1"
+        text-anchor="middle" fill="#B9D6E0">Первый запуск: правый клик по приложению, затем «Открыть».</text>
+  <text x="460" y="330" class="sans" font-size="11.5" font-weight="400" letter-spacing="0.1"
+        text-anchor="middle" fill="#6E8390">Если заблокировано — Системные настройки, «Конфиденциальность и безопасность», «Открыть всё равно».</text>
+</svg>

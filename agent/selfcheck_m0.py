@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -54,12 +56,38 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 # --- helpers ----------------------------------------------------------------
 
 
+def _ffmpeg() -> str:
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+def _has_tools() -> bool:
+    return bool(shutil.which("ffmpeg")) and bool(shutil.which("ffprobe"))
+
+
 def _make_book(watch: Path, name: str, files: list[str]) -> Path:
+    """Create a book folder of REAL (tiny) mp3s so the engine can build it.
+
+    M0 validates the protocol, but the engine is now real (M1) — a ``confirm-build``
+    must reach a genuine ``done`` (a real ``.m4b``), so the fixtures have to be
+    decodable audio rather than placeholder bytes. Each file is a 1s sine tone with
+    its title set to the (cleaned) filename so chapters read sensibly. Distinct
+    frequencies keep the inputs from being byte-identical.
+    """
     folder = watch / name
     folder.mkdir(parents=True, exist_ok=True)
     for i, fn in enumerate(files):
         p = folder / fn
-        p.write_bytes(b"ID3fake-mp3-bytes-" + str(i).encode())
+        freq = 330 + i * 110
+        subprocess.run(
+            [
+                _ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=1",
+                "-metadata", f"title={Path(fn).stem}",
+                str(p),
+            ],
+            check=True,
+            capture_output=True,
+        )
     return folder
 
 
@@ -111,6 +139,13 @@ def _journal_gate_ok(events) -> bool:
 
 
 def run() -> int:
+    # M0 now drives the REAL engine to a successful build, so it needs ffmpeg/
+    # ffprobe (the protocol logic itself is engine-agnostic, but the happy-path
+    # ``confirm-build`` → ``done`` assertion requires real audio).
+    if not _has_tools():
+        print("§M0 self-check: SKIPPED — ffmpeg/ffprobe not found on PATH")
+        return 1
+
     root = Path(tempfile.mkdtemp(prefix="mp3tom4b-selfcheck-"))
     support = root / "support"
     watch = root / "watch"
@@ -167,8 +202,20 @@ def run() -> int:
     m_cur = state.read_json(manifests[0])
     stale_cmd = _confirm_build_cmd(m_cur)  # captured at the old rev
 
-    # Mutate inputs: add a file → source_rev changes on next scan.
-    (book_dir / "03 - Добавлено.mp3").write_bytes(b"ID3-new-chapter")
+    # Mutate inputs: add a REAL (decodable) mp3 → source_rev changes on next scan.
+    # It must be genuine audio, not placeholder bytes: Case 3 below builds THIS book
+    # to a full ``done``, and the build now refuses any unreadable chapter (E3). A
+    # distinct frequency keeps it from being byte-identical to the seed chapters.
+    subprocess.run(
+        [
+            _ffmpeg(), "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=770:duration=1",
+            "-metadata", "title=Добавлено",
+            str(book_dir / "03 - Добавлено.mp3"),
+        ],
+        check=True,
+        capture_output=True,
+    )
     time.sleep(0.01)
     scan.run_scan()  # re-arms the book: new source_rev + new confirm_token, pending
     m_rearmed = state.read_json(manifests[0])
@@ -225,8 +272,15 @@ def run() -> int:
           skips == 1, f"build_skipped_idempotent={skips}")
     check("idempotency: book reached done", m_built.get("status") == "done",
           f"status={m_built.get('status')!r}")
-    check("idempotency: result marked fake (no real .m4b)",
-          isinstance(m_built.get("result"), dict) and m_built["result"].get("fake") is True)
+    # The engine is real now (M1): a successful build yields an actual .m4b on disk
+    # (no ``fake`` marker). Validate the real output path exists and is non-empty.
+    _res = m_built.get("result") if isinstance(m_built.get("result"), dict) else {}
+    _out = _res.get("output_path") or _res.get("output")
+    check("idempotency: real .m4b produced (engine, not fake)",
+          isinstance(_out, str) and _out.endswith(".m4b")
+          and Path(_out).is_file() and Path(_out).stat().st_size > 0
+          and "fake" not in _res,
+          f"result={_res}")
     check("idempotency: both command files consumed",
           not (config.commands_dir() / f"{c1['cmd_id']}.json").exists()
           and not (config.commands_dir() / f"{c2['cmd_id']}.json").exists())

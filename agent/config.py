@@ -53,6 +53,30 @@ def events_file() -> Path:
     return state_dir() / "events.jsonl"
 
 
+def notified_file() -> Path:
+    """notified.json — agent-owned ledger of already-raised confirm/grouping edges.
+
+    Holds the set of ``book:…``/``group:…`` keys the agent has ALREADY nudged the
+    app about (scan._publish_showcase_and_maybe_open). Rising-edge detection against
+    this ledger is what makes the auto-raise fire exactly once per new pending
+    book / grouping prompt and never loop. The app never reads or writes it.
+    """
+    return state_dir() / "notified.json"
+
+
+def presence_file() -> Path:
+    """presence.json — agent-owned ledger of each book's present/absent history.
+
+    Written only by scan runs (single writer). Records, per ``book_id``, whether
+    the book's source was alive on the LAST scan. A book that is present NOW but
+    was marked absent on a prior scan has been moved out and back in — a conscious
+    re-drop the inode signal cannot see (a same-volume Finder MOVE keeps st_ino),
+    so the scanner re-arms it ``pending-confirm``. The app never reads or writes
+    this file.
+    """
+    return state_dir() / "presence.json"
+
+
 def queue_dir() -> Path:
     return support_root() / "queue"
 
