@@ -83,12 +83,12 @@
       <stop offset="100%" stop-color="#DDFBFF"/>
     </linearGradient>
     <!-- wordmark m4b: teal -> indigo (mirrors logo.svg lg-m4b), pinned in user space -->
-    <linearGradient id="grad-m4b" gradientUnits="userSpaceOnUse" x1="900" y1="240" x2="1140" y2="348">
+    <linearGradient id="grad-m4b" gradientUnits="userSpaceOnUse" x1="900" y1="201" x2="1140" y2="309">
       <stop offset="0%"  stop-color="#22B5E0"/>
       <stop offset="100%" stop-color="#4A6BFF"/>
     </linearGradient>
     <!-- arrow: cyan -> teal, pinned across the arrow span -->
-    <linearGradient id="grad-arrow" gradientUnits="userSpaceOnUse" x1="766" y1="298" x2="852" y2="298">
+    <linearGradient id="grad-arrow" gradientUnits="userSpaceOnUse" x1="766" y1="259" x2="852" y2="259">
       <stop offset="0%"  stop-color="#34E0D2"/>
       <stop offset="100%" stop-color="#22B5E0"/>
     </linearGradient>
@@ -187,36 +187,38 @@
   </g>
 
   <!-- ============================ WORDMARK (right of icon) ============================ -->
-  <!-- baseline group: vertically centered on ~y=300. "mp3"  ->  "m4b" -->
-  <text x="482" y="338" class="sans" font-size="120" font-weight="800" letter-spacing="-4" fill="#EAF6FA">mp3</text>
+  <!-- baseline group: whole right block (wordmark..badge) centered on canvas mid y=320. "mp3"  ->  "m4b" -->
+  <text x="482" y="299" class="sans" font-size="120" font-weight="800" letter-spacing="-4" fill="#EAF6FA">mp3</text>
 
   <!-- VECTOR arrow (cyan->teal), solid fills only (no strokes under filters).
        Solid triangular head deliberately echoes the play triangle of the mark. -->
-  <ellipse cx="811" cy="298" rx="80" ry="38" fill="url(#g-arrowglow)"/>
-  <rect x="766" y="291" width="52" height="14" rx="7" fill="url(#grad-arrow)"/>
-  <path d="M814 270 L852 298 L814 326 Z" fill="url(#grad-arrow)"/>
+  <ellipse cx="811" cy="259" rx="80" ry="38" fill="url(#g-arrowglow)"/>
+  <rect x="766" y="252" width="52" height="14" rx="7" fill="url(#grad-arrow)"/>
+  <path d="M814 231 L852 259 L814 287 Z" fill="url(#grad-arrow)"/>
 
-  <text x="900" y="338" class="sans" font-size="120" font-weight="800" letter-spacing="-4" fill="url(#grad-m4b)">m4b</text>
+  <text x="900" y="299" class="sans" font-size="120" font-weight="800" letter-spacing="-4" fill="url(#grad-m4b)">m4b</text>
 
   <!-- ============================ TAGLINE ============================ -->
   <!-- the "->" is a VECTOR mini-arrow (solid fills): fallback fonts lack the U+2192 glyph
        next to Cyrillic and render tofu in cairosvg. Text ink measured: ends at x=902. -->
-  <text x="484" y="404" class="sans" font-size="36" font-weight="500" letter-spacing="0.2" fill="#B7D4E0">&#1057;&#1073;&#1086;&#1088;&#1082;&#1072; &#1072;&#1091;&#1076;&#1080;&#1086;&#1082;&#1085;&#1080;&#1075; &#183; MP3</text>
+  <text x="484" y="365" class="sans" font-size="36" font-weight="500" letter-spacing="0.2" fill="#B7D4E0">&#1057;&#1073;&#1086;&#1088;&#1082;&#1072; &#1072;&#1091;&#1076;&#1080;&#1086;&#1082;&#1085;&#1080;&#1075; &#183; MP3</text>
   <g fill="#34E0D2" opacity="0.85">
-    <rect x="916" y="388" width="24" height="6" rx="3"/>
-    <path d="M936 380 L952 391 L936 402 Z"/>
+    <rect x="916" y="349" width="24" height="6" rx="3"/>
+    <path d="M936 341 L952 352 L936 363 Z"/>
   </g>
-  <text x="966" y="404" class="sans" font-size="36" font-weight="500" letter-spacing="0.2" fill="#B7D4E0">M4B</text>
+  <text x="966" y="365" class="sans" font-size="36" font-weight="500" letter-spacing="0.2" fill="#B7D4E0">M4B</text>
 
   <!-- ============================ BADGE + FOOTER URL (one row) ============================ -->
-  <rect x="484" y="422" width="154" height="42" rx="21"
+  <rect x="484" y="383" width="154" height="42" rx="21"
         fill="#34E0D2" fill-opacity="0.07" stroke="#34E0D2" stroke-opacity="0.40" stroke-width="1.5"/>
-  <text x="561" y="450" text-anchor="middle" class="sans" font-size="21" font-weight="600" letter-spacing="0.5" fill="#CFEFF0">&#1076;&#1083;&#1103; macOS</text>
-  <text x="666" y="450" class="sans" font-size="24" font-weight="500" letter-spacing="0.3" fill="#74909E">github.com/ArrivaRUS/mp3-to-m4b</text>
+  <text x="561" y="411" text-anchor="middle" class="sans" font-size="21" font-weight="600" letter-spacing="0.5" fill="#CFEFF0">&#1076;&#1083;&#1103; macOS</text>
+  <text x="666" y="411" class="sans" font-size="24" font-weight="500" letter-spacing="0.3" fill="#74909E">github.com/ArrivaRUS/mp3-to-m4b</text>
 
   <!-- ============================ AUDIO WAVEFORM STRIP (MP3 motif, fades right) ============================ -->
-  <!-- solid rounded bars, per-bar opacity fade — no filters, downscale-safe -->
-  <g fill="url(#grad-wave)">
+  <!-- solid rounded bars, per-bar opacity fade — no filters, downscale-safe.
+       translate(0,-16): keeps the strip balanced under the raised text block
+       (grad-wave is horizontal, x-anchored — the y shift can't affect the fill). -->
+  <g fill="url(#grad-wave)" transform="translate(0,-16)">
     <rect x="486"  y="532" width="7" height="16" rx="3.5" opacity="0.45"/>
     <rect x="512"  y="525" width="7" height="30" rx="3.5" opacity="0.43"/>
     <rect x="538"  y="518" width="7" height="44" rx="3.5" opacity="0.42"/>
