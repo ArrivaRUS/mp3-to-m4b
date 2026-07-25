@@ -50,6 +50,12 @@ struct QueueView: View {
     /// window surfaces (file-watch) → the user presses «Собрать» to rebuild. Returns true
     /// on a successful drop so the row can show a brief ack (mirrors cancel/confirm).
     let onReconvert: (BookSummary) -> Bool
+    /// "Вернуть" on a ПРОПУЩЕНО row → undo a «Пропустить»: put the book back into
+    /// ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ. The host wires this to the SAME `reconvert` command
+    /// «Собрать заново» uses (the agent re-arms `skipped` exactly like `done`), so
+    /// undoing a skip needs no extra protocol action. Returns true on a successful
+    /// drop so the row can show its ack.
+    let onRestore: (BookSummary) -> Bool
     /// "Отмена" on a converting row → drop a `cancel` command for that book (D13).
     /// The agent kills ffmpeg and lands the book back at pending-confirm; the row
     /// then clears itself via file-watch. Returns true on a successful drop so the
@@ -64,9 +70,11 @@ struct QueueView: View {
     private var converting: [BookSummary] { state.convertingBooks }
     private var done: [BookSummary] { state.doneBooks }
     private var errored: [BookSummary] { state.errorBooks }
+    private var skipped: [BookSummary] { state.skippedBooks }
 
     private var isEmpty: Bool {
         pending.isEmpty && converting.isEmpty && done.isEmpty && errored.isEmpty
+            && skipped.isEmpty
     }
 
     var body: some View {
@@ -173,6 +181,21 @@ struct QueueView: View {
                                topGap: topGap(after: !pending.isEmpty || !converting.isEmpty || !done.isEmpty))
                     ForEach(errored) { book in
                         ErrorRow(book: book, manifest: manifestFor(book))
+                    }
+                }
+
+                // ПРОПУЩЕНО — books the user took off the pipeline with «Пропустить».
+                // It exists so a skipped book is never "just gone": this is the ONE
+                // place that answers «куда делась книга?», and «Вернуть» on the row
+                // puts it straight back into ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ. Last section by
+                // design — it is the coldest state (not live, not history).
+                if !skipped.isEmpty {
+                    sectionCap("ПРОПУЩЕНО", count: skipped.count,
+                               topGap: topGap(after: !pending.isEmpty || !converting.isEmpty
+                                                     || !done.isEmpty || !errored.isEmpty))
+                    ForEach(skipped) { book in
+                        SkippedRow(book: book, cover: manifestFor(book),
+                                   onRestore: { onRestore(book) })
                     }
                 }
             }
@@ -735,6 +758,44 @@ private struct ErrorRow: View {
              subColor: Tokens.C.qSubErr,
              leading: { QStatusDisc(kind: .error) },
              trailing: { QButton(label: "Повторить", style: .warn, enabled: false) {} })
+    }
+}
+
+/// Skipped row: cover-38 · "<автор> · N глав · ~T" (muted) · "Вернуть".
+///
+/// The book was taken off the pipeline by «Пропустить» — its FILES ARE UNTOUCHED, it
+/// simply stopped being offered. This row is the whole reason the ПРОПУЩЕНО section
+/// exists: a skipped book must never just vanish, it must sit somewhere the user can
+/// find it and undo. «Вернуть» drops the same `reconvert` the done row uses (the
+/// agent re-arms `skipped` → `pending-confirm` with a fresh token), after which the
+/// row shows a brief ack and disappears as the book rejoins ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ.
+/// No new visual language: the same QRow/QCover/QButton chrome as the pending row —
+/// the section cap is what marks the state.
+private struct SkippedRow: View {
+    let book: BookSummary
+    let cover: BookManifest?
+    let onRestore: () -> Bool
+
+    @State private var sent = false
+
+    var body: some View {
+        QRow(title: book.title.isEmpty ? "Без названия" : book.title,
+             sub: QueueSub.pending(book),
+             subColor: Tokens.C.textMuted,          // colder than a live row
+             leading: { QCover(manifest: cover) },
+             trailing: {
+                if sent {
+                    Text("Отправлено…")
+                        .font(.system(size: Tokens.F.caption, weight: .semibold))
+                        .foregroundColor(Tokens.C.textMuted)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                } else {
+                    QButton(label: "Вернуть", style: .base) {
+                        if onRestore() { sent = true }
+                    }
+                }
+             })
     }
 }
 

@@ -30,6 +30,10 @@ This module wires the happy path plus the M0.6 protocol protections:
   - :func:`recover_interrupted` (run at startup): a manifest stuck at
     ``converting`` with no live build pid → ``error`` (``reason=interrupted``) +
     temp sweep, so a crash/kill mid-build surfaces instead of dangling.
+  - :func:`_handle_skip` («Пропустить»): flips the manifest to ``skipped`` —
+    sources untouched, the scan stops re-arming it for free (unchanged
+    ``source_rev``), and a conscious re-drop brings it back (lesson .patches/004).
+    Undo without a re-drop is the queue's «Вернуть», which reuses ``reconvert``.
 
 A processed command file is removed only AFTER its handler completes, never
 before — so a crash mid-handle leaves the command to be retried, not lost.
@@ -82,6 +86,33 @@ CANCEL_ACTION = "cancel"
 # lets the legitimate re-build through while a changed source_rev is not required.
 RECONVERT_ACTION = "reconvert"
 
+# «Пропустить» (skip) — the confirm window's `btn-skip` (design/spec.md:108,
+# design/flows.md:63, prd/PRD.md:261, arch/plan-claude.md §2.3). The app drops a
+# ``skip`` command targeting a ``book_id``; like cancel/reconvert it targets the
+# book BY ID and is NOT validated against source_rev/confirm_token — nothing is
+# built, so there is no live token to echo and no I2 surface.
+#
+# Effect: flip the manifest to ``skipped``. That is the WHOLE mechanism, and it is
+# deliberately the lightest possible one:
+#   · the SOURCES ARE NEVER TOUCHED (PRD: «исходники целы») — we only rewrite the
+#     book's own manifest, never the watch folder;
+#   · «разведка не вернёт её снова» comes for FREE from the existing idempotency:
+#     :func:`scan._write_manifest` short-circuits on an UNCHANGED ``source_rev``
+#     and returns the manifest as-is, so a skipped book stays skipped across every
+#     later scan without a single new gate in the scanner;
+#   · the book also stops nudging by construction — :func:`scan._edge_keys` only
+#     builds raise-edges for ``pending-confirm`` rows.
+#
+# NOT a permanent black mark (lesson .patches/004 — «намерение пользователя ≠
+# новизна контента»): a conscious RE-DROP of the same book resurrects it, on both
+# macOS drop shapes —
+#   · COPY  → new inodes → new ``source_rev`` → _write_manifest falls past the
+#     unchanged-rev short-circuit and writes a fresh ``pending-confirm`` manifest;
+#   · MOVE out→in (same inode) → the presence ledger fires; ``skipped`` is in the
+#     re-arm set of :func:`scan._reconcile_presence` next to ``done``.
+# Both paths are covered by §skip self-check, which is the point of that suite.
+SKIP_ACTION = "skip"
+
 # The grouping decision for loose mp3s in the watch root (D1, flows S4). Handled
 # in its own branch (it carries group_id, not book_id) and materializes book
 # manifest(s) — it NEVER builds (each new book then goes the normal confirm path).
@@ -95,6 +126,21 @@ STATUS_PENDING = "pending-confirm"
 STATUS_CONVERTING = "converting"
 STATUS_DONE = "done"
 STATUS_ERROR = "error"
+# «Пропущено» — the user took this book OFF the pipeline (sources untouched). A
+# terminal-but-reversible status: the scan never re-arms it, and it leaves the
+# state only via «Вернуть» (a reconvert) or a conscious re-drop.
+STATUS_SKIPPED = "skipped"
+
+# Statuses «Пропустить» accepts. pending-confirm is the confirm window's own case;
+# error is spec'd too (design/flows.md:90 lists «Пропустить» among an error book's
+# actions). A ``converting`` book is mid-build → use cancel; a ``done`` one has
+# nothing left to skip; an already-``skipped`` one is a no-op.
+SKIPPABLE_STATUSES = (STATUS_PENDING, STATUS_ERROR)
+
+# Statuses that «Собрать заново» / «Вернуть» may re-arm. ``done`` is the original
+# reconvert case; ``skipped`` reuses the SAME re-arm machinery as the queue's
+# «Вернуть» button, so undoing a skip needs no second command in the protocol.
+REARMABLE_STATUSES = (STATUS_DONE, STATUS_SKIPPED)
 
 # validate_command verdicts → how handle_command reacts (M0.6).
 #   ACCEPT          build (or, for an already-processed key, idempotent-skip)
@@ -733,10 +779,15 @@ def _handle_reconvert(command: dict, command_path: Path, manifest: dict | None,
          (``source_missing``) instead of re-arming a book that can never build — a
          confirm against gone inputs would only fail later at ffmpeg; rejecting here
          is the honest, early diagnosis;
-      3. **status** — only a ``done`` book is re-armed. A book already
-         ``pending-confirm`` needs nothing; a ``converting`` one is mid-build (use
-         cancel); an ``error`` one is surfaced already. Any non-``done`` status →
-         REJECT ``status_not_done`` (a no-op, never a corruption).
+      3. **status** — only a ``done`` or ``skipped`` book is re-armed
+         (``REARMABLE_STATUSES``). ``done`` is the original «Собрать заново» case;
+         ``skipped`` is the queue's «Вернуть», which undoes a «Пропустить» through
+         this SAME machinery instead of a second protocol command — a skipped book
+         needs exactly what reconvert does (re-probe → fresh ``pending-confirm`` +
+         new token + cleared ledger). A book already ``pending-confirm`` needs
+         nothing; a ``converting`` one is mid-build (use cancel); an ``error`` one is
+         surfaced already. Anything else → REJECT ``status_not_done`` (a no-op,
+         never a corruption).
 
     On ACCEPT it RE-DISCOVERS the book from its CURRENT source files rather than
     merely flipping the old manifest's status — :func:`scan.rescan_book_manifest`
@@ -789,7 +840,10 @@ def _handle_reconvert(command: dict, command_path: Path, manifest: dict | None,
         return False
 
     # 3. status — only a finished (done) book is re-armed; anything else is a no-op.
-    if manifest.get("status") != STATUS_DONE:
+    if manifest.get("status") not in REARMABLE_STATUSES:
+        # The reason string stays ``status_not_done`` verbatim: it is a journal
+        # value the §reconvert suite asserts on, and it remains literally true for
+        # every rejected case (pending / converting / error are all "not done").
         state.append_event("reconvert_rejected", file=command_path.name,
                            book_id=book_id, reason="status_not_done",
                            status=manifest.get("status"))
@@ -816,6 +870,66 @@ def _handle_reconvert(command: dict, command_path: Path, manifest: dict | None,
     # Re-project state.json now so the book moves ГОТОВО → ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ and
     # the confirm window surfaces via the app's file-watch. refresh_showcase re-reads
     # the just-written manifest from disk (no folder walk → no second re-arm).
+    scan.refresh_showcase()
+    _delete_command(command_path)
+    return False
+
+
+def _handle_skip(command: dict, command_path: Path, manifest: dict | None,
+                 manifest_path: Path | None) -> bool:
+    """«Пропустить» — take a book OFF the pipeline, leaving its sources untouched.
+
+    Targets a book BY ID (like ``cancel``/``reconvert``): no ``source_rev`` /
+    ``confirm_token`` validation — nothing is built, so there is no live token to
+    echo and no I2 surface to protect. Validation is deliberately narrow:
+
+      1. structural — the ``book_id``'s manifest must exist, else REJECT
+         ``manifest_missing`` (a forged/garbage id never mutates anything);
+      2. status — only ``SKIPPABLE_STATUSES`` (pending-confirm / error). A
+         ``converting`` book is mid-build (that is what ``cancel`` is for), a
+         ``done`` one has nothing left to skip, and an already-``skipped`` one is a
+         no-op. Anything else → REJECT ``status_not_skippable``.
+
+    Note what this handler deliberately does NOT do:
+      · it does not touch the watch folder — «исходники целы» is a structural
+        property here, not a promise: the only write is this book's own manifest;
+      · it does not delete the manifest. A deleted manifest would be re-created as
+        ``pending-confirm`` by the very next scan (the folder is still there), i.e.
+        the book would pop straight back — the manifest IS the memory of the skip;
+      · it does not add any gate to the scanner. An unchanged ``source_rev`` makes
+        :func:`scan._write_manifest` return the manifest untouched, so ``skipped``
+        survives every later scan for free.
+
+    ``refresh_showcase`` re-projects state.json so the row leaves ОЖИДАЕТ
+    ПОДТВЕРЖДЕНИЯ and lands in the queue's ПРОПУЩЕНО section (the user can always
+    see where the book went, and «Вернуть» there re-arms it via ``reconvert``).
+    Returns ``False`` always — skip NEVER builds (I2).
+    """
+    book_id = command.get("book_id")
+
+    if not isinstance(manifest, dict) or manifest_path is None:
+        state.append_event("skip_rejected", file=command_path.name,
+                           book_id=book_id, reason="manifest_missing")
+        _delete_command(command_path)
+        return False
+
+    status = manifest.get("status")
+    if status not in SKIPPABLE_STATUSES:
+        state.append_event("skip_rejected", file=command_path.name,
+                           book_id=book_id, reason="status_not_skippable",
+                           status=status)
+        _delete_command(command_path)
+        return False
+
+    # --- ACCEPT: mark the book skipped (single atomic manifest write) -----------
+    updated = dict(manifest)
+    updated["status"] = STATUS_SKIPPED
+    updated["skipped_at"] = time.time()
+    updated["ts"] = time.time()
+    state.write_json_atomic(manifest_path, updated)
+
+    state.append_event("book_skipped", book_id=book_id,
+                       src_dir=updated.get("src_dir"), from_status=status)
     scan.refresh_showcase()
     _delete_command(command_path)
     return False
@@ -878,6 +992,12 @@ def handle_command(command_path: Path) -> bool:
     # finished). Dispatched in its own validated branch; it NEVER builds itself (I2).
     if action == RECONVERT_ACTION:
         return _handle_reconvert(command, command_path, manifest, manifest_path)
+
+    # «Пропустить» (skip) — take the book off the pipeline (manifest → skipped),
+    # sources untouched. Targets book_id only, never builds (I2). A conscious
+    # re-drop resurrects it (source_rev / presence ledger) — see SKIP_ACTION.
+    if action == SKIP_ACTION:
+        return _handle_skip(command, command_path, manifest, manifest_path)
 
     # A non-build action is dispatched without ever touching build validation
     # (cover/… land in M1). It still requires a real manifest so a garbage

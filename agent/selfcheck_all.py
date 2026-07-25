@@ -52,6 +52,14 @@ SUITES: list[tuple[str, str]] = [
     # Swift detector's rule (identical→up-to-date, any drift/missing→outdated, no
     # bundled tree→undecidable/don't-touch) holds at the source of truth.
     ("agent.selfcheck_agent_update", "§agent-update self-check:"),
+    # WHICH BOOK the confirm window presents. The queue's «Подтвердить» on a row
+    # must open THAT book — it opened the first one in v0.9 (the row's book was
+    # discarded), so «Собрать» could build a book the user never chose. The rule
+    # is now one pure function (ShowcaseState.presentedBook) shared by the queue
+    # pick and the agent's auto-surface; this suite compiles the Foundation-only
+    # app sources + app/selfcheck_routing.swift and runs those assertions. Needs
+    # swiftc, no ffmpeg/launchd/state tree — grouped with the lightweight basics.
+    ("agent.selfcheck_app_routing", "§app-routing self-check:"),
     ("agent.selfcheck_m05", "§M0.5 self-check:"),
     ("agent.selfcheck_m1", "§M1-vertical self-check:"),
     ("agent.selfcheck_cover", "§cover self-check:"),
@@ -66,6 +74,14 @@ SUITES: list[tuple[str, str]] = [
     # AND the follow-up confirm-build with the same key really rebuilds (not deduped),
     # plus source-gone / non-done / bogus-id rejects. No nesting.
     ("agent.selfcheck_reconvert", "§reconvert self-check:"),
+    # «Пропустить» (skip). Book-targeted like cancel/reconvert — grouped with them.
+    # Green ⇔ BOTH halves of the contract hold: the mark HOLDS (a skipped book is
+    # not re-armed by any later scan and never raises the app) AND the mark is not
+    # permanent — a conscious re-drop resurrects the book through BOTH macOS drop
+    # shapes: COPY (new inodes → new source_rev) and MOVE out→in (inode survives →
+    # presence ledger). That second half is lesson .patches/004 encoded as a gate.
+    # Also covers «Вернуть» (a reconvert of a skipped book) and the status guards.
+    ("agent.selfcheck_skip", "§skip self-check:"),
     # The app auto-raise (nudge) layer: a NEW pending-confirm book / grouping
     # prompt makes the agent bring the app forward exactly once (rising edge via
     # the notified.json ledger). Runs the production run_scan/drain path with the

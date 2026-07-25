@@ -228,6 +228,34 @@ struct EngineClient {
         }
     }
 
+    /// «Пропустить» (spec §3 footer `btn-skip`). Takes the book OFF the pipeline —
+    /// the agent flips its manifest to `skipped`; the SOURCES ARE NEVER TOUCHED and
+    /// nothing is built. Targets the book by id (like cancel/reconvert): no
+    /// source_rev / confirm_token — there is no build to gate.
+    ///
+    ///     { cmd_id, action:"skip", book_id, idempotency_key, ts }
+    ///
+    /// Keys mirror agent/dispatcher.py `_handle_skip` EXACTLY. Accepted only for a
+    /// `pending-confirm` or `error` book; anything else is a no-op reject agent-side.
+    /// Reversible two ways: the queue's ПРОПУЩЕНО section has «Вернуть» (which sends
+    /// a `reconvert`), and a conscious re-drop of the same folder re-arms the book on
+    /// its own (agent lesson .patches/004 — a re-drop is user intent, not novelty).
+    struct SkipCommand: Codable, Equatable {
+        let cmdID: String
+        let action: String          // always "skip"
+        let bookID: String
+        let idempotencyKey: String
+        let ts: Double
+
+        enum CodingKeys: String, CodingKey {
+            case cmdID = "cmd_id"
+            case action
+            case bookID = "book_id"
+            case idempotencyKey = "idempotency_key"
+            case ts
+        }
+    }
+
     // MARK: - Idempotency
 
     /// Stable idempotency key for "build THIS book at THIS revision". Two clicks on
@@ -321,6 +349,25 @@ struct EngineClient {
     /// honest. The cmd_id stays a fresh UUID per file, so files never clobber.
     static func reconvertIdempotencyKey(bookID: String) -> String {
         "reconvert:\(bookID)"
+    }
+
+    /// Idempotency key for a `skip`. Same shape/rationale as the reconvert key:
+    /// deterministic per book, so a double click collapses to one skip.
+    static func skipIdempotencyKey(bookID: String) -> String {
+        "skip:\(bookID)"
+    }
+
+    /// Build the `skip` command for a book (no I/O) — unit-testable and inspectable
+    /// before the write. `bookID` is all the agent needs to take the book off the
+    /// pipeline; the sources are never touched.
+    func makeSkip(bookID: String) -> SkipCommand {
+        SkipCommand(
+            cmdID: UUID().uuidString,
+            action: "skip",
+            bookID: bookID,
+            idempotencyKey: Self.skipIdempotencyKey(bookID: bookID),
+            ts: Date().timeIntervalSince1970
+        )
     }
 
     /// Build the `reconvert` command for a book (no I/O). Split out so it is
@@ -443,6 +490,15 @@ struct EngineClient {
     @discardableResult
     func writeReconvert(bookID: String) throws -> URL {
         let command = makeReconvert(bookID: bookID)
+        return try dropCommand(command, cmdID: command.cmdID)
+    }
+
+    /// Write a `skip` command for `bookID`. The agent marks the manifest `skipped`
+    /// (sources untouched, nothing built), so the book leaves ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ
+    /// and appears in the queue's ПРОПУЩЕНО section — where «Вернуть» brings it back.
+    @discardableResult
+    func writeSkip(bookID: String) throws -> URL {
+        let command = makeSkip(bookID: bookID)
         return try dropCommand(command, cmdID: command.cmdID)
     }
 }

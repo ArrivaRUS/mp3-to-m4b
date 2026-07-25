@@ -88,6 +88,18 @@ MANIFEST_STATUS_PENDING = "pending-confirm"
 # carrying the live ``progress`` field onto a showcase row (Task 2): progress is
 # preserved across a refresh ONLY while the book is still converting.
 STATUS_CONVERTING = "converting"
+# Statuses that a conscious RE-DROP of the same book must reverse (lesson
+# .patches/004 — «намерение пользователя ≠ новизна контента»): both mean "the user
+# is finished with this book", and putting the folder back means he is not.
+#   · ``done``    — already built, dropped again → build it again;
+#   · ``skipped`` — taken off the pipeline by «Пропустить», dropped again → the
+#     mark is lifted and the confirm window comes back. Without this a skip would
+#     be a permanent black mark: the user re-drops the book and the app stays
+#     silent — exactly the bug .patches/004 was written about.
+# The COPY shape of a re-drop needs nothing here (new inodes → new ``source_rev``
+# → _write_manifest re-arms on its own); this set is the MOVE shape, where the
+# inode survives and only the presence ledger can see the gesture.
+REDROP_REARM_STATUSES = ("done", "skipped")
 # Status of a loose-mp3 set awaiting the user's grouping decision (D1, flows S4).
 # The agent does NOT write a book manifest for these yet — the choice command
 # materializes the manifest(s). Until then the group lives only in state.json.
@@ -1194,18 +1206,20 @@ def _reconcile_presence(manifests: list[dict]) -> list[dict]:
     Called ONLY from :func:`run_scan` (never :func:`refresh_showcase` — a refresh
     runs mid-build and must not re-arm anything). Rules, per showcase manifest:
 
-      - book known + marked ABSENT on a prior scan + present now + status ``done``
-        → a move-out/move-in re-drop: rebuild the manifest via
-        :func:`rescan_book_manifest` (``force=True`` — fresh ``confirm_token``,
-        cleared ``processed_keys``, same machinery as reconvert) so the book
-        re-arms ``pending-confirm`` and the nudge layer raises the app once;
+      - book known + marked ABSENT on a prior scan + present now + status in
+        ``REDROP_REARM_STATUSES`` → a move-out/move-in re-drop: rebuild the
+        manifest via :func:`rescan_book_manifest` (``force=True`` — fresh
+        ``confirm_token``, cleared ``processed_keys``, same machinery as
+        reconvert) so the book re-arms ``pending-confirm`` and the nudge layer
+        raises the app once;
       - book present and previously present (or brand new to the ledger) → just
         record it present. Seeding is organic: the first scan after the agent
         update writes every lying book as present WITHOUT re-arming (no window
         storm);
       - status pending/converting/error → never re-armed here (pending already
         has its window; converting is the anti-loop guarantee; error keeps its
-        honest state) — only ``done`` encodes "user already finished this book".
+        honest state) — only ``done``/``skipped`` encode "the user is FINISHED
+        with this book", which is exactly what a re-drop reverses.
 
     Every ledger entry not present in this scan is flipped to absent (that is the
     edge the next reappearance fires on). Returns the manifest list with any
@@ -1230,7 +1244,7 @@ def _reconcile_presence(manifests: list[dict]) -> list[dict]:
         present_ids.add(bid)
         prev_entry = entries.get(bid)
         was_absent = isinstance(prev_entry, dict) and prev_entry.get("present") is False
-        if was_absent and m.get("status") == "done":
+        if was_absent and m.get("status") in REDROP_REARM_STATUSES:
             fresh = rescan_book_manifest(m, force=True)
             if isinstance(fresh, dict):
                 state.append_event(

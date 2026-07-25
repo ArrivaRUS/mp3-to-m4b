@@ -44,6 +44,23 @@ enum Screen {
     }
 }
 
+/// The confirm footer's "Применить параметры ко всем (N)" (US-3.7 / spec §3):
+/// the build params the user approved once, plus the ids of the books that were
+/// awaiting confirmation at that moment. Purely APP-SIDE — the protocol has no
+/// `apply-to-all` command, so this only PRE-FILLS the confirm window of those
+/// books; each one still rides to the agent in its own `confirm-build` after a
+/// human "ок" (invariant I2). The COVER is deliberately not part of the preset —
+/// it stays per-book (US-3.7 AC: «обложку всё равно подтверждаю по каждой»).
+struct ParamsPreset: Equatable {
+    let params: BookParams
+    /// Snapshot of the `pending-confirm` ids at the moment of the click. A book
+    /// recognized LATER was not "ожидающей" then, so it keeps its own defaults
+    /// instead of silently inheriting a stale preset.
+    let bookIDs: Set<String>
+
+    func applies(to bookID: String) -> Bool { bookIDs.contains(bookID) }
+}
+
 /// Holds the showcase + the manifest for the book we are currently presenting.
 /// Mutated only on the main thread (the watcher hops to main before refreshing).
 final class ReaderModel: ObservableObject {
@@ -60,11 +77,29 @@ final class ReaderModel: ObservableObject {
     /// Published so the spinner/error updates live as the AppDelegate runs/completes
     /// the bundled installer off the main thread.
     @Published var agentUpdatePhase: InstallPhase = .running
+    /// Session-scoped params preset from the confirm footer's "Применить параметры
+    /// ко всем (N)". nil = every book seeds from its own manifest defaults.
+    @Published var paramsPreset: ParamsPreset?
+    /// The book the user explicitly picked in the queue («Подтвердить» on a ROW).
+    /// nil = no pick → the window presents the first active book (the auto-surface
+    /// default). Dropped automatically once the pick stops being active, and reset
+    /// by the AppDelegate on the rising edge of a NEW pending book so the agent's
+    /// raise always lands on the fresh queue, not on a stale hand-pick.
+    @Published private(set) var selectedBookID: String?
 
     private let store: StateStore
 
     init(store: StateStore) {
         self.store = store
+    }
+
+    /// "Применить параметры ко всем (N)": remember `params` for every book that is
+    /// awaiting confirmation RIGHT NOW, so their confirm windows open pre-filled
+    /// with it. No command is written — the agent has no `apply-to-all` action and
+    /// each book is still confirmed individually.
+    func applyParamsToAllPending(_ params: BookParams) {
+        paramsPreset = ParamsPreset(params: params,
+                                    bookIDs: Set(state.pendingConfirm.map { $0.bookID }))
     }
 
     /// Per-book manifest lookup for the queue's qrows (cover preview + result path
@@ -73,21 +108,61 @@ final class ReaderModel: ObservableObject {
         store.loadManifest(bookID: book.bookID)
     }
 
-    /// Re-read state.json and, for the first ACTIVE book (pending-confirm /
-    /// converting / error), its manifest. Idle (no active book) clears
-    /// `book`/`manifest`. Presenting converting/error books — not just pending —
-    /// lets the window mirror the live build (spec §3 state table). The rising-edge
-    /// WINDOW RAISE still keys on pending-confirm only (see AppDelegate).
+    /// Re-read state.json and re-resolve the presented book + its manifest.
+    /// Presenting converting/error books — not just pending — lets the window
+    /// mirror the live build (spec §3 state table). The rising-edge WINDOW RAISE
+    /// still keys on pending-confirm only (see AppDelegate).
     func refresh() {
-        let s = store.loadState()
-        state = s
-        if let first = s.activeBooks.first {
-            book = first
-            manifest = store.loadManifest(bookID: first.bookID)
-        } else {
+        state = store.loadState()
+        resolvePresented()
+    }
+
+    /// Queue «Подтвердить» on a ROW → present THAT book (QueueView contract, :41).
+    /// Without this the window always showed `activeBooks.first`, so confirming the
+    /// second book opened the first one's window — and «Собрать» built the wrong book.
+    func present(_ picked: BookSummary) {
+        selectedBookID = picked.bookID
+        resolvePresented()
+    }
+
+    /// Queue «Подтвердить все по очереди» → start at the FIRST book awaiting
+    /// confirmation (QueueView :220 contract), not at whatever active book happens
+    /// to sort first (a converting one would otherwise win).
+    func presentFirstPending() {
+        selectedBookID = state.pendingConfirm.first?.bookID
+        resolvePresented()
+    }
+
+    /// Drop the explicit pick → back to the first-active default. Used on the
+    /// rising edge of a new pending book so the agent's raise is never swallowed
+    /// by an older hand-picked book.
+    func clearSelection() {
+        guard selectedBookID != nil else { return }
+        selectedBookID = nil
+        resolvePresented()
+    }
+
+    /// 1-based position of the presented book among the active ones — the confirm
+    /// header's «N из M». Falls back to 1 when nothing is presented.
+    var presentedPosition: Int {
+        guard let id = book?.bookID, let pos = state.activePosition(of: id) else { return 1 }
+        return pos
+    }
+
+    /// Apply the routing rule (`ShowcaseState.presentedBook`) to the CURRENT
+    /// showcase and load that book's manifest. A pick that no longer resolves is
+    /// forgotten here, so the window follows the queue again instead of sticking
+    /// to a book that finished or vanished.
+    private func resolvePresented() {
+        guard let target = state.presentedBook(selectedID: selectedBookID) else {
+            selectedBookID = nil
             book = nil
             manifest = nil
+            return
         }
+        if selectedBookID != nil && selectedBookID != target.bookID { selectedBookID = nil }
+        book = target
+        manifest = store.loadManifest(bookID: target.bookID)
     }
 }
 
@@ -112,6 +187,10 @@ private struct RootView: View {
     /// book back to pending-confirm (fresh token + cleared idempotency ledger), so it
     /// leaves ГОТОВО and the confirm window surfaces via the watcher for a rebuild.
     let onReconvert: (BookSummary) -> Bool
+    /// Writes a `skip` command (confirm footer «Пропустить»). Returns true on a
+    /// successful drop so the button can show its ack; the agent marks the book
+    /// `skipped` (sources untouched) and it moves to the queue's ПРОПУЩЕНО section.
+    let onSkip: (BookSummary) -> Bool
     /// Navigate the single window to a screen (the AppDelegate resizes the window to
     /// that screen's width/height when this flips `model.screen`).
     let navigate: (Screen) -> Void
@@ -167,12 +246,27 @@ private struct RootView: View {
                     QueueView(
                         state: model.state,
                         manifestFor: { model.manifest(for: $0) },
-                        onConfirm: { _ in navigate(.confirm) },
-                        onConfirmAll: { navigate(.confirm) },
+                        // "Подтвердить" on a ROW must open THAT book (QueueView :41).
+                        // The picked book is recorded on the model BEFORE navigating,
+                        // so the confirm window presents it instead of the first one.
+                        onConfirm: { book in
+                            model.present(book)
+                            navigate(.confirm)
+                        },
+                        // "Подтвердить все по очереди" deliberately starts at the
+                        // FIRST pending book and walks the queue from there.
+                        onConfirmAll: {
+                            model.presentFirstPending()
+                            navigate(.confirm)
+                        },
                         onReveal: { manifest in
                             if let p = manifest.result?.outputPath, !p.isEmpty { reveal(p) }
                         },
                         onReconvert: { book in onReconvert(book) },
+                        // «Вернуть» on a ПРОПУЩЕНО row is the SAME re-arm the agent
+                        // already implements for «Собрать заново» — one mechanism,
+                        // no second protocol command to undo a skip.
+                        onRestore: { book in onReconvert(book) },
                         onCancel: { book in onCancel(book) },
                         onOpenFolder: {
                             if let dir = model.state.agent.watchDir, !dir.isEmpty { reveal(dir) }
@@ -222,16 +316,25 @@ private struct RootView: View {
                 book: book,
                 manifest: manifest,
                 pendingCount: model.state.activeBooks.count,
+                // Header "N из M": N is the presented book's own position, so a
+                // book opened from the queue reads "2 из 2", not a misleading "1".
+                position: model.presentedPosition,
+                pendingConfirmCount: model.state.pendingConfirm.count,
                 queueCount: model.state.books.count,
+                // Seed from the "ко всем" preset when this book was one of the
+                // pending ones at the time it was set (else: manifest defaults).
+                paramsPreset: model.paramsPreset,
                 onBuild: { params, coverID, coverCustomPath in
                     onBuild(manifest, params, coverID, coverCustomPath)
                 },
+                onApplyToAll: { params in model.applyParamsToAllPending(params) },
                 onOpenQueue: { navigate(.queue) },
                 // Reuse the SAME cancel path as the queue's "Отмена" (D13): the
                 // converting footer's "Отменить конвертацию" drops the identical
                 // `cancel` command; the agent kills ffmpeg and lands the book back at
                 // pending-confirm, and the file-watch returns the window to confirm.
-                onCancel: { onCancel(book) }
+                onCancel: { onCancel(book) },
+                onSkip: { onSkip(book) }
             )
             // Reset the per-book ack + edited params when the presented book
             // changes (a different book_id means a different confirm flow).
@@ -1594,12 +1697,26 @@ private struct ConfirmView: View {
     let book: BookSummary
     let manifest: BookManifest
     let pendingCount: Int
+    /// 1-based position of THIS book among the active ones — the "N из M" counter.
+    /// Passed in (not assumed to be 1) because the queue can open any book directly.
+    let position: Int
+    /// Books still AWAITING CONFIRMATION — the audience of "Применить параметры ко
+    /// всем (N)" (US-3.7: «ко всем ожидающим»). Distinct from `pendingCount`, which
+    /// also counts converting/error books whose params can no longer be changed.
+    let pendingConfirmCount: Int
     /// Total books in the showcase (any status) — drives the "В очередь" entry count.
     let queueCount: Int
+    /// Session preset from a previous "Применить параметры ко всем" — seeds the
+    /// quality/split controls when it covers THIS book (see `ParamsPreset`).
+    let paramsPreset: ParamsPreset?
     /// Writes the command with the edited params + cover pick (cover_id for an
     /// agent-known option, or cover_custom_path for a user file); returns true on
     /// success.
     let onBuild: (BookParams, _ coverID: String?, _ coverCustomPath: String?) -> Bool
+    /// "Применить параметры ко всем (N)" — hands the current params to the model,
+    /// which remembers them for the books awaiting confirmation. App-side only: no
+    /// command is written and no book is built (each still needs its own "Собрать").
+    let onApplyToAll: (BookParams) -> Void
     /// Navigate to the full queue (footer "Позже в очередь" — the book stays pending,
     /// the app changes no status).
     let onOpenQueue: () -> Void
@@ -1608,6 +1725,11 @@ private struct ConfirmView: View {
     /// drop so the button can show its sent ack. The agent unwinds ffmpeg and the
     /// file-watch returns this window to the confirm step.
     let onCancel: () -> Bool
+    /// «Пропустить» (footer `btn-skip`): drops a `skip` command for THIS book.
+    /// Returns true on a successful drop so the button can show its ack; the agent
+    /// marks the book `skipped` (sources untouched) and the file-watch retires this
+    /// window. Undo: «Вернуть» in the queue's ПРОПУЩЕНО section, or a re-drop.
+    let onSkip: () -> Bool
 
     // Editable book fields, seeded from the manifest. (The title field also drives
     // the disabled-state validation: an empty title blocks "Собрать", spec §3.)
@@ -1645,32 +1767,48 @@ private struct ConfirmView: View {
     /// button to its ack ("Отмена отправлена…") — the agent unwinds the build and the
     /// file-watch swaps this window back to confirm, retiring the whole view.
     @State private var cancelSent = false
+    /// Same lock for «Пропустить»: once the `skip` command is on disk the button
+    /// shows its ack until the agent's status flip retires the window.
+    @State private var skipSent = false
 
     init(book: BookSummary, manifest: BookManifest, pendingCount: Int,
-         queueCount: Int,
+         position: Int, pendingConfirmCount: Int, queueCount: Int,
+         paramsPreset: ParamsPreset?,
          onBuild: @escaping (BookParams, String?, String?) -> Bool,
+         onApplyToAll: @escaping (BookParams) -> Void,
          onOpenQueue: @escaping () -> Void,
-         onCancel: @escaping () -> Bool) {
+         onCancel: @escaping () -> Bool,
+         onSkip: @escaping () -> Bool) {
         self.book = book
         self.manifest = manifest
         self.pendingCount = pendingCount
+        self.position = position
+        self.pendingConfirmCount = pendingConfirmCount
         self.queueCount = queueCount
+        self.paramsPreset = paramsPreset
         self.onBuild = onBuild
+        self.onApplyToAll = onApplyToAll
         self.onOpenQueue = onOpenQueue
         self.onCancel = onCancel
+        self.onSkip = onSkip
         // Prefer the manifest's resolved title/author; fall back to the showcase
         // title (which the agent also fills) so the field is never blank-by-bug.
         _title = State(initialValue: manifest.title.isEmpty ? book.title : manifest.title)
         _author = State(initialValue: manifest.author)
-        _bitrate = State(initialValue: manifest.params.bitrate)
-        _channels = State(initialValue: manifest.params.channels)
-        _samplerate = State(initialValue: manifest.params.samplerate)
-        _split = State(initialValue: manifest.params.split)
+        // Build params come from the "ко всем" preset when it covers this book,
+        // otherwise from the manifest defaults (D2). Title/author/cover are NEVER
+        // preset — they are per-book by definition (US-3.7 AC).
+        let seed = paramsPreset.flatMap { $0.applies(to: manifest.bookID) ? $0.params : nil }
+            ?? manifest.params
+        _bitrate = State(initialValue: seed.bitrate)
+        _channels = State(initialValue: seed.channels)
+        _samplerate = State(initialValue: seed.samplerate)
+        _split = State(initialValue: seed.split)
         // Seed the threshold from the manifest, clamped into the slider's 250…700 МБ
         // range so a stray param can't push the knob off-track (default 300, D6).
         _splitThresholdMB = State(initialValue:
-            Double(min(700, max(250, manifest.params.splitThresholdMB))))
-        _buildMode = State(initialValue: manifest.params.buildMode)
+            Double(min(700, max(250, seed.splitThresholdMB))))
+        _buildMode = State(initialValue: seed.buildMode)
         // Seed the cover pick from the agent's default (cover_selected); fall back to
         // the first option so something is always selected when options exist.
         _coverSelectedID = State(initialValue:
@@ -1836,11 +1974,14 @@ private struct ConfirmView: View {
 
             Spacer(minLength: 8)
 
-            // "N из M" counter pill (q-counter). Shown whenever there is a queue,
-            // and reads "1 из N" because we present the first active book.
+            // "N из M" counter pill (q-counter). Shown whenever there is a queue.
+            // N is the PRESENTED book's position — opening the 2nd book from the
+            // queue reads "2 из 2" (it used to be hardcoded "1", which quietly
+            // claimed the first book was on screen).
             if pendingCount >= 1 {
                 HStack(spacing: 0) {
-                    Text("1").font(.system(size: Tokens.F.caption, weight: .bold).monospacedDigit())
+                    Text("\(position)")
+                        .font(.system(size: Tokens.F.caption, weight: .bold).monospacedDigit())
                         .foregroundColor(Tokens.C.textHigh)
                     Text(" из \(pendingCount)").font(.system(size: Tokens.F.caption).monospacedDigit())
                         .foregroundColor(Tokens.C.textMuted)
@@ -2555,15 +2696,35 @@ private struct ConfirmView: View {
 
     private var confirmFooter: some View {
         HStack(spacing: 10) {
-            if pendingCount > 1 {
+            // Only meaningful when more than one book is awaiting confirmation
+            // (spec §3: «показывать, если в очереди >1 книги»).
+            if pendingConfirmCount > 1 {
                 applyAllLink
             }
             Spacer(minLength: 8)
-            ghostButton("Пропустить", skip: true) {}
+            // "Пропустить" — LIVE (agent action `skip`, arch/plan-claude.md §2.3):
+            // takes the book off the pipeline, sources untouched. It is not a
+            // deletion and not a dead end — the book lands in the queue's ПРОПУЩЕНО
+            // section with «Вернуть» on the row, and a conscious re-drop of the
+            // folder re-arms it too (lesson .patches/004). Once the command is on
+            // disk the button locks to its ack; the agent's status flip then retires
+            // this window (the book stops being active).
+            if skipSent {
+                skipAck
+            } else {
+                ghostButton("Пропустить", skip: true,
+                            help: "Снять книгу с обработки. Файлы не тронуты — "
+                                + "книга уйдёт в раздел «Пропущено» в очереди, "
+                                + "откуда её можно вернуть.") {
+                    if onSkip() { skipSent = true }
+                }
+            }
             // "Позже в очередь" → open the queue; the book stays pending (no status
             // change here — the agent owns status). This is the window's entry point
             // into the queue screen (spec §7).
-            ghostButton("Позже в очередь", skip: false) { onOpenQueue() }
+            ghostButton("Позже в очередь", skip: false,
+                        help: "Открыть очередь. Книга останется ожидать "
+                            + "подтверждения — ничего не удаляется.") { onOpenQueue() }
             if sent {
                 sentAck
             } else {
@@ -2590,22 +2751,46 @@ private struct ConfirmView: View {
         .background(Tokens.C.surfaceFooter)
     }
 
+    /// True while the preset in force covers this book AND still equals what the
+    /// controls show — i.e. the click actually took effect and nothing was edited
+    /// afterwards. Derived (no extra @State), so editing a knob honestly flips the
+    /// link back from "Применено" to "Применить".
+    private var appliedToAll: Bool {
+        guard let preset = paramsPreset, preset.applies(to: manifest.bookID) else { return false }
+        return preset.params == editedParams
+    }
+
+    /// Footer link "Применить параметры ко всем (N)" (spec §3 / US-3.7): stores the
+    /// current quality/split params as the preset for the books awaiting
+    /// confirmation, so each opens pre-filled. It builds NOTHING and sends no
+    /// command — the cover and the final "Собрать" stay per-book.
     private var applyAllLink: some View {
-        Button(action: {}) {
+        Button(action: { onApplyToAll(editedParams) }) {
             HStack(spacing: 6) {
-                Image(systemName: "checkmark")
+                Image(systemName: appliedToAll ? "checkmark.circle.fill" : "checkmark")
                     .font(.system(size: 11, weight: .bold))
-                Text("Применить параметры ко всем (\(pendingCount))")
+                Text(appliedToAll
+                        ? "Применено ко всем (\(pendingConfirmCount))"
+                        : "Применить параметры ко всем (\(pendingConfirmCount))")
                     .font(.system(size: Tokens.F.caption, weight: .semibold))
             }
             .foregroundColor(Tokens.C.accentLabel)
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .help("Битрейт, каналы, частота, режим и нарезка станут значениями по "
+            + "умолчанию для остальных книг, ожидающих подтверждения. "
+            + "Обложку и «Собрать» подтверждаете по каждой книге отдельно.")
     }
 
-    private func ghostButton(_ title: String, skip: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    /// Footer ghost button. `enabled: false` renders it visibly inert (dimmed, no
+    /// click) instead of a dead control — the queue's disabled "Повторить" pattern
+    /// (QueueView `QButton(enabled:)`). `help` is REQUIRED (never empty, so no blank
+    /// tooltip bubble can appear) and, for an inert button, explains WHY on hover.
+    private func ghostButton(_ title: String, skip: Bool,
+                             enabled: Bool = true, help: String,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: { if enabled { action() } }) {
             Text(title)
                 .font(.system(size: Tokens.F.body, weight: .semibold))
                 .foregroundColor(Tokens.C.textSoft)
@@ -2623,6 +2808,10 @@ private struct ConfirmView: View {
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.55)
+        .help(help)
+        .accessibilityLabel("\(title). \(help)")
     }
 
     // Active "Собрать": writes the command with edited params, then locks the ack.
@@ -2682,6 +2871,26 @@ private struct ConfirmView: View {
                 RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
                     .stroke(Tokens.C.borderControl, lineWidth: 1)
             )
+    }
+
+    /// Ack for «Пропустить», in the ghost button's own chrome so the footer does
+    /// not reflow. It says where the book WENT — never a bare "готово" that leaves
+    /// the user wondering what just happened to it.
+    private var skipAck: some View {
+        Text("Пропущено →")
+            .font(.system(size: Tokens.F.body, weight: .semibold))
+            .foregroundColor(Tokens.C.textSecondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
+                    .fill(Tokens.C.surfaceControl)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
+                    .stroke(Tokens.C.borderFieldInput, lineWidth: 1)
+            )
+            .help("Книга снята с обработки и лежит в разделе «Пропущено» в очереди.")
     }
 
     // MARK: Computed labels
@@ -3783,6 +3992,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onReconvert: { [weak self] book in
                 self?.handleReconvert(book) ?? false
             },
+            onSkip: { [weak self] book in
+                self?.handleSkip(book) ?? false
+            },
             navigate: { [weak self] screen in self?.navigate(to: screen) },
             reveal: { [weak self] path in self?.reveal(path) },
             onInstalled: { [weak self] in self?.handleInstalled() },
@@ -4051,7 +4263,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // A new book to confirm → bring its confirm window to the front (a new
             // grouping prompt raises the window too; the modal sheet overlays
             // whatever screen is showing, so we don't force a screen change for it).
-            if newPending { navigate(to: .confirm) }
+            // Drop any hand-pick from the queue FIRST: an auto-surface must land on
+            // the fresh queue (first active book), not stay parked on a book the
+            // user opened by hand earlier.
+            if newPending {
+                model.clearSelection()
+                navigate(to: .confirm)
+            }
             bringWindowForward()
         } else if !hasActive && model.screen == .confirm {
             // The active book cleared while we were on the confirm window (the build
@@ -4101,6 +4319,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let delta = newFrameHeight - frame.height
         frame.origin.y -= delta
         frame.size.height = newFrameHeight
+        // …but keep the whole window ON SCREEN. `cappedContentHeight` bounds the
+        // HEIGHT, not the POSITION: a window parked low grows DOWNWARD from its
+        // pinned top, so a fitting-but-lower window still slides its footer —
+        // «Собрать» — under the bottom edge of the screen (measured up to 357pt on
+        // a long book). Only the VERTICAL axis is touched here, and only because
+        // WE just changed the height: a window the user dragged low himself never
+        // reaches this line (the guard above returns first). Rule + edge priority
+        // live in WindowGeometry (unit-checked); this is the only caller for Y.
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame = WindowGeometry.clampedVertically(frame, in: visible)
+        }
         window.setFrame(frame, display: true, animate: false)
     }
 
@@ -4156,6 +4385,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard abs(window.frame.width - w) > 0.5 else { return }
         var frame = window.frame
         frame.size.width = w               // top-left pinned (origin.x unchanged)
+        // …but keep the whole window ON SCREEN. AppKit does NOT constrain a frame
+        // horizontally (measured: a 400-wide window parked at the right edge keeps
+        // its origin and hangs 240pt past it when the confirm window widens it to
+        // 640) — and that overhang is exactly where the footer's «Собрать» sits, so
+        // the primary action would be unclickable. Only the HORIZONTAL axis is
+        // touched here — the axis this method just changed; the height refit owns Y.
+        // Rule + edge priority live in WindowGeometry (unit-checked).
+        if let visible = (window.screen ?? NSScreen.main)?.visibleFrame {
+            frame = WindowGeometry.clampedHorizontally(frame, in: visible)
+        }
         window.setFrame(frame, display: true, animate: false)
     }
 
@@ -4264,6 +4503,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         } catch {
             NSLog("[reconvert] reconvert write FAILED for book_id=%@: %@",
+                  book.bookID, String(describing: error))
+            return false
+        }
+    }
+
+    /// «Пропустить» in the confirm footer: drop a `skip` command for the book.
+    /// Returns true on a successful write so the button shows its ack. The app does
+    /// NOT change status (the agent owns it — D13): the agent marks the manifest
+    /// `skipped`, the SOURCES ARE NEVER TOUCHED, and the status flip moves the book
+    /// out of ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ into the queue's ПРОПУЩЕНО section via the state
+    /// watcher (so it is never "just gone"). Reversible: «Вернуть» on that row, or a
+    /// conscious re-drop of the folder. On failure we log and return false.
+    @discardableResult
+    private func handleSkip(_ book: BookSummary) -> Bool {
+        do {
+            let url = try engine.writeSkip(bookID: book.bookID)
+            print("[skip] skip dropped: \(url.lastPathComponent) "
+                + "book_id=\(book.bookID)")
+            return true
+        } catch {
+            NSLog("[skip] skip write FAILED for book_id=%@: %@",
                   book.bookID, String(describing: error))
             return false
         }

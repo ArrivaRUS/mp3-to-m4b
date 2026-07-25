@@ -57,6 +57,7 @@ SWIFT_SRCS=(
   "$REPO_DIR/app/main.swift"
   "$REPO_DIR/app/Tokens.swift"
   "$REPO_DIR/app/StateModel.swift"
+  "$REPO_DIR/app/WindowGeometry.swift"
   "$REPO_DIR/app/EngineClient.swift"
   "$REPO_DIR/app/EngineClient+Status.swift"
   "$REPO_DIR/app/QueueView.swift"
@@ -177,6 +178,14 @@ if [[ "$ICON_OK" -ne 1 ]]; then
 fi
 
 # --- Info.plist: clean, written from scratch (native bundle) ---------------
+# NSSupportsSuddenTermination / NSSupportsAutomaticTermination are DELIBERATELY NOT
+# emitted below (both default to false when the key is absent). Sudden termination
+# lets AppKit tear the process down with exit(): -applicationWillTerminate: never
+# runs and pending completion handlers never fire. This app depends on BOTH — the
+# delegate's teardown (app/main.swift applicationWillTerminate) and the agent
+# installer, which runs as a CHILD Process() awaited synchronously with
+# waitUntilExit (app/SetupView.swift). Being exit()'d mid-install leaves a
+# half-installed agent and skips handleInstalled. Do not re-add these keys.
 echo "==> writing Info.plist (id=$BUNDLE_ID, exec=$APP_NAME, version=$VERSION)"
 PLIST="$APP/Contents/Info.plist"
 cat > "$PLIST" <<PLIST_EOF
@@ -210,10 +219,6 @@ cat > "$PLIST" <<PLIST_EOF
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
-	<key>NSSupportsAutomaticTermination</key>
-	<true/>
-	<key>NSSupportsSuddenTermination</key>
-	<true/>
 </dict>
 </plist>
 PLIST_EOF

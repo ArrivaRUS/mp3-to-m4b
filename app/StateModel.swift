@@ -126,6 +126,11 @@ struct BookSummary: Codable, Identifiable, Equatable {
     var isConverting: Bool { status == "converting" }
     var isDone: Bool { status == "done" }
     var isError: Bool { status == "error" }
+    /// Taken off the pipeline by «Пропустить» (agent `skip`). Sources are intact;
+    /// the scan never re-arms it. Deliberately NOT `isActive` — a skipped book must
+    /// never be presented in the confirm window — it lives in the queue's
+    /// ПРОПУЩЕНО section, where «Вернуть» re-arms it (a re-drop does too).
+    var isSkipped: Bool { status == "skipped" }
     /// Books the confirm window should surface: awaiting confirm, mid-build, or
     /// failed (so the window reflects the live build, not only the pending step).
     var isActive: Bool { isPendingConfirm || isConverting || isError }
@@ -361,15 +366,48 @@ struct ShowcaseState: Codable, Equatable {
     var pendingConfirm: [BookSummary] { books.filter { $0.isPendingConfirm } }
 
     /// Books in any "active" stage the confirm window can present (pending-confirm,
-    /// converting, or error), in showcase order. The window shows the FIRST of
-    /// these; the rising-edge raise still keys on pending-confirm only.
+    /// converting, or error), in showcase order. With no explicit pick the window
+    /// shows the FIRST of these; the rising-edge raise still keys on pending-confirm
+    /// only. See `presentedBook(selectedID:)` for the full routing rule.
     var activeBooks: [BookSummary] { books.filter { $0.isActive } }
+
+    // MARK: Confirm-window routing (WHICH book the window presents)
+
+    /// The single source of truth for "which book does the confirm window show".
+    ///
+    /// `selectedID` is the book the user explicitly picked in the queue
+    /// («Подтвердить» on a row); nil = no pick. Rules, in order:
+    ///   1. an explicit pick that is STILL ACTIVE wins — pressing «Подтвердить» on
+    ///      the second book must open the SECOND book (never the first);
+    ///   2. a pick that stopped being active (built / cancelled / vanished) is
+    ///      IGNORED, so the window can never stick to a retired book;
+    ///   3. no (or stale) pick → the first active book, which is the auto-surface
+    ///      default the agent's rising-edge raise relies on.
+    /// Pure function of the showcase — unit-checked by `app/selfcheck_routing.swift`.
+    func presentedBook(selectedID: String?) -> BookSummary? {
+        if let id = selectedID, let picked = activeBooks.first(where: { $0.bookID == id }) {
+            return picked
+        }
+        return activeBooks.first
+    }
+
+    /// 1-based position of `bookID` among the active books — the confirm header's
+    /// «N из M» must count the book actually ON SCREEN, not always the first one.
+    /// nil when the book is not active (nothing sensible to show).
+    func activePosition(of bookID: String) -> Int? {
+        guard let idx = activeBooks.firstIndex(where: { $0.bookID == bookID }) else { return nil }
+        return idx + 1
+    }
 
     // Status partitions for the QUEUE screen (spec §7 sections), all in showcase
     // order. The agent owns these statuses; the queue just projects them.
     var convertingBooks: [BookSummary] { books.filter { $0.isConverting } }
     var doneBooks: [BookSummary] { books.filter { $0.isDone } }
     var errorBooks: [BookSummary] { books.filter { $0.isError } }
+    /// Books the user took off the pipeline with «Пропустить» — the queue's
+    /// ПРОПУЩЕНО section. They are shown (never silently vanished) so the answer to
+    /// «куда делась книга?» is one screen away, with «Вернуть» right on the row.
+    var skippedBooks: [BookSummary] { books.filter { $0.isSkipped } }
 
     /// The first converting book, if any — the Status hero's "Сейчас: <title>" line
     /// (spec §5). nil when nothing is mid-build (the hero shows an idle sub instead).
@@ -680,6 +718,8 @@ struct BookManifest: Decodable, Equatable {
     var isPendingConfirm: Bool { status == "pending-confirm" }
     var isConverting: Bool { status == "converting" }
     var isError: Bool { status == "error" }
+    /// Taken off the pipeline by «Пропустить» — see `BookSummary.isSkipped`.
+    var isSkipped: Bool { status == "skipped" }
     /// Books the confirm window should present: awaiting confirm OR mid-build OR
     /// failed (the window mirrors the live build, not just the pending step).
     var isActive: Bool { isPendingConfirm || isConverting || isError }
