@@ -1,0 +1,6 @@
+# The frozen FDA helper is the TCC identity of the LaunchAgent: the user's Full
+# Disk Access grant is pinned to the cdhash of these exact bytes. Git must never
+# run a clean/smudge filter, an EOL conversion, a diff driver or a merge driver
+# over it — any of those would rewrite the file on checkout and silently revoke
+# every user's grant (plan v2, M3f). See packaging/agent-src/PROVENANCE.md.
+packaging/mp3-to-m4b-agent binary -filter -diff -merge -text

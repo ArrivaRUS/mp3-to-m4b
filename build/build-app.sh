@@ -22,11 +22,23 @@
 #
 # Output: build/dist/mp3-to-m4b.app
 #
-# Usage: build/build-app.sh [version]   (default version below)
+# Usage: build/build-app.sh [version] [--allow-sips]
+#   --allow-sips  degrade to the low-fidelity `sips` rasterizer instead of
+#                 failing when cairosvg is unusable. DEV ONLY — never for a
+#                 release build; see the ICON section for why.
 
 set -euo pipefail
 
-VERSION="${1:-0.9}"
+VERSION=""
+ALLOW_SIPS=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-sips) ALLOW_SIPS=1 ;;
+    -*) echo "build-app: unknown option '$arg' (usage: build-app.sh [version] [--allow-sips])" >&2; exit 2 ;;
+    *)  VERSION="$arg" ;;
+  esac
+done
+VERSION="${VERSION:-0.9}"
 BUNDLE_ID="com.arrivarus.mp3tom4b"
 APP_NAME="mp3-to-m4b"
 MIN_MACOS="11.0"
@@ -127,30 +139,108 @@ done
 
 # --- icon: SVG -> PNG set -> .icns -----------------------------------------
 # Render the SVG once at 1024 (transparent bg), then sips-downscale to each
-# iconset size. Rasterizer preference:
-#   1. cairosvg (matches the neighbor's proven path; best fidelity) if present;
-#   2. else `sips` reading the SVG directly (zero extra deps; works for this
-#      flat icon — verified for branding/icon-app.svg);
-#   3. else skip the icon with a loud warning (M0.1 stays unblocked; the bundle
-#      gets the generic icon). TODO: pin a rasterizer in build/.venv before the
-#      release-icon milestone so the shipped .icns is always cairosvg-quality.
+# iconset size.
+#
+# cairosvg is the ONLY rasterizer we ship with. `sips` can read an SVG, but it
+# does so crudely, and the failure is invisible: the build stays green and the
+# release quietly carries a worse icon. The icon is the face of the release, so
+# an unusable rasterizer is a BUILD ERROR (--allow-sips opts out, dev only).
+#
+# Two traps, both live on this machine — do not "simplify" back to calling the
+# console script:
+#   * $BUILD_DIR/.venv/bin/cairosvg is a console script. When the project path
+#     contains a space it is invoked through /bin/sh, and SIP strips DYLD_* from
+#     that shell's environment -> cairocffi's dlopen fails with
+#     "cannot load library 'libcairo.2.dylib'". Calling the venv's python
+#     directly with `-m cairosvg` keeps DYLD_* alive (memory:
+#     venv-scripts-space-path-sip-strips-dyld).
+#   * libcairo lives wherever Homebrew is; its prefix is DISCOVERED below, never
+#     hardcoded.
 echo "==> building AppIcon.icns from $(basename "$ICON_SVG")"
 ICON_TMP="$(mktemp -d)"
 ICONSET="$ICON_TMP/AppIcon.iconset"
 mkdir -p "$ICONSET"
 BASE_PNG="$ICON_TMP/base-1024.png"
 
-CAIROSVG="$BUILD_DIR/.venv/bin/cairosvg"
-[[ -x "$CAIROSVG" ]] || CAIROSVG="$(command -v cairosvg 2>/dev/null || true)"
+VENV_PY="$BUILD_DIR/.venv/bin/python3"
+
+# Where does libcairo.2.dylib live? brew first (handles a relocated Homebrew),
+# then the conventional prefixes.
+find_cairo_libdir() {
+  local p
+  for p in "$(brew --prefix cairo 2>/dev/null || true)" "$(brew --prefix 2>/dev/null || true)"; do
+    [[ -n "$p" && -f "$p/lib/libcairo.2.dylib" ]] && { printf '%s' "$p/lib"; return 0; }
+  done
+  for p in /opt/homebrew/lib /usr/local/lib /opt/local/lib; do
+    [[ -f "$p/libcairo.2.dylib" ]] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
 
 ICON_OK=0
-if [[ -n "$CAIROSVG" && -x "$CAIROSVG" ]]; then
-  echo "    rasterizer: cairosvg"
-  "$CAIROSVG" "$ICON_SVG" -o "$BASE_PNG" --output-width 1024 --output-height 1024 2>&1 | sed 's/^/    /' || true
+RASTERIZER=""
+ICON_WHY=""
+if [[ ! -x "$VENV_PY" ]]; then
+  ICON_WHY="no venv python at $VENV_PY"
+else
+  CAIRO_LIBDIR="$(find_cairo_libdir || true)"
+  if [[ -z "$CAIRO_LIBDIR" ]]; then
+    ICON_WHY="libcairo.2.dylib not found (brew --prefix cairo / the usual prefixes)"
+  elif DYLD_FALLBACK_LIBRARY_PATH="$CAIRO_LIBDIR${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" \
+       "$VENV_PY" -m cairosvg "$ICON_SVG" -o "$BASE_PNG" \
+       --output-width 1024 --output-height 1024 2>"$ICON_TMP/cairo.err"; then
+    RASTERIZER="cairosvg"
+    echo "    rasterizer: cairosvg  ($VENV_PY -m cairosvg)"
+    echo "                libcairo: $CAIRO_LIBDIR"
+  else
+    ICON_WHY="$(tr '\n' ' ' < "$ICON_TMP/cairo.err" | cut -c1-300)"
+  fi
 fi
+
+# A produced file is not a produced ICON: check the geometry too, or a truncated
+# render sails through as green.
+if [[ -s "$BASE_PNG" ]]; then
+  px_w="$(sips -g pixelWidth "$BASE_PNG" 2>/dev/null | awk '/pixelWidth/{print $2}')"
+  px_h="$(sips -g pixelHeight "$BASE_PNG" 2>/dev/null | awk '/pixelHeight/{print $2}')"
+  if [[ "$px_w" != "1024" || "$px_h" != "1024" ]]; then
+    ICON_WHY="rasterizer produced ${px_w}x${px_h}, expected 1024x1024"
+    rm -f "$BASE_PNG"
+    RASTERIZER=""
+  else
+    echo "    base render: ${px_w}x${px_h} ok"
+  fi
+fi
+
 if [[ ! -s "$BASE_PNG" ]]; then
-  echo "    rasterizer: sips (direct SVG read)"
-  sips -s format png "$ICON_SVG" --out "$BASE_PNG" >/dev/null 2>&1 || true
+  if [[ "$ALLOW_SIPS" -eq 1 ]]; then
+    echo "    cairosvg unusable ($ICON_WHY)" >&2
+    echo "    --allow-sips given -> degrading to the low-fidelity sips rasterizer" >&2
+    sips -s format png "$ICON_SVG" --out "$BASE_PNG" >/dev/null 2>&1 || true
+    [[ -s "$BASE_PNG" ]] && RASTERIZER="sips (DEGRADED)" && echo "    rasterizer: sips (DEGRADED — not release quality)"
+  else
+    cat >&2 <<EOF
+
+build-app: FAILED — cannot rasterize the app icon with cairosvg.
+
+  reason: $ICON_WHY
+
+  The icon is release-visible, so the build refuses to substitute the
+  low-fidelity 'sips' path silently. Fix the rasterizer:
+
+    python3 -m venv "$BUILD_DIR/.venv"
+    "$BUILD_DIR/.venv/bin/pip" install cairosvg
+    brew install cairo
+
+  Note: call it as '"\$VENV/bin/python3" -m cairosvg', never the console script
+  '.venv/bin/cairosvg' — SIP strips DYLD_* from the /bin/sh that wraps it when
+  the project path contains a space, and cairocffi then cannot dlopen libcairo.
+
+  For a throwaway dev build only:  build/build-app.sh $VERSION --allow-sips
+
+EOF
+    rm -rf "$ICON_TMP"
+    exit 1
+  fi
 fi
 
 if [[ -s "$BASE_PNG" ]]; then
@@ -172,10 +262,13 @@ fi
 rm -rf "$ICON_TMP"
 
 if [[ "$ICON_OK" -ne 1 ]]; then
-  echo "    WARNING: could not build AppIcon.icns (no cairosvg, sips fallback failed)." >&2
-  echo "             Bundle will use the generic icon. Install cairosvg into build/.venv" >&2
-  echo "             (python3 -m venv build/.venv && build/.venv/bin/pip install cairosvg)." >&2
+  echo "" >&2
+  echo "build-app: FAILED — iconutil could not assemble AppIcon.icns" >&2
+  echo "           (base render came from: ${RASTERIZER:-none})." >&2
+  echo "           Not shipping a bundle with a generic icon." >&2
+  exit 1
 fi
+echo "    AppIcon.icns built via: $RASTERIZER"
 
 # --- Info.plist: clean, written from scratch (native bundle) ---------------
 # NSSupportsSuddenTermination / NSSupportsAutomaticTermination are DELIBERATELY NOT
