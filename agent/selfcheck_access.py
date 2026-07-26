@@ -59,6 +59,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import selfcheck_blast_radius as blast_radius
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # --- tiny assertion harness -------------------------------------------------
@@ -1071,39 +1073,22 @@ def scenario_journal_rotation(box: Sandbox, state, config) -> None:
 # K. blast radius — the live system must be exactly as we found it
 # ============================================================================
 
-REAL_SUPPORT = Path.home() / "Library" / "Application Support" / "mp3-to-m4b"
-REAL_LOG = Path.home() / "Library" / "Logs" / "mp3-to-m4b.log"
-REAL_PLIST = (Path.home() / "Library" / "LaunchAgents"
-              / "com.arrivarus.mp3tom4b.agent.plist")
-
-
 def _blast_snapshot() -> dict:
-    def stamp(p: Path):
-        return (p.exists(), p.stat().st_mtime_ns if p.exists() else 0)
-    jobs = []
-    try:
-        proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-        jobs = [ln.split("\t")[-1].strip() for ln in (proc.stdout or "").splitlines()
-                if "mp3tom4b" in ln]
-    except OSError:
-        pass
-    return {"support": stamp(REAL_SUPPORT), "log": stamp(REAL_LOG),
-            "plist": stamp(REAL_PLIST), "jobs": sorted(jobs)}
+    """One shared implementation (:mod:`agent.selfcheck_blast_radius`).
+
+    Not a local copy: the guard has to tell a self-check writing into the live
+    install apart from the USER'S OWN AGENT, which since 1.0 ticks every 300 s and
+    therefore inside this suite's runtime. Two divergent copies of that judgement
+    is how a guard rots.
+    """
+    return blast_radius.snapshot()
 
 
 def scenario_blast_radius(before: dict) -> None:
     print("\n— K: blast radius — the live system is untouched —")
-    after = _blast_snapshot()
-    check("blast_radius: the real App Support tree was not created/modified",
-          after["support"] == before["support"],
-          f"before={before['support']} after={after['support']}")
-    check("blast_radius: the real agent log was not created/modified",
-          after["log"] == before["log"])
-    check("blast_radius: the real production plist was not created/modified",
-          after["plist"] == before["plist"])
-    check("blast_radius: no mp3tom4b job appeared in the live launchd domain",
-          after["jobs"] == before["jobs"],
-          f"before={before['jobs']} after={after['jobs']}")
+    damage = blast_radius.diff(before, blast_radius.snapshot())
+    check("blast_radius: this suite did not touch the user's install",
+          damage == [], "; ".join(damage)[:400])
 
 
 # --- the run ----------------------------------------------------------------

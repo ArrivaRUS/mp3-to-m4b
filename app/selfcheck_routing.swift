@@ -430,8 +430,8 @@ struct RoutingSelfCheck {
               FolderAccessCopy.disclosureTitle(blocked)?.contains("не появился") == true)
         check("нет доступа ≠ нет папки: у missing FDA-блока нет вовсе",
               FolderAccessCopy.disclosureTitle(.problem(.missing)) == nil)
-        check("FDA-шаги называют именно файл-агент, а не приложение",
-              FolderAccessCopy.fdaSteps.contains { $0.contains(StateStore.helperName) })
+        check("шаги «добавить вручную» называют именно файл-агент, а не приложение",
+              FolderAccessCopy.routeAddSteps.contains { $0.contains(StateStore.helperName) })
         check("FDA-блок предупреждает, что панель врёт про свежие записи (урок донора 020)",
               FolderAccessCopy.fdaCaveat.contains("не показывает свежие записи"))
 
@@ -471,6 +471,141 @@ struct RoutingSelfCheck {
               naivePrimary(denied) == naivePrimary(blocked)
                   && FolderAccessCopy.actions(denied).primary
                       != FolderAccessCopy.actions(blocked).primary)
+    }
+
+    // MARK: M6 — куда ведёт ручной фолбэк и как кнопки ОТВЕЧАЮТ на нажатие
+    //
+    // Два боевых бага, оба у человека на рабочей установке:
+    //   1. ссылка вела в «Полный доступ к диску», а наш грант живёт в «Файлах и
+    //      папках» — человек искал `mp3-to-m4b-agent` в списке, где его быть не
+    //      может, и решил, что приложение врёт;
+    //   2. «Скопировать путь агента» копировала исправно и молчала — а молчащая
+    //      кнопка неотличима от мёртвой.
+
+    static func checkManualFallback() {
+        // --- 1. якоря разделов --------------------------------------------------
+        check("«Файлы и папки» открываются якорем Privacy_FilesAndFolders",
+              FolderAccessAction.openFilesAndFolders.settingsAnchor == "Privacy_FilesAndFolders")
+        check("«Полный доступ к диску» — якорь Privacy_AllFiles",
+              FolderAccessAction.openPrivacyPane.settingsAnchor == "Privacy_AllFiles")
+        check("два РАЗНЫХ раздела, а не один и тот же дважды",
+              FolderAccessAction.openFilesAndFolders.settingsAnchor
+                  != FolderAccessAction.openPrivacyPane.settingsAnchor)
+        check("у кнопок, не ведущих в настройки, якоря нет",
+              FolderAccessAction.recheck.settingsAnchor == nil
+                  && FolderAccessAction.copyHelperPath.settingsAnchor == nil)
+
+        // Якоря сверяются С САМОЙ СИСТЕМОЙ, а не с документацией: панель уже один раз
+        // соврала этому проекту (урок донора 020B). `TCCServiceList.plist` и таблица
+        // строк расширения — то, по чему System Settings реально ищет раздел.
+        let ext = "/System/Library/ExtensionKit/Extensions/SecurityPrivacyExtension.appex"
+        let declared = declaredPrivacyAnchors(extensionPath: ext)
+        if declared.isEmpty {
+            check("якоря разделов сверены с системой (расширение не найдено — пропуск)", true,
+                  "нет \(ext)")
+        } else {
+            for action in [FolderAccessAction.openFilesAndFolders, .openPrivacyPane] {
+                let anchor = action.settingsAnchor ?? ""
+                check("система знает якорь \(anchor)", declared.contains(anchor),
+                      "объявленных якорей: \(declared.count)")
+            }
+            check("НЕГ.КОНТРОЛЬ: выдуманный якорь система НЕ знает",
+                  !declared.contains("Privacy_FolderAccessDefinitelyNotAThing"))
+        }
+
+        // --- 2. два маршрута, а не один -----------------------------------------
+        let zoned = FolderAccessCopy.routeToggleSteps(zone: "Рабочий стол")
+        check("маршрут 1 ведёт в «Файлы и папки»",
+              zoned.contains { $0.contains("Файлы и папки") })
+        check("маршрут 1 называет КОНКРЕТНЫЙ переключатель",
+              zoned.contains { $0.contains("«Рабочий стол»") })
+        check("без защищённой зоны переключатель не выдумывается",
+              !FolderAccessCopy.routeToggleSteps(zone: nil).contains { $0.contains("«Рабочий стол»") })
+        check("маршрут 2 ведёт в «Полный доступ к диску» и жмёт «+»",
+              FolderAccessCopy.routeAddSteps.contains { $0.contains("Полный доступ к диску") }
+                  && FolderAccessCopy.routeAddSteps.contains { $0.contains("«+»") })
+        check("маршруты различаются и по заголовку",
+              FolderAccessCopy.routeToggleTitle != FolderAccessCopy.routeAddTitle)
+        check("сначала дешёвый ремонт (тумблер), потом тяжёлый (+)",
+              FolderAccessCopy.routeToggleSteps(zone: "Документы").count
+                  < FolderAccessCopy.routeAddSteps.count)
+
+        // --- 3. имена зон — те же, что показывает macOS -------------------------
+        let home = "/Users/tester"
+        check("Рабочий стол опознан",
+              LocalWatchFolder.protectedZoneName(for: "\(home)/Desktop/mp3-to-m4b", home: home)
+                  == "Рабочий стол")
+        check("Документы опознаны",
+              LocalWatchFolder.protectedZoneName(for: "\(home)/Documents/x", home: home) == "Документы")
+        check("Загрузки опознаны",
+              LocalWatchFolder.protectedZoneName(for: "\(home)/Downloads", home: home) == "Загрузки")
+        check("вне защищённых зон переключателя нет",
+              LocalWatchFolder.protectedZoneName(for: LocalWatchFolder.path(home: home),
+                                                 home: home) == nil)
+
+        // --- 4. кнопка ОБЯЗАНА показать, что сработала --------------------------
+        check("успех копирования: заголовок меняется",
+              FolderAccessAck.copyTitle(copied: true) != FolderAccessAck.copyTitle(copied: false))
+        check("успех копирования: меняется ИКОНКА, не только текст",
+              FolderAccessAck.copyIcon(copied: true) != FolderAccessAck.copyIcon(copied: false),
+              FolderAccessAck.copyIcon(copied: true))
+        check("успех копирования: меняется ЦВЕТ кнопки",
+              FolderAccessAck.copyTone(copied: true, refused: false) == .success
+                  && FolderAccessAck.copyTone(copied: false, refused: false) == .neutral)
+        check("отказ виден на самой кнопке, а не только в журнале",
+              FolderAccessAck.copyTone(copied: false, refused: true) == .danger)
+        check("отказ НИКОГДА не красится в цвет успеха",
+              FolderAccessAck.copyTone(copied: true, refused: true) == .danger)
+        check("расписка об успехе гаснет (иначе второе нажатие ничего не меняет)",
+              FolderAccessAck.successLingers > 0 && FolderAccessAck.successLingers <= 5,
+              "\(FolderAccessAck.successLingers) с")
+        check("текст расписки читается как подтверждение",
+              FolderAccessCopy.copyDone.contains("✓"), FolderAccessCopy.copyDone)
+        check("у отказа есть объяснение, а не просто красный цвет",
+              FolderAccessCopy.copyRefused.contains("не скопирован"))
+        check("не открывшаяся панель настроек тоже отвечает пользователю",
+              FolderAccessCopy.paneOpenFailed.contains("Файлы и папки"))
+
+        // --- 5. НЕГАТИВНЫЙ КОНТРОЛЬ --------------------------------------------
+        // Как было: один маршрут, один якорь (FDA), расписка — только смена текста.
+        // Фикстуры обязаны различать старое поведение и новое.
+        let oldSingleAnchor = "Privacy_AllFiles"
+        check("НЕГ.КОНТРОЛЬ: старый код вёл ОБЕ кнопки в Полный доступ к диску",
+              FolderAccessAction.openPrivacyPane.settingsAnchor == oldSingleAnchor
+                  && FolderAccessAction.openFilesAndFolders.settingsAnchor != oldSingleAnchor)
+        let textOnlyAck: (Bool) -> (String, String, String) = { copied in
+            (copied ? "Путь скопирован" : "Скопировать путь агента", "doc.on.doc", "neutral")
+        }
+        check("НЕГ.КОНТРОЛЬ: расписка только текстом — иконка и цвет не менялись",
+              textOnlyAck(true).1 == textOnlyAck(false).1
+                  && FolderAccessAck.copyIcon(copied: true) != FolderAccessAck.copyIcon(copied: false))
+    }
+
+    /// Anchors this macOS actually knows, read out of the Settings privacy extension
+    /// (`TCCServiceList.plist` + the binary's string table). Empty ⇒ the extension is
+    /// not where we expect, and the caller skips rather than failing on a machine
+    /// that simply differs.
+    static func declaredPrivacyAnchors(extensionPath: String) -> Set<String> {
+        var found: Set<String> = []
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: extensionPath) else { return [] }
+        let resources = extensionPath + "/Contents/Resources"
+        var candidates = [resources + "/TCCServiceList.plist"]
+        if let macos = try? fm.contentsOfDirectory(atPath: extensionPath + "/Contents/MacOS") {
+            candidates += macos.map { extensionPath + "/Contents/MacOS/" + $0 }
+        }
+        for path in candidates {
+            guard let data = fm.contents(atPath: path) else { continue }
+            // Scan bytes for the literal anchor names — works for both the plist and
+            // the Mach-O string table without parsing either.
+            guard let text = String(data: data, encoding: .isoLatin1) else { continue }
+            for name in ["Privacy_FilesAndFolders", "Privacy_AllFiles",
+                         "Privacy_DesktopFolder", "Privacy_DownloadsFolder"]
+            where text.contains(name) {
+                found.insert(name)
+            }
+        }
+        return found
     }
 
     // MARK: M6 — «Проверить снова»: three outcomes, not two
@@ -995,6 +1130,7 @@ struct RoutingSelfCheck {
         checkFolderAccessDecode()
         // M6 — the card that finally hangs off that gate.
         checkFolderAccessCard()
+        checkManualFallback()
         checkFolderRecheck()
         checkLocalWatchFolder()
         checkWatchDirTruth()

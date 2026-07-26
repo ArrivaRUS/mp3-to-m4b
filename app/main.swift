@@ -150,6 +150,9 @@ final class ReaderModel: ObservableObject {
     /// acks: the card never claims a copy happened on its own.
     @Published var accessPathCopied = false
     @Published var accessCopyRefused = false
+    /// A System Settings panel would not open. Surfaced on the card so «Открыть…»
+    /// is never a button that does nothing visible.
+    @Published var accessPaneOpenFailed = false
     /// The window hit the screen ceiling on the last refit, so the content really is
     /// scrolling. Set by `refitWindowHeight` (it owns both numbers) and rendered as
     /// an OVERLAY hint — never as layout, or it would change the very height it
@@ -344,6 +347,7 @@ private struct RootView: View {
             watchDir: resolvedWatchDir() ?? model.state.agent.watchDir,
             pathCopied: model.accessPathCopied,
             copyRefused: model.accessCopyRefused,
+            paneOpenFailed: model.accessPaneOpenFailed,
             perform: onAccessAction,
             onHandOff: { navigate(.status) })
     }
@@ -562,22 +566,40 @@ private struct RootView: View {
 /// (bundled installer via Process), `FFmpegProbe` (engine check), `InstallPhase`
 /// (idle/running/done/failed), and the folder-chooser pattern (NSOpenPanel +
 /// "Создать" when missing + a real existence check via `SetupView.directoryExists`).
-/// Open the System Settings "Full Disk Access" privacy pane (fb2 parity, brief).
-/// The `Privacy_AllFiles` anchor lands directly on the Full Disk Access list on
-/// modern macOS; older systems open the Security & Privacy pane. Best-effort.
+/// Reveal a section of System Settings › Конфиденциальность и безопасность.
 ///
-/// A FALLBACK route since T0 (addendum §5.1): the grant our helper actually gets
-/// comes from the consent dialog, and this panel's own preflight is refused on
-/// every run. It stays because the one case with no other remedy — «Не разрешать»
-/// already pressed — has to end somewhere.
-func openFullDiskAccessPane() {
-    let urls = [
-        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-        "x-apple.systempreferences:com.apple.preference.security?Privacy",
+/// `anchor` is a `revealElementKeyName` — NOT a name we invented. The two we use
+/// were read off this machine rather than out of documentation, because the panel
+/// has already lied to this project once (donor lesson 020B):
+///
+///   · `Privacy_FilesAndFolders` — «Разрешить приложениям доступ к пользовательским
+///     файлам». Where a FOLDER grant lives, as a per-app switch. This is where our
+///     `kTCCServiceSystemPolicyDesktopFolder` row actually is.
+///   · `Privacy_AllFiles` — «Полный доступ к диску». The only list with a «+», so
+///     the only way to add a bundle-less path client that has no row yet.
+///
+/// Both identifiers appear in the extension's own string table, and
+/// `TCCServiceList.plist` maps `kTCCServiceSystemPolicyAllFiles → Privacy_AllFiles`
+/// — which is exactly why the old single anchor was wrong: we do not hold that
+/// service, so we were opening a list our helper cannot be in.
+///
+/// The bundle id also moved with macOS 13 (`com.apple.settings.PrivacySecurity.
+/// extension`; verified on this machine), so the legacy `com.apple.preference.
+/// security` form is kept only as a trailing fallback for older systems.
+///
+/// Returns false when NOTHING opened — the caller must show that, not swallow it.
+@discardableResult
+func openPrivacySettings(anchor: String) -> Bool {
+    let candidates = [
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?\(anchor)",
+        "x-apple.systempreferences:com.apple.preference.security?\(anchor)",
+        "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
     ]
-    for s in urls {
-        if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
+    for s in candidates {
+        if let url = URL(string: s), NSWorkspace.shared.open(url) { return true }
     }
+    NSLog("[access] could not open System Settings for anchor %@", anchor)
+    return false
 }
 
 private struct SettingsView: View {
@@ -1344,9 +1366,12 @@ private struct SettingsView: View {
 
             SettingsHairline(color: Tokens.C.borderHairline)
 
-            // Full Disk Access › — opens the System Settings privacy pane (the exact
-            // "Full Disk Access" list). A chevron marks it as an outward jump.
-            Button(action: openFullDiskAccess) {
+            // «Доступ к папкам» › — jumps to «Файлы и папки», where the agent's
+            // folder grant actually lives as a switch. It used to open «Полный
+            // доступ к диску», which is a different list that our helper is not in
+            // and cannot be in until somebody presses «+» there — the same wrong
+            // destination the access card was sending people to.
+            Button(action: { openPrivacySettings(anchor: "Privacy_FilesAndFolders") }) {
                 HStack(spacing: 11) {
                     ZStack {
                         RoundedRectangle(cornerRadius: Tokens.R.chip, style: .continuous)
@@ -1357,10 +1382,10 @@ private struct SettingsView: View {
                     }
                     .frame(width: 28, height: 28)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Full Disk Access")
+                        Text("Доступ к файлам и папкам")
                             .font(.system(size: Tokens.F.body))
                             .foregroundColor(Tokens.C.textHigh)
-                        Text("Доступ фонового агента к папкам")
+                        Text("Разрешения фонового агента в macOS")
                             .font(.system(size: Tokens.F.small))
                             .foregroundColor(Tokens.C.textTertiary)
                     }
@@ -1521,10 +1546,6 @@ private struct SettingsView: View {
                 // is still on the OLD folder, and the red stderr line says why.
             })
     }
-
-    /// Open the System Settings "Full Disk Access" privacy pane. Shared with the
-    /// access card's FDA fallback so both jump to the same place.
-    private func openFullDiskAccess() { openFullDiskAccessPane() }
 
     // MARK: - Small helpers
 
@@ -5087,11 +5108,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .openAppSettings:
             navigate(to: .settings)
         case .copyHelperPath:
-            let ok = copyHelperPathFailClosed()
-            model.accessPathCopied = ok
-            model.accessCopyRefused = !ok
-        case .openPrivacyPane:
-            openFullDiskAccessPane()
+            acknowledgeCopy(copyHelperPathFailClosed())
+        case .openFilesAndFolders, .openPrivacyPane:
+            guard let anchor = action.settingsAnchor else { return }
+            model.accessPaneOpenFailed = !openPrivacySettings(anchor: anchor)
+        }
+    }
+
+    /// Token for the pending "clear the copy acknowledgement" hop. Without it a
+    /// revert scheduled by the FIRST press would wipe the ack of a LATER one, and
+    /// the second press would look dead — which is the very bug being fixed.
+    private var copyAckGeneration = 0
+
+    /// Show the result of the fail-closed copy, LOUDLY, and let it lapse.
+    ///
+    /// Both halves are the fix. Loud, because the previous acknowledgement was a
+    /// text swap on a grey pill and the human reported the button as broken while it
+    /// was working perfectly. Lapsing, because an ack that never reverts makes every
+    /// press after the first produce no change at all — a permanently green button is
+    /// as silent as a grey one.
+    private func acknowledgeCopy(_ ok: Bool) {
+        copyAckGeneration &+= 1
+        let generation = copyAckGeneration
+        model.accessPathCopied = ok
+        model.accessCopyRefused = !ok
+        // A refusal is an ERROR, not a receipt: it stays until the user does
+        // something about it. Only the success receipt lapses.
+        guard ok else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + FolderAccessAck.successLingers) { [weak self] in
+            guard let self = self, self.copyAckGeneration == generation else { return }
+            self.model.accessPathCopied = false
         }
     }
 
@@ -5116,6 +5162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A copy ack from the previous round says nothing about this one.
         model.accessPathCopied = false
         model.accessCopyRefused = false
+        model.accessPaneOpenFailed = false
 
         do {
             try engine.writeRecheckAccess()

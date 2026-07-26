@@ -146,9 +146,12 @@ enum FolderAccessAction: String, Equatable {
     case chooseFolder
     /// Go to the app's own Настройки screen.
     case openAppSettings
-    /// Copy `ProgramArguments[0]` — fail-closed, inside the FDA fallback only.
+    /// Copy `ProgramArguments[0]` — fail-closed, inside the manual fallback only.
     case copyHelperPath
-    /// Open the System Settings privacy pane — inside the FDA fallback only.
+    /// Open «Файлы и папки» — where an EXISTING folder grant lives as a switch.
+    case openFilesAndFolders
+    /// Open «Полный доступ к диску» — the only panel with a «+», i.e. the only way
+    /// to create access for a bundle-less path client from nothing.
     case openPrivacyPane
 
     var title: String {
@@ -159,7 +162,8 @@ enum FolderAccessAction: String, Equatable {
         case .chooseFolder:           return "Выбрать другую папку…"
         case .openAppSettings:        return "Открыть Настройки"
         case .copyHelperPath:         return "Скопировать путь агента"
-        case .openPrivacyPane:        return "Открыть Системные настройки"
+        case .openFilesAndFolders:    return "Открыть «Файлы и папки»"
+        case .openPrivacyPane:        return "Открыть «Полный доступ к диску»"
         }
     }
 
@@ -171,7 +175,21 @@ enum FolderAccessAction: String, Equatable {
         case .chooseFolder:           return "folder"
         case .openAppSettings:        return "gearshape"
         case .copyHelperPath:         return "doc.on.doc"
-        case .openPrivacyPane:        return "arrow.up.right.square"
+        case .openFilesAndFolders:    return "folder.badge.gearshape"
+        case .openPrivacyPane:        return "externaldrive.badge.person.crop"
+        }
+    }
+
+    /// The System Settings anchor this action reveals, if any. Verified against the
+    /// OS itself rather than documentation: these identifiers are the
+    /// `revealElementKeyName` values inside
+    /// `SecurityPrivacyExtension.appex/Contents/Resources/TCCServiceList.plist` and
+    /// the extension binary's own string table on this machine (macOS 26).
+    var settingsAnchor: String? {
+        switch self {
+        case .openFilesAndFolders: return "Privacy_FilesAndFolders"
+        case .openPrivacyPane:     return "Privacy_AllFiles"
+        default:                   return nil
         }
     }
 }
@@ -207,6 +225,26 @@ enum LocalWatchFolder {
             if dir == prefix || dir.hasPrefix(prefix + "/") { return true }
         }
         return false
+    }
+
+    /// What macOS calls the protected zone `path` lives in, in the System Settings
+    /// UI («Рабочий стол» / «Документы» / «Загрузки»), or nil outside them.
+    ///
+    /// Worth the extra function: in «Файлы и папки» each app is a row with ONE
+    /// switch per folder, so naming the switch turns «найдите нужный переключатель»
+    /// into «включите вот этот». The names are the OS's own — the same three the
+    /// privacy extension lists under `Privacy_FilesAndFolders`.
+    static func protectedZoneName(for path: String, home: String) -> String? {
+        guard !home.isEmpty, !path.isEmpty else { return nil }
+        let dir = normalized(path)
+        let names = ["Desktop": "Рабочий стол",
+                     "Documents": "Документы",
+                     "Downloads": "Загрузки"]
+        for zone in protectedZones {
+            let prefix = normalized((home as NSString).appendingPathComponent(zone))
+            if dir == prefix || dir.hasPrefix(prefix + "/") { return names[zone] }
+        }
+        return nil
     }
 
     /// Collapse `~` and drop a trailing slash — display and comparison share it so
@@ -470,9 +508,48 @@ enum FolderAccessCopy {
         }
     }
 
-    static let fdaSteps: [String] = [
+    // TWO routes, not one — and the order matters more than the wording.
+    //
+    // The shipped version had a single route: «Полный доступ к диску» → «+» → paste
+    // the path. It sent the human to the wrong panel, and the reason is worth writing
+    // down because it was invisible from the code: our grant is NOT a Full Disk
+    // Access grant. Read off the live TCC database, the row is
+    // `kTCCServiceSystemPolicyDesktopFolder`, and `TCCServiceList.plist` inside
+    // SecurityPrivacyExtension.appex maps only `kTCCServiceSystemPolicyAllFiles` to
+    // the `Privacy_AllFiles` anchor we were opening. There is no Full Disk Access row
+    // for our helper — there never was one, and there cannot be one until somebody
+    // presses «+». So the user followed our instructions, looked for
+    // `mp3-to-m4b-agent` in a list where it cannot appear, and concluded the app
+    // lies. Exactly the failure this whole card exists to prevent.
+    //
+    // Both panels are real and they answer DIFFERENT questions:
+    //   · «Файлы и папки» (`Privacy_FilesAndFolders`) — where an EXISTING folder
+    //     grant lives, as a switch. This is the one-toggle repair, and it is the
+    //     likely case: the grant was given once and later switched off (which is
+    //     precisely how the human reproduced the denied card).
+    //   · «Полный доступ к диску» (`Privacy_AllFiles`) — the only panel with a «+»,
+    //     so the only way to create access from nothing for a path-client with no
+    //     bundle. Needed when the row does not exist at all (после «Не разрешать»,
+    //     or when the panel refuses to draw a bundle-less client — donor lesson 020B).
+    // Cheap repair first, heavy one second.
+
+    static let routeToggleTitle = "Если доступ когда-то выдавали — быстрее так"
+    static let routeAddTitle = "Если строки «\(helperName)» там нет"
+
+    /// `zone` is the human name of the protected folder the agent watches («Рабочий
+    /// стол» / «Документы» / «Загрузки») — the switch is labelled with it, so naming
+    /// it turns "find the right toggle" into "flip this toggle".
+    static func routeToggleSteps(zone: String?) -> [String] {
+        [
+            "Откройте «Файлы и папки» кнопкой ниже.",
+            zone.map { "Найдите «\(helperName)» и включите у него переключатель «\($0)»." }
+                ?? "Найдите «\(helperName)» и включите у него переключатель нужной папки.",
+        ]
+    }
+
+    static let routeAddSteps: [String] = [
         "Нажмите «Скопировать путь агента» — путь ляжет в буфер обмена.",
-        "Откройте Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску.",
+        "Откройте «Полный доступ к диску» кнопкой ниже.",
         "Нажмите «+» под списком, затем Cmd-Shift-G и вставьте путь.",
         "Включите переключатель у «\(helperName)» и введите пароль, если система попросит.",
     ]
@@ -487,7 +564,47 @@ enum FolderAccessCopy {
     static let copyRefused =
         "Путь не скопирован: LaunchAgent сейчас указывает не на этот файл. Сначала почините агента — иначе доступ был бы выдан не тому."
 
-    static let copyDone = "Путь скопирован"
+    static let copyDone = "Путь скопирован ✓"
+
+    /// `NSWorkspace.open` returned false for every candidate URL — the panel did not
+    /// open. Silence here would be the same defect as the silent copy button, one
+    /// level down: the user presses «Открыть…», nothing happens, and the button is
+    /// indistinguishable from a dead one.
+    static let paneOpenFailed =
+        "Не удалось открыть Системные настройки. Откройте их вручную: Конфиденциальность и безопасность → Файлы и папки."
+}
+
+/// How a press ANSWERS — kept as pure values so the "a control must show that it
+/// fired" rule is a testable contract and not a detail buried in a view body.
+///
+/// Reason it exists: the copy button worked, relabelled itself, and was still
+/// reported as broken. The relabel was the whole acknowledgement — same grey pill,
+/// same icon, same size — and it never reverted, so a second press changed nothing
+/// whatsoever. Colour, icon and expiry are therefore part of the contract now.
+enum FolderAccessAck {
+
+    /// How long a SUCCESS receipt stays up. It must expire: a permanently green
+    /// button is exactly as uninformative as a permanently grey one, because the
+    /// next press produces no visible change.
+    static let successLingers: TimeInterval = 2.5
+
+    static func copyTitle(copied: Bool) -> String {
+        copied ? FolderAccessCopy.copyDone : FolderAccessAction.copyHelperPath.title
+    }
+
+    static func copyIcon(copied: Bool) -> String {
+        copied ? "checkmark.circle.fill" : FolderAccessAction.copyHelperPath.icon
+    }
+
+    /// A refusal outranks a receipt — they can never be shown at once, and «не
+    /// скопировано» must never be dressed in the colour of success.
+    static func copyTone(copied: Bool, refused: Bool) -> GhostPillButton.Tone {
+        if refused { return .danger }
+        return copied ? .success : .neutral
+    }
+}
+
+extension FolderAccessCopy {
 
     // MARK: compact подачи
 
@@ -558,6 +675,10 @@ struct FolderAccessCard: View {
     var pathCopied: Bool = false
     /// Host-driven honest hint after the fail-closed copy REFUSED.
     var copyRefused: Bool = false
+    /// Host-driven: a System Settings panel would not open. Without this the
+    /// «Открыть…» buttons are silent on failure — the same defect as the copy
+    /// button, one level down.
+    var paneOpenFailed: Bool = false
 
     /// The one entry point for every button. The host maps the action to work.
     var perform: (FolderAccessAction) -> Void = { _ in }
@@ -683,10 +804,9 @@ struct FolderAccessCard: View {
         }
     }
 
-    private var primaryTitle: String {
-        pathCopied && actions.primary == .copyHelperPath
-            ? FolderAccessCopy.copyDone : actions.primary.title
-    }
+    // The copy/pane actions never reach the primary slot (asserted in the
+    // self-check), so the primary button has no acknowledgement branch to carry.
+    private var primaryTitle: String { actions.primary.title }
     private var primaryIcon: String { actions.primary.icon }
 
     // MARK: - The folded-away FDA fallback (shared by blocker and banner)
@@ -696,14 +816,27 @@ struct FolderAccessCard: View {
         if let title = FolderAccessCopy.disclosureTitle(state) {
             FolderAccessDisclosure(
                 title: title,
-                steps: FolderAccessCopy.fdaSteps,
+                toggleTitle: FolderAccessCopy.routeToggleTitle,
+                toggleSteps: FolderAccessCopy.routeToggleSteps(zone: watchZoneName),
+                addTitle: FolderAccessCopy.routeAddTitle,
+                addSteps: FolderAccessCopy.routeAddSteps,
                 caveat: FolderAccessCopy.fdaCaveat,
-                copyTitle: pathCopied ? FolderAccessCopy.copyDone
-                                      : FolderAccessAction.copyHelperPath.title,
+                copyTitle: FolderAccessAck.copyTitle(copied: pathCopied),
+                copyDone: pathCopied,
                 copyRefusedText: copyRefused ? FolderAccessCopy.copyRefused : nil,
+                paneFailedText: paneOpenFailed ? FolderAccessCopy.paneOpenFailed : nil,
                 onCopy: { perform(.copyHelperPath) },
+                onOpenFilesAndFolders: { perform(.openFilesAndFolders) },
                 onOpenPane: { perform(.openPrivacyPane) })
         }
+    }
+
+    /// The System-Settings switch name for the watched folder's zone, when it is in
+    /// one. nil outside the protected zones — and then the step text falls back to a
+    /// generic wording instead of naming a switch that will not be there.
+    private var watchZoneName: String? {
+        guard let dir = watchDir, !dir.isEmpty else { return nil }
+        return LocalWatchFolder.protectedZoneName(for: dir, home: NSHomeDirectory())
     }
 
     // MARK: - Presentation: BANNER (Status keeps its content)
@@ -856,10 +989,24 @@ struct PrimaryPillButton: View {
 }
 
 /// Full-width secondary action (quiet surface + contour).
+///
+/// `tone` exists because of a measured user report: the copy button DID work and
+/// DID relabel itself, and the human still said «не копирует». A text swap on an
+/// identical grey pill, inside a dense list of identical grey pills, is not
+/// feedback — nothing flashes, nothing changes colour, and the eye is on the
+/// clipboard, not on the button just left behind. A silent control is
+/// indistinguishable from a dead one, which is the third time this project has paid
+/// for that lesson. So an acknowledgement changes the button's COLOUR, not just its
+/// words.
 struct GhostPillButton: View {
+    /// Neutral = the resting control. Success/danger are host-driven answers to the
+    /// press that just happened.
+    enum Tone { case neutral, success, danger }
+
     let title: String
     let icon: String
     var enabled: Bool = true
+    var tone: Tone = .neutral
     let action: () -> Void
 
     var body: some View {
@@ -869,22 +1016,44 @@ struct GhostPillButton: View {
                 Text(title).font(.system(size: Tokens.F.caption, weight: .semibold))
                     .multilineTextAlignment(.center)
             }
-            .foregroundColor(Tokens.C.textHigh)
+            .foregroundColor(foreground)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 9)
             .background(
                 RoundedRectangle(cornerRadius: Tokens.R.appIconConfirm, style: .continuous)
-                    .fill(Tokens.C.surfaceControl)
+                    .fill(fill)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: Tokens.R.appIconConfirm, style: .continuous)
-                    .stroke(Tokens.C.borderControl, lineWidth: 1)
+                    .stroke(border, lineWidth: 1)
             )
             .opacity(enabled ? 1 : 0.45)
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
         .disabled(!enabled)
+    }
+
+    private var foreground: Color {
+        switch tone {
+        case .neutral: return Tokens.C.textHigh
+        case .success: return Tokens.C.stepOkSub
+        case .danger:  return Tokens.C.dangerText
+        }
+    }
+    private var fill: Color {
+        switch tone {
+        case .neutral: return Tokens.C.surfaceControl
+        case .success: return Tokens.C.stepOkBg
+        case .danger:  return Tokens.C.dangerTint10
+        }
+    }
+    private var border: Color {
+        switch tone {
+        case .neutral: return Tokens.C.borderControl
+        case .success: return Tokens.C.stepOkBorder
+        case .danger:  return Tokens.C.dangerBorder30
+        }
     }
 }
 
@@ -913,17 +1082,31 @@ private struct FolderAccessProgressBar: View {
     }
 }
 
-/// «Если запрос так и не появился» / «Включить доступ вручную…» — the FDA route,
-/// collapsed by default. It is a FALLBACK now (addendum §5.1), so it must not be
-/// the first thing the eye lands on; it is still one click away because the case
-/// it covers («Не разрешать» already pressed) has no other in-place remedy.
+/// «Если запрос так и не появился» / «Включить доступ вручную…» — the manual route,
+/// collapsed by default. It is a FALLBACK (addendum §5.1), so it must not be the
+/// first thing the eye lands on; it is still one click away because the cases it
+/// covers («Не разрешать» already pressed, or the switch turned off later) have no
+/// other in-place remedy.
+///
+/// TWO routes inside, cheap first — see `FolderAccessCopy` for why one route was
+/// not merely incomplete but actively misleading.
 private struct FolderAccessDisclosure: View {
     let title: String
-    let steps: [String]
+    /// «Файлы и папки» — flip an existing switch. `zone` names it.
+    let toggleTitle: String
+    let toggleSteps: [String]
+    /// «Полный доступ к диску» — «+» a bundle-less binary in from nothing.
+    let addTitle: String
+    let addSteps: [String]
     let caveat: String
     let copyTitle: String
+    /// The copy succeeded a moment ago → the button goes green with a checkmark.
+    let copyDone: Bool
     let copyRefusedText: String?
+    /// A settings panel refused to open — shown under whichever button was pressed.
+    let paneFailedText: String?
     let onCopy: () -> Void
+    let onOpenFilesAndFolders: () -> Void
     let onOpenPane: () -> Void
 
     @SwiftUI.State private var expanded = false
@@ -956,46 +1139,68 @@ private struct FolderAccessDisclosure: View {
             .buttonStyle(.plain)
 
             if expanded {
-                VStack(alignment: .leading, spacing: 7) {
-                    ForEach(Array(steps.enumerated()), id: \.offset) { index, step in
-                        HStack(alignment: .top, spacing: 8) {
-                            Text("\(index + 1)")
-                                .font(.system(size: Tokens.F.small, weight: .bold))
-                                .foregroundColor(Tokens.C.textTertiary)
-                                .frame(width: 16, height: 16)
-                                .background(Circle().fill(Tokens.C.surfaceControl))
-                            Text(step)
-                                .font(.system(size: Tokens.F.small))
-                                .foregroundColor(Tokens.C.textSecondary)
-                                .lineSpacing(2)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Spacer(minLength: 0)
-                        }
-                    }
-                    Text(caveat)
-                        .font(.system(size: Tokens.F.small))
-                        .foregroundColor(Tokens.C.textTertiary)
-                        .lineSpacing(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 2)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // ROUTE 1 — the switch already exists somewhere in «Файлы и папки».
+                routeHeading(toggleTitle)
+                steps(toggleSteps)
+                GhostPillButton(title: FolderAccessAction.openFilesAndFolders.title,
+                                icon: FolderAccessAction.openFilesAndFolders.icon,
+                                action: onOpenFilesAndFolders)
 
+                // ROUTE 2 — nothing to switch: add the binary by hand.
+                routeHeading(addTitle).padding(.top, 4)
+                steps(addSteps)
                 GhostPillButton(title: copyTitle,
-                                icon: FolderAccessAction.copyHelperPath.icon,
+                                icon: FolderAccessAck.copyIcon(copied: copyDone),
+                                tone: FolderAccessAck.copyTone(copied: copyDone,
+                                                               refused: copyRefusedText != nil),
                                 action: onCopy)
-                if let refused = copyRefusedText {
-                    Text(refused)
-                        .font(.system(size: Tokens.F.small))
-                        .foregroundColor(Tokens.C.dangerText)
-                        .lineSpacing(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                if let refused = copyRefusedText { note(refused, Tokens.C.dangerText) }
                 GhostPillButton(title: FolderAccessAction.openPrivacyPane.title,
                                 icon: FolderAccessAction.openPrivacyPane.icon,
                                 action: onOpenPane)
+
+                if let failed = paneFailedText { note(failed, Tokens.C.dangerText) }
+                note(caveat, Tokens.C.textTertiary).padding(.top, 2)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func routeHeading(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: Tokens.F.small, weight: .bold))
+            .foregroundColor(Tokens.C.textSoft)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func steps(_ list: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(list.enumerated()), id: \.offset) { index, step in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("\(index + 1)")
+                        .font(.system(size: Tokens.F.small, weight: .bold))
+                        .foregroundColor(Tokens.C.textTertiary)
+                        .frame(width: 16, height: 16)
+                        .background(Circle().fill(Tokens.C.surfaceControl))
+                    Text(step)
+                        .font(.system(size: Tokens.F.small))
+                        .foregroundColor(Tokens.C.textSecondary)
+                        .lineSpacing(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func note(_ text: String, _ color: Color) -> some View {
+        Text(text)
+            .font(.system(size: Tokens.F.small))
+            .foregroundColor(color)
+            .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

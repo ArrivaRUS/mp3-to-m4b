@@ -62,6 +62,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import selfcheck_blast_radius as blast_radius
+
 # The fixed, dependency-ordered roster. Each entry is (module, summary-marker).
 # The marker is the exact prefix each suite prints in its «X/Y checks passed»
 # line — Yurka greps these, so the format is preserved verbatim by the suites.
@@ -156,6 +158,12 @@ SUITES: list[tuple[str, str]] = [
     # like E15 is allowed). It prints the same «X/Y checks passed» line and now
     # exits non-zero on any FAIL, so it is a real gate here.
     ("agent.selfcheck_reliability", "§reliability self-check:"),
+    # The guard this runner itself relies on (.patches/005). It has to stay green
+    # on the user's live agent ticking through the run AND red on a self-check
+    # writing into the install — both halves are proven here against a SYNTHETIC
+    # install, so the user's real one is only ever read. Last in the roster: if it
+    # is red, every blast_radius verdict above it is suspect.
+    ("agent.selfcheck_blast_radius", "§blast-radius self-check:"),
 ]
 
 # Parses "<marker> 12/12 checks passed" → (passed, total).
@@ -179,78 +187,17 @@ _REQUIRED_PATH_OVERRIDES = (
 _REQUIRED_LABEL = "MP3TOM4B_LABEL"
 PROD_LABEL = "com.arrivarus.mp3tom4b.agent"
 
-# The production artifacts a self-check must never create, move or modify.
-PROD_SUPPORT = Path.home() / "Library" / "Application Support" / "mp3-to-m4b"
-PROD_LOG = Path.home() / "Library" / "Logs" / "mp3-to-m4b.log"
-PROD_LAUNCHAGENTS = Path.home() / "Library" / "LaunchAgents"
-PROD_WATCH = Path.home() / "Desktop" / "mp3-to-m4b"
-
-
-def _stamp(path: Path) -> tuple:
-    """(exists, size, mtime_ns) for one path — never reads content."""
-    try:
-        st = path.stat()
-        return (True, st.st_size, st.st_mtime_ns)
-    except OSError:
-        return (False, 0, 0)
-
-
-def _dir_stamp(path: Path) -> tuple:
-    """A directory's own stamp plus its top-level entries (stat only, no reads).
-
-    Top level is enough for the failure modes we have actually seen — a stray tree
-    appearing, a plist landing, a book folder being created or removed — and it
-    keeps the guard cheap enough to run before AND after every suite even when the
-    user's library is large.
-    """
-    entries: list[tuple] = []
-    try:
-        for child in sorted(path.iterdir(), key=lambda p: p.name):
-            entries.append((child.name,) + _stamp(child))
-    except OSError:
-        pass
-    return (_stamp(path), tuple(entries))
-
-
-def _loaded_jobs() -> tuple:
-    try:
-        proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-    except OSError:
-        return ()
-    return tuple(sorted(
-        ln.split("\t")[-1].strip() for ln in (proc.stdout or "").splitlines()
-        if "mp3tom4b" in ln
-    ))
-
-
-def _prod_snapshot() -> dict:
-    """Everything a suite is forbidden to touch, in one comparable record."""
-    plists = []
-    try:
-        for p in sorted(PROD_LAUNCHAGENTS.glob("*mp3*")):
-            plists.append((p.name,) + _stamp(p))
-    except OSError:
-        pass
-    return {
-        "support": _dir_stamp(PROD_SUPPORT),
-        "watch": _dir_stamp(PROD_WATCH),
-        "log": _stamp(PROD_LOG),
-        "plists": tuple(plists),
-        "jobs": _loaded_jobs(),
-    }
+# The guard that decides whether the live system was touched lives in its own
+# module, with its own suite: since 1.0 shipped there is a REAL install on this
+# machine, its agent fires every 300 s, and a full run always overlaps a tick. So
+# the guard has to tell "a self-check wrote here" from "the user's agent did its
+# job" — see :mod:`agent.selfcheck_blast_radius` for how that attribution works and
+# what stays strict regardless (plists, PA0, helper bytes, jobs, the tree itself).
+_prod_snapshot = blast_radius.snapshot
 
 
 def _prod_diff(before: dict, after: dict) -> list[str]:
-    """Human-readable list of what changed in the live system (empty = clean)."""
-    labels = {
-        "support": f"the real App Support tree ({PROD_SUPPORT})",
-        "watch": f"the real watch folder ({PROD_WATCH})",
-        "log": f"the real agent log ({PROD_LOG})",
-        "plists": f"a LaunchAgent plist in {PROD_LAUNCHAGENTS}",
-        "jobs": "the loaded launchd jobs",
-    }
-    return [f"{labels[key]} changed: {before[key]} → {after[key]}"
-            for key in labels if before.get(key) != after.get(key)]
+    return blast_radius.diff(before, after)
 
 
 def _child_env(sandbox: Path, short: str) -> dict:
@@ -418,9 +365,24 @@ def run() -> int:
             for line in damage:
                 print(f"        BLAST RADIUS — {short} touched the live system: {line}")
             if not res["ok"]:
-                # Surface the failing suite's own summary line + a stderr tail so a
-                # red run is diagnosable straight from this runner's output.
+                # Surface the failing suite's own summary line + its failing checks,
+                # and PERSIST the full output next to its fixtures. A truncated tail
+                # is how an intermittent failure becomes unattributable: the run that
+                # caught it is the only one that had the evidence.
                 print(f"        summary: {res['summary']}")
+                for ln in res["stdout"].splitlines():
+                    if "[FAIL]" in ln:
+                        print(f"        {ln.strip()[:300]}")
+                try:
+                    out_dir = sandbox / short
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    (out_dir / "stdout.txt").write_text(res["stdout"] or "",
+                                                        encoding="utf-8")
+                    (out_dir / "stderr.txt").write_text(res["stderr"] or "",
+                                                        encoding="utf-8")
+                    print(f"        full output: {out_dir}/stdout.txt")
+                except OSError:
+                    pass
                 tail = (res["stderr"] or "").strip().splitlines()[-5:]
                 for ln in tail:
                     print(f"        stderr| {ln}")
@@ -453,7 +415,11 @@ def run() -> int:
         for line in overall:
             print(f"  BLAST RADIUS (whole run): {line}")
     else:
-        print("  blast_radius: the live system is byte-identical to before the run")
+        final = _prod_snapshot()
+        state = ("live install present — its own agent ticks are attributed and "
+                 "allowed" if final.get("live") else "no live install on this machine")
+        print(f"  blast_radius: no self-check touched the user's install "
+              f"({state})")
 
     _sweep(sandbox, keep=failed)
     if failed:
