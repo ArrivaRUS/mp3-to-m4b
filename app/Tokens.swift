@@ -57,7 +57,7 @@ enum Tokens {
     static let githubURL = "https://github.com/ArrivaRUS/mp3-to-m4b"
     /// The shipped app version shown on the Settings version card + the credit line.
     /// Kept in sync with build/build-app.sh's default VERSION.
-    static let appVersion = "0.9"
+    static let appVersion = "1.0"
 
     // MARK: - Colors (role -> hex), from tokens.json "color"
 

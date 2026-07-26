@@ -35,7 +35,7 @@
 
 set -euo pipefail
 
-VERSION="${1:-0.9}"
+VERSION="${1:-1.0}"
 MODE="${2:-}"
 APP_NAME="mp3-to-m4b"
 VOLNAME="mp3-to-m4b"

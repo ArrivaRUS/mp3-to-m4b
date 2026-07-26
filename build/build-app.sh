@@ -44,7 +44,7 @@ for arg in "$@"; do
     *)  VERSION="$arg" ;;
   esac
 done
-VERSION="${VERSION:-0.9}"
+VERSION="${VERSION:-1.0}"
 BUNDLE_ID="com.arrivarus.mp3tom4b"
 APP_NAME="mp3-to-m4b"
 MIN_MACOS="11.0"

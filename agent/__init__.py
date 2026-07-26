@@ -25,4 +25,4 @@ build (chapters, cover, split, fast mode), the command protocol, and the M4 acce
 gate that keeps every one of those away from a folder macOS has not granted.
 """
 
-__version__ = "0.9"
+__version__ = "1.0"
