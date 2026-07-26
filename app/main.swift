@@ -36,11 +36,23 @@ enum Screen {
     case confirm   // a book's confirm window
     case queue     // the full queue (spec §7)
     case settings  // settings (later slice; placeholder destination)
+    /// «Агент не запустился» — the surface that replaces any access help when we
+    /// cannot PROVE launchd is running the job we installed (plan v2 B3). Never a
+    /// cosmetic variant of the access card: the two ask for opposite actions.
+    case agentNotRunning
 
     /// The pinned window WIDTH for this screen (spec §2): the confirm window is 640,
     /// everything else (setup/updating/status/queue/settings) is the standard 400.
     var windowWidth: CGFloat {
         self == .confirm ? Tokens.M.windowConfirm : Tokens.M.windowStandard
+    }
+
+    /// Screens the app must not be yanked off by a background refresh: they are
+    /// entered/left only by an explicit handoff (install finished, user pressed an
+    /// exit). Without this a focus event would drop the user back to Status in the
+    /// middle of a repair.
+    var isModalFlow: Bool {
+        self == .setup || self == .updating || self == .agentNotRunning
     }
 }
 
@@ -61,6 +73,44 @@ struct ParamsPreset: Equatable {
     func applies(to bookID: String) -> Bool { bookIDs.contains(bookID) }
 }
 
+/// A pending "the system is about to ask you for access" notice.
+///
+/// Why it exists (addendum §5.1–5.2, measured): on macOS 26 the folder grant for
+/// our path-client is created by a SYSTEM DIALOG (`auth_reason=2`, user consent),
+/// not by a trip to System Settings. That dialog is raised by the AGENT's first
+/// probe — the app cannot raise it, cannot answer it, and cannot bring it back:
+/// «Не разрешать» writes `auth_value=0` and the dialog never appears again. The
+/// only lever the app has is the seconds BEFORE it appears, so it spends them
+/// telling the user what is about to be asked and by whom.
+struct ConsentPrompt: Identifiable, Equatable {
+    let id = UUID()
+    /// The folder access will be asked for (shown so the dialog is recognizable).
+    let folder: String
+    /// Run when the user acknowledges. Never runs on «Не сейчас».
+    let proceed: () -> Void
+
+    static func == (a: ConsentPrompt, b: ConsentPrompt) -> Bool { a.id == b.id }
+}
+
+/// A pending «перенести работу в ~/mp3-to-m4b» confirmation.
+///
+/// Why a confirmation and not a one-click fix: the button re-points the agent at a
+/// different folder, and the user's existing sources and finished `.m4b` files STAY
+/// where they are. That is a deliberate choice (addendum §3.2 rule 3 — `book_id` is
+/// `sha256(absolute path)`, so moving files would re-arm the whole library and make
+/// every finished book look new), but it is only an honest choice if the user is
+/// told before it happens, not after they go looking for their books.
+struct RelocatePrompt: Identifiable, Equatable {
+    let id = UUID()
+    /// Where the agent watches now (may be unknown — then only `to` is shown).
+    let from: String?
+    /// Where it will watch after this (`~/mp3-to-m4b`).
+    let to: String
+    let proceed: () -> Void
+
+    static func == (a: RelocatePrompt, b: RelocatePrompt) -> Bool { a.id == b.id }
+}
+
 /// Holds the showcase + the manifest for the book we are currently presenting.
 /// Mutated only on the main thread (the watcher hops to main before refreshing).
 final class ReaderModel: ObservableObject {
@@ -77,6 +127,43 @@ final class ReaderModel: ObservableObject {
     /// Published so the spinner/error updates live as the AppDelegate runs/completes
     /// the bundled installer off the main thread.
     @Published var agentUpdatePhase: InstallPhase = .running
+    /// What the `.failed` update screen shows in its «Подробности» block, and what
+    /// the «Агент не запустился» screen shows outright. Recomputed on every refresh
+    /// so it is never a stale snapshot of a system that has since been repaired.
+    @Published var diagnostics: InstallDiagnostics = .empty
+    /// Which surface owns the window per the fail-closed router (StatusSurface).
+    /// The AppDelegate acts on it; M6's access card reads it too.
+    @Published var surface: StatusSurface = .normal
+    /// The pending "macOS is about to ask you for folder access" notice, if any.
+    /// Set by any path that is about to (re)bootstrap the agent; cleared when the
+    /// user acknowledges or backs out.
+    @Published var consentPrompt: ConsentPrompt?
+    /// The pending «перенести папку в ~/mp3-to-m4b» confirmation, if any. A move is
+    /// the user's data changing hands, so it never happens without «откуда → куда»
+    /// on screen first (addendum §3.2 rule 2).
+    @Published var relocatePrompt: RelocatePrompt?
+    /// M6 — the access card state the host PINNED after a recheck settled
+    /// (stillDenied / busy / timeout). nil = the card is derived purely from the
+    /// live verdict. Dropped by `FolderRecheck.terminalRecheckDissolves`.
+    @Published var accessPin: FolderAccessCardState?
+    /// The fail-closed helper-path copy said yes / said no. Both are host-driven
+    /// acks: the card never claims a copy happened on its own.
+    @Published var accessPathCopied = false
+    @Published var accessCopyRefused = false
+    /// The window hit the screen ceiling on the last refit, so the content really is
+    /// scrolling. Set by `refitWindowHeight` (it owns both numbers) and rendered as
+    /// an OVERLAY hint — never as layout, or it would change the very height it
+    /// describes and refit itself in a loop.
+    @Published var contentClipped = false
+
+    /// What the access card must show right now, or nil when there is nothing to
+    /// show. The ROUTER decides whether an access surface is allowed at all
+    /// (`InstallTruth.allowsFolderAccessSurface` — a card over a job we cannot
+    /// prove is running would send the user to grant access to the wrong binary);
+    /// this only picks between the live verdict and a pinned recheck outcome.
+    var accessCardState: FolderAccessCardState? {
+        FolderAccessCardState.forSurface(surface, pinned: accessPin)
+    }
     /// Session-scoped params preset from the confirm footer's "Применить параметры
     /// ко всем (N)". nil = every book seeds from its own manifest defaults.
     @Published var paramsPreset: ParamsPreset?
@@ -216,6 +303,50 @@ private struct RootView: View {
     /// Current freshness of the staged agent vs. the bundled one — passed to Settings'
     /// «Обновить агент» card. Computed by the AppDelegate (has the StateStore).
     var agentFreshness: () -> AgentFreshness = { .undecidable }
+    // --- M5 exits out of the two dead ends (M12f / B3) ------------------------
+    /// «Выбрать папку…» on the failed-update screen: pick a folder explicitly and
+    /// retry. Closes the `currentWatchDir() == nil` case, where the app refuses to
+    /// auto-install precisely because guessing would silently re-point the agent.
+    var onChooseFolderAndRetry: () -> Void = {}
+    /// «Продолжить без обновления»: land normally. The agent is old, but the app is
+    /// not a brick — and the access surface stays suppressed by the gate, which is
+    /// correct rather than unfortunate.
+    var onContinueWithoutUpdate: () -> Void = {}
+    /// «Починить» on the «Агент не запустился» screen → offline
+    /// `--repair-launchd-only`.
+    var onRepairAgent: () -> Void = {}
+    /// Copy the diagnostics block (both dead-end screens).
+    var onCopyDiagnostics: () -> Void = {}
+    /// Copy the helper path — the ONLY app action that hands the user a path they
+    /// will grant access to, therefore the one that re-reads PA0 live and refuses
+    /// on a mismatch. Returns false when it refused.
+    var onCopyHelperPath: () -> Bool = { false }
+    /// Show the consent notice before an install that will (re)bootstrap the agent.
+    var requestConsentNotice: (String, @escaping () -> Void) -> Void = { _, go in go() }
+    /// The PROVEN watched folder (receipt → plist → same-generation state), nil when
+    /// unknown. Settings shows and acts on this, never on the raw state value.
+    var resolvedWatchDir: () -> String? = { nil }
+    /// The installed engine is newer than this .app (M11f) — Settings says so
+    /// instead of offering a downgrade dressed up as an update.
+    var installIsNewerThanApp: () -> Bool = { false }
+    /// M6 — every button on the access card lands here (recheck, folder move,
+    /// folder pick, the FDA fallback's copy/pane). One entry point so the card
+    /// stays a pure view and the rules (a move is refused mid-build, the copy is
+    /// fail-closed) live in one place on the host.
+    var onAccessAction: (FolderAccessAction) -> Void = { _ in }
+
+    /// The configured access card, or nil when there is nothing to show. Built ONCE
+    /// and re-stamped per подача by whoever renders it.
+    private var accessCard: FolderAccessCard? {
+        guard let state = model.accessCardState else { return nil }
+        return FolderAccessCard(
+            state: state,
+            watchDir: resolvedWatchDir() ?? model.state.agent.watchDir,
+            pathCopied: model.accessPathCopied,
+            copyRefused: model.accessCopyRefused,
+            perform: onAccessAction,
+            onHandOff: { navigate(.status) })
+    }
 
     var body: some View {
         ZStack {
@@ -227,9 +358,26 @@ private struct RootView: View {
             Group {
                 switch model.screen {
                 case .setup:
-                    SetupView(onInstalled: onInstalled)
+                    SetupView(onInstalled: onInstalled,
+                              requestConsentNotice: requestConsentNotice)
                 case .updating:
-                    AgentUpdatingView(phase: model.agentUpdatePhase, onRetry: onRetryAgentUpdate)
+                    AgentUpdatingView(
+                        phase: model.agentUpdatePhase,
+                        diagnostics: model.diagnostics,
+                        onRetry: onRetryAgentUpdate,
+                        onChooseFolder: onChooseFolderAndRetry,
+                        onOpenSettings: { navigate(.settings) },
+                        onContinue: onContinueWithoutUpdate,
+                        onCopyDiagnostics: onCopyDiagnostics)
+                case .agentNotRunning:
+                    AgentNotRunningView(
+                        reason: model.surface.stallReason,
+                        diagnostics: model.diagnostics,
+                        onRepair: onRepairAgent,
+                        onOpenSettings: { navigate(.settings) },
+                        onContinue: onContinueWithoutUpdate,
+                        onCopyDiagnostics: onCopyDiagnostics,
+                        onCopyHelperPath: onCopyHelperPath)
                 case .status:
                     StatusView(
                         state: model.state,
@@ -240,7 +388,9 @@ private struct RootView: View {
                         },
                         onOpenSettings: { navigate(.settings) },
                         onClearHistory: onClearHistory,
-                        recentClearedAt: recentClearedAt()
+                        recentClearedAt: recentClearedAt(),
+                        accessCard: accessCard,
+                        contentClipped: model.contentClipped
                     )
                 case .queue:
                     QueueView(
@@ -277,12 +427,18 @@ private struct RootView: View {
                     confirmOrIdle
                 case .settings:
                     SettingsView(
-                        watchDir: model.state.agent.watchDir,
+                        // The folder Settings SHOWS is the folder its two installer
+                        // buttons will pass back to the installer, so it must be the
+                        // proven one (receipt → plist → same-generation state), not
+                        // whatever an agent from an older generation last stamped.
+                        watchDir: resolvedWatchDir() ?? model.state.agent.watchDir,
                         onBack: { navigate(.status) },
                         onResetStats: onResetStats,
                         onOpenGitHub: onOpenGitHub,
                         agentFreshness: agentFreshness(),
-                        refreshFreshness: agentFreshness
+                        refreshFreshness: agentFreshness,
+                        installIsNewerThanApp: installIsNewerThanApp(),
+                        accessCard: accessCard
                     )
                 }
             }
@@ -292,6 +448,37 @@ private struct RootView: View {
             if let group = model.state.firstPendingGroup {
                 GroupingSheetOverlay(group: group, onGroupingChoice: onGroupingChoice)
                     .id(group.groupID)        // reset selection per new group
+                    .transition(.opacity)
+            }
+
+            // …and the consent notice outranks even that: it is the last moment
+            // before macOS puts its own dialog on screen, and a user who does not
+            // know who is asking is one click away from a grant that can never be
+            // re-requested (addendum §5.3).
+            if let prompt = model.consentPrompt {
+                ConsentNoticeOverlay(
+                    prompt: prompt,
+                    onProceed: {
+                        model.consentPrompt = nil
+                        prompt.proceed()
+                    },
+                    onCancel: { model.consentPrompt = nil })
+                    .id(prompt.id)
+                    .transition(.opacity)
+            }
+
+            // …and the folder-move confirmation sits at the same level: it re-points
+            // the agent and leaves the user's existing files behind, so it must be
+            // seen and acknowledged, never merged into a button press.
+            if let prompt = model.relocatePrompt {
+                RelocateNoticeOverlay(
+                    prompt: prompt,
+                    onProceed: {
+                        model.relocatePrompt = nil
+                        prompt.proceed()
+                    },
+                    onCancel: { model.relocatePrompt = nil })
+                    .id(prompt.id)
                     .transition(.opacity)
             }
         }
@@ -375,6 +562,24 @@ private struct RootView: View {
 /// (bundled installer via Process), `FFmpegProbe` (engine check), `InstallPhase`
 /// (idle/running/done/failed), and the folder-chooser pattern (NSOpenPanel +
 /// "Создать" when missing + a real existence check via `SetupView.directoryExists`).
+/// Open the System Settings "Full Disk Access" privacy pane (fb2 parity, brief).
+/// The `Privacy_AllFiles` anchor lands directly on the Full Disk Access list on
+/// modern macOS; older systems open the Security & Privacy pane. Best-effort.
+///
+/// A FALLBACK route since T0 (addendum §5.1): the grant our helper actually gets
+/// comes from the consent dialog, and this panel's own preflight is refused on
+/// every run. It stays because the one case with no other remedy — «Не разрешать»
+/// already pressed — has to end somewhere.
+func openFullDiskAccessPane() {
+    let urls = [
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy",
+    ]
+    for s in urls {
+        if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
+    }
+}
+
 private struct SettingsView: View {
     /// The agent's CURRENT watched folder (from the showcase). The display flips to
     /// `appliedDir` after a successful re-point; until then this is the truth.
@@ -386,9 +591,9 @@ private struct SettingsView: View {
     var onResetStats: () -> Void = {}
     /// "Открыть на GitHub" (version card, fb2 parity). Opens the project repo.
     var onOpenGitHub: () -> Void = {}
-    /// Test seam: extra env for the installer process (NO_LAUNCHCTL / NO_VENV /
-    /// temp LABEL / scratch SUPPORT). Empty in production — a real re-point touches
-    /// the live launchd agent.
+    /// Test seam: extra env for the installer process. Empty in production — a real
+    /// re-point touches the live launchd agent. Build it with
+    /// `InstallerTestEnv.latched`: the installer refuses a half-armed latch.
     var installerExtraEnv: [String: String] = [:]
     /// The freshness of the STAGED agent vs. the one shipped in the bundle, computed
     /// by the AppDelegate (AgentUpdate.freshness). Drives the «Обновить агент» card's
@@ -399,6 +604,18 @@ private struct SettingsView: View {
     /// AppDelegate owns the `StateStore`, so it does the comparison and hands back the
     /// fresh verdict; SettingsView just reflects it.
     var refreshFreshness: () -> AgentFreshness = { .undecidable }
+    /// TRUE when the INSTALLED engine is newer than this .app (receipt's
+    /// `engine_version` > CFBundleShortVersionString — M11f). Carried separately
+    /// because `AgentFreshness` only answers "do the trees differ", and on a
+    /// downgrade they differ in the OTHER direction: saying "устарел, доступно
+    /// обновление" there would invite the user to downgrade their own engine, and a
+    /// v0.9 installer re-points PA0 back at runner.sh, killing folder access.
+    var installIsNewerThanApp: Bool = false
+    /// M6 — the compact access row, shown ONLY while the agent reports a problem
+    /// AND the gate allows claiming anything about access. Settings deliberately
+    /// does not repeat the automat: the row states the problem and hands off to
+    /// Status, where the live card with its rechecks lives.
+    var accessCard: FolderAccessCard? = nil
 
     // The folder the user has SELECTED to switch to (seeded from the current watch
     // dir so the field is never blank). A re-point sends THIS to the installer.
@@ -434,7 +651,10 @@ private struct SettingsView: View {
          onOpenGitHub: @escaping () -> Void = {},
          installerExtraEnv: [String: String] = [:],
          agentFreshness: AgentFreshness = .undecidable,
-         refreshFreshness: @escaping () -> AgentFreshness = { .undecidable }) {
+         refreshFreshness: @escaping () -> AgentFreshness = { .undecidable },
+         installIsNewerThanApp: Bool = false,
+         accessCard: FolderAccessCard? = nil) {
+        self.accessCard = accessCard
         self.watchDir = watchDir
         self.onBack = onBack
         self.onResetStats = onResetStats
@@ -442,6 +662,7 @@ private struct SettingsView: View {
         self.installerExtraEnv = installerExtraEnv
         self.agentFreshness = agentFreshness
         self.refreshFreshness = refreshFreshness
+        self.installIsNewerThanApp = installIsNewerThanApp
         let current = (watchDir?.isEmpty == false ? watchDir! : SetupView.defaultWatchDir)
         _selectedDir = State(initialValue: current)
         _selectedDirExists = State(initialValue: SetupView.directoryExists(at: current))
@@ -455,6 +676,21 @@ private struct SettingsView: View {
             SettingsHairline(color: Tokens.C.borderHairline)
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // A live access problem outranks everything else on this screen:
+                    // «Сменить папку» below is meaningless advice while the agent
+                    // cannot read the folder it already has.
+                    if let card = accessCard {
+                        card.presented(as: .settingsRow)
+                            .padding(.init(top: 12, leading: 12, bottom: 12, trailing: 12))
+                            .background(
+                                RoundedRectangle(cornerRadius: Tokens.R.card, style: .continuous)
+                                    .fill(Tokens.C.bgCard)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: Tokens.R.card, style: .continuous)
+                                    .stroke(Tokens.C.borderCard, lineWidth: 1)
+                            )
+                    }
                     watchFolderSection
                     if selectedIsInTCCZone {
                         fdaFootnote
@@ -761,7 +997,14 @@ private struct SettingsView: View {
         normalize(selectedDir) == normalize(appliedDir)
     }
 
-    // MARK: FDA footnote — shown when the SELECTED folder is a TCC-protected zone.
+    // MARK: Access footnote — shown when the SELECTED folder is a TCC-protected zone.
+    //
+    // REWRITTEN after T0 (addendum §5.1). The old line promised «может понадобиться
+    // разовый Full Disk Access», and that was measurably wrong: the grant our helper
+    // actually gets is `auth_reason=2` — plain consent in a system dialog — while the
+    // Full Disk Access preflight fails on EVERY run, successful ones included. Sending
+    // the user to the FDA panel first is sending them the long way round a door that
+    // opens by itself.
 
     private var fdaFootnote: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -769,7 +1012,7 @@ private struct SettingsView: View {
                 .font(.system(size: 12, weight: .regular))
                 .foregroundColor(Tokens.C.textSecondary)
                 .padding(.top, 1)
-            Text("Папка в Desktop / Documents / Downloads — может понадобиться разовый Full Disk Access для фонового агента.")
+            Text("Папка в Рабочем столе / Документах / Загрузках: после смены папки macOS один раз спросит доступ — нажмите «Разрешить». В домашней папке (\(LocalWatchFolder.tildeAbbreviated(LocalWatchFolder.path))) разрешение не нужно вовсе.")
                 .font(.system(size: Tokens.F.small))
                 .foregroundColor(Tokens.C.textSecondary)
                 .lineSpacing(3)
@@ -938,6 +1181,7 @@ private struct SettingsView: View {
     // muted "can't check".
     private var agentStatusIcon: String {
         if case .failed = updatePhase { return "exclamationmark.triangle.fill" }
+        if installIsNewerThanApp { return "arrow.down.circle" }
         switch freshness {
         case .upToDate: return "checkmark.seal.fill"
         case .outdated: return "exclamationmark.triangle.fill"
@@ -946,6 +1190,7 @@ private struct SettingsView: View {
     }
     private var agentStatusTint: Color {
         if case .failed = updatePhase { return Tokens.C.dangerBase }
+        if installIsNewerThanApp { return Tokens.C.stepCurText }
         switch freshness {
         case .upToDate: return Tokens.C.brandCyan
         case .outdated: return Tokens.C.stepCurText
@@ -953,6 +1198,7 @@ private struct SettingsView: View {
         }
     }
     private var agentStatusBg: Color {
+        if installIsNewerThanApp { return Tokens.C.surfaceControlSoft }
         switch freshness {
         case .upToDate: return Tokens.C.rowIcTealBg
         case .outdated: return Tokens.C.dangerTint10
@@ -961,6 +1207,11 @@ private struct SettingsView: View {
     }
     private var agentStatusSub: String {
         if case .failed(let msg) = updatePhase { return msg }
+        // M11f — the trees differ, but in the direction that makes "обновить"
+        // exactly the wrong advice.
+        if installIsNewerThanApp {
+            return "Установлен более новый агент — обновите приложение"
+        }
         switch freshness {
         case .upToDate: return "Актуален — совпадает с приложением"
         case .outdated: return "Устарел — доступно обновление"
@@ -969,6 +1220,7 @@ private struct SettingsView: View {
     }
     private var agentStatusSubColor: Color {
         if case .failed = updatePhase { return Tokens.C.dangerText }
+        if installIsNewerThanApp { return Tokens.C.stepCurText }
         switch freshness {
         case .upToDate: return Tokens.C.stepOkSub
         case .outdated: return Tokens.C.stepCurText
@@ -988,17 +1240,24 @@ private struct SettingsView: View {
         let dir = appliedDir   // the folder the agent is really on (this screen's truth)
         let env = installerExtraEnv
         updatePhase = .running
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = InstallRunner.run(installerPath: installer, watchDir: dir, extraEnv: env)
-            DispatchQueue.main.async {
-                self.updatePhase = result
-                if case .done = result {
+        // Single-flight (B4). This screen used to own TWO independent InstallPhases
+        // — this one and the folder re-point below — which meant two installer
+        // processes were allowed by design, on a script that swaps a directory tree
+        // and re-bakes the LaunchAgent. Both now go through the process-wide
+        // coordinator: a second press of the SAME button joins the run in flight, a
+        // press of the OTHER one is refused with a reason instead of racing it.
+        InstallCoordinator.shared.submit(
+            id: "agent-update",
+            work: { InstallOutcome(InstallRunner.run(installerPath: installer,
+                                                     watchDir: dir, extraEnv: env)) },
+            completion: { outcome in
+                self.updatePhase = outcome.phase
+                if case .done = outcome {
                     // Re-derive freshness — after a successful reinstall the staged
                     // tree matches the bundle, so this flips to .upToDate.
                     self.freshness = self.refreshFreshness()
                 }
-            }
-        }
+            })
     }
 
     private func statusRow(icon: String, tint: Color, bg: Color,
@@ -1243,12 +1502,16 @@ private struct SettingsView: View {
         let dir = selectedDir
         let env = installerExtraEnv
         phase = .running
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = InstallRunner.run(installerPath: installer, watchDir: dir,
-                                           extraEnv: env)
-            DispatchQueue.main.async {
-                self.phase = result
-                if case .done = result {
+        // Single-flight (B4) — see startManualUpdate. A re-point is a DIFFERENT
+        // operation from an update, so it is refused (not joined) while one runs:
+        // joining would report "folder changed" on the back of an unrelated success.
+        InstallCoordinator.shared.submit(
+            id: "watch-repoint",
+            work: { InstallOutcome(InstallRunner.run(installerPath: installer,
+                                                     watchDir: dir, extraEnv: env)) },
+            completion: { outcome in
+                self.phase = outcome.phase
+                if case .done = outcome {
                     // SUCCESS: the agent is now on `dir`. Reflect that as the current
                     // folder (the display can never claim an un-applied folder).
                     self.appliedDir = dir
@@ -1256,22 +1519,12 @@ private struct SettingsView: View {
                 }
                 // On .failed we intentionally leave appliedDir untouched — the agent
                 // is still on the OLD folder, and the red stderr line says why.
-            }
-        }
+            })
     }
 
-    /// Open the System Settings "Full Disk Access" privacy pane (fb2 parity, brief).
-    /// The `Privacy_AllFiles` anchor lands directly on the Full Disk Access list on
-    /// modern macOS; older systems open the Security & Privacy pane. Best-effort.
-    private func openFullDiskAccess() {
-        let urls = [
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy",
-        ]
-        for s in urls {
-            if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
-        }
-    }
+    /// Open the System Settings "Full Disk Access" privacy pane. Shared with the
+    /// access card's FDA fallback so both jump to the same place.
+    private func openFullDiskAccess() { openFullDiskAccessPane() }
 
     // MARK: - Small helpers
 
@@ -1320,21 +1573,43 @@ private struct SettingsHairline: View {
 /// the watch folder are preserved — the runner.sh path never changes).
 ///
 /// States mirror Setup's install phase: `.running` → spinner + "Обновляю фоновый
-/// агент…"; `.failed(msg)` → the installer's honest stderr + a "Повторить" button.
-/// `.idle`/`.done` are transient here (the AppDelegate flips off this screen on
-/// success), so they render as the running state to avoid a flash of empty content.
+/// агент…"; `.failed(msg)` → the installer's honest stderr + FOUR ways out + a
+/// diagnostics block. `.idle`/`.done` are transient here (the AppDelegate flips off
+/// this screen on success), so they render as the running state to avoid a flash of
+/// empty content.
+///
+/// M12f — why `.failed` grew: it used to offer «Повторить» and nothing else, while
+/// the most common failure message literally read «обновите через Настройки» — from
+/// a screen that could not reach Настройки. A retry that fails the same way twice
+/// left the user with a spinner-shaped brick. The four exits below each close one
+/// real cause: retry (transient), pick a folder (the `watchDir == nil` refusal),
+/// Настройки (everything else), continue (the app is not a brick — the agent is
+/// merely old, and the access surface stays suppressed by the gate, which is
+/// correct, not unfortunate).
 private struct AgentUpdatingView: View {
     let phase: InstallPhase
+    var diagnostics: InstallDiagnostics = .empty
     let onRetry: () -> Void
+    var onChooseFolder: () -> Void = {}
+    var onOpenSettings: () -> Void = {}
+    var onContinue: () -> Void = {}
+    var onCopyDiagnostics: () -> Void = {}
 
     var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 24)
-            card
-            Spacer(minLength: 24)
+        // The failure branch grows with the installer's message and four exits, so
+        // the variable part scrolls INSIDE a capped box rather than growing the
+        // window past the screen — otherwise the bottom exits land under the screen
+        // edge, which is the whole lesson of native-window-cap-height. Test this
+        // screen at MAX content (long stderr + diagnostics expanded), not at min.
+        ScrollView {
+            VStack(spacing: 0) {
+                Spacer(minLength: 24)
+                card
+                Spacer(minLength: 24)
+            }
         }
         .frame(width: Tokens.M.windowStandard)   // 400 (spec §2)
-        .frame(minHeight: 240)
+        .frame(minHeight: 240, maxHeight: 620)
     }
 
     private var card: some View {
@@ -1379,22 +1654,15 @@ private struct AgentUpdatingView: View {
                     .foregroundColor(Tokens.C.dangerText)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                Button(action: onRetry) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 12, weight: .bold))
-                        Text("Повторить")
-                            .font(.system(size: Tokens.F.caption, weight: .semibold))
-                    }
-                    .foregroundColor(Tokens.C.textOnAccent)
-                    .padding(.init(top: 8, leading: 15, bottom: 8, trailing: 15))
-                    .background(
-                        RoundedRectangle(cornerRadius: Tokens.R.appIconConfirm, style: .continuous)
-                            .fill(Tokens.Grad.brandButton)
-                    )
-                }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
+                PrimaryPillButton(title: "Повторить", icon: "arrow.clockwise", action: onRetry)
+                // Three ghost exits, so the screen always has a next step.
+                GhostPillButton(title: "Выбрать папку…", icon: "folder",
+                                action: onChooseFolder)
+                GhostPillButton(title: "Открыть Настройки", icon: "gearshape",
+                                action: onOpenSettings)
+                GhostPillButton(title: "Продолжить без обновления", icon: "arrow.right",
+                                action: onContinue)
+                DiagnosticsDisclosure(diagnostics: diagnostics, onCopy: onCopyDiagnostics)
             }
         default:
             // .running (and the transient .idle/.done): spinner + reassurance.
@@ -1415,6 +1683,390 @@ private struct AgentUpdatingView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+}
+
+// MARK: - «Агент не запустился» (the surface that replaces access help — B3)
+
+/// Shown when the fail-closed gate says we cannot prove launchd is running the job
+/// we installed: either `ProgramArguments[0]` on disk is not our frozen helper, or
+/// the running agent's `install_generation` does not match the receipt's.
+///
+/// This is NOT a softer version of the access card — it is its OPPOSITE, and
+/// mixing them up is the bug B3 exists to prevent. A correct plist on disk does not
+/// mean launchd loaded it: the installer can die between «publish plist» and
+/// «bootstrap», leaving perfect files while the OLD job keeps running. If we showed
+/// the access card then, the user would grant access to the new binary while the
+/// old one kept doing the work — a grant that looks given, changes nothing, and
+/// offers the user no way to notice.
+private struct AgentNotRunningView: View {
+    let reason: AgentStallReason?
+    let diagnostics: InstallDiagnostics
+    let onRepair: () -> Void
+    let onOpenSettings: () -> Void
+    let onContinue: () -> Void
+    let onCopyDiagnostics: () -> Void
+    /// Returns false when the live PA0 re-read refused the copy (fail-closed).
+    let onCopyHelperPath: () -> Bool
+
+    @State private var copyRefused = false
+    @State private var copied = false
+
+    var body: some View {
+        // Same cap-and-scroll rule as the update screen: four actions + an
+        // expandable diagnostics block must never push «Починить» off the screen.
+        ScrollView {
+            VStack(spacing: 0) {
+                Spacer(minLength: 24)
+                card
+                Spacer(minLength: 24)
+            }
+        }
+        .frame(width: Tokens.M.windowStandard)
+        .frame(minHeight: 240, maxHeight: 620)
+    }
+
+    private var card: some View {
+        VStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: Tokens.R.card, style: .continuous)
+                    .fill(Tokens.C.dangerTint10)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(Tokens.C.dangerBase)
+            }
+            .frame(width: 48, height: 48)
+
+            Text("Фоновый агент не запустился")
+                .font(.system(size: Tokens.F.h1Confirm, weight: .bold))
+                .foregroundColor(Tokens.C.textHigh)
+                .multilineTextAlignment(.center)
+
+            Text(explanation)
+                .font(.system(size: Tokens.F.small))
+                .foregroundColor(Tokens.C.textSecondary)
+                .multilineTextAlignment(.center)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+            PrimaryPillButton(title: "Починить", icon: "wrench.and.screwdriver",
+                              action: onRepair)
+            GhostPillButton(title: copyButtonTitle, icon: "doc.on.doc") {
+                let ok = onCopyHelperPath()
+                copied = ok
+                copyRefused = !ok
+            }
+            GhostPillButton(title: "Открыть Настройки", icon: "gearshape",
+                            action: onOpenSettings)
+            GhostPillButton(title: "Продолжить", icon: "arrow.right", action: onContinue)
+            if copyRefused {
+                Text("Путь не скопирован: LaunchAgent сейчас указывает не на этот файл. Сначала «Починить» — иначе доступ был бы выдан не тому.")
+                    .font(.system(size: Tokens.F.small))
+                    .foregroundColor(Tokens.C.dangerText)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            DiagnosticsDisclosure(diagnostics: diagnostics, onCopy: onCopyDiagnostics)
+        }
+        .padding(.init(top: 22, leading: 20, bottom: 22, trailing: 20))
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: Tokens.R.card, style: .continuous)
+                .fill(Tokens.C.bgCard)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Tokens.R.card, style: .continuous)
+                .stroke(Tokens.C.borderCard, lineWidth: 1)
+        )
+        .padding(.horizontal, 16)
+    }
+
+    private var copyButtonTitle: String {
+        copied ? "Путь скопирован" : "Скопировать путь агента"
+    }
+
+    /// One honest sentence per reason — each names a DIFFERENT broken thing, so a
+    /// shared "что-то пошло не так" would throw away the only useful information.
+    private var explanation: String {
+        switch reason {
+        case .pa0Mismatch:
+            return "В LaunchAgent прописан не тот исполняемый файл. Пока это так, доступ к папке выдать невозможно — система спрашивает разрешение для конкретного файла."
+        case .receiptMissing:
+            return "Установка не оставила отметки о завершении — значит, она не дошла до конца. Нажмите «Починить»."
+        case .generationMissing:
+            return "Агент установлен, но ещё ни разу не отчитался о запуске. Нажмите «Починить» — переустановим задание launchd."
+        case .generationMismatch:
+            return "Сейчас работает агент от ПРЕДЫДУЩЕЙ установки: файлы обновились, а задание launchd осталось старым. Нажмите «Починить»."
+        case nil:
+            return "Не удалось подтвердить, что фоновый агент работает."
+        }
+    }
+}
+
+// MARK: - Consent notice (shown BEFORE macOS raises its own dialog)
+
+/// Modal scrim + a small card explaining the system dialog that is about to appear.
+/// See `ConsentPrompt` for why this exists at all.
+private struct ConsentNoticeOverlay: View {
+    let prompt: ConsentPrompt
+    let onProceed: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(Tokens.C.rowIcBrandTealBg)
+                    Image(systemName: "hand.raised.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Tokens.C.brandTeal)
+                }
+                .frame(width: 48, height: 48)
+
+                Text("Сейчас система спросит разрешение")
+                    .font(.system(size: 18, weight: .bold))
+                    .tracking(-0.3)
+                    .foregroundColor(Tokens.C.textHigh)
+                    .multilineTextAlignment(.center)
+
+                Text("Через пару секунд macOS покажет своё окно и спросит доступ к папке. Нажмите в нём «Разрешить» — без этого фоновый агент не увидит ваши mp3.")
+                    .font(.system(size: Tokens.F.emptyBody))
+                    .foregroundColor(Tokens.C.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // The folder is not always nameable (a repair can carry one over
+                // from the plist that our stricter resolution refuses to claim) —
+                // an empty line is better than an invented path.
+                if !prompt.folder.isEmpty {
+                    Text(tildeAbbrev(prompt.folder))
+                        .font(.system(size: Tokens.F.small, design: .monospaced))
+                        .foregroundColor(Tokens.C.textTertiary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .multilineTextAlignment(.center)
+                }
+
+                Text("Если нажать «Не разрешать», окно больше не появится — доступ придётся включать вручную в Системных настройках.")
+                    .font(.system(size: Tokens.F.small))
+                    .foregroundColor(Tokens.C.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                PrimaryPillButton(title: "Понятно, продолжить", icon: "checkmark",
+                                  action: onProceed)
+                GhostPillButton(title: "Не сейчас", icon: "xmark", action: onCancel)
+            }
+            .padding(.init(top: 22, leading: 22, bottom: 20, trailing: 22))
+            .frame(width: Tokens.M.windowSheet)   // 440 (spec §6 sheet family)
+            .background(
+                RoundedRectangle(cornerRadius: Tokens.R.window, style: .continuous)
+                    .fill(Tokens.Canvas.sheetGradient)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Tokens.R.window, style: .continuous)
+                    .stroke(Tokens.C.borderFieldInput, lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.85), radius: 35, x: 0, y: 28)
+            .padding(.vertical, 24)
+        }
+    }
+
+    private func tildeAbbrev(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        if !home.isEmpty, path.hasPrefix(home + "/") {
+            return "~/" + String(path.dropFirst(home.count + 1))
+        }
+        return path
+    }
+}
+
+// MARK: - «Перенести работу в ~/mp3-to-m4b» (the one-click repair, addendum §2 (г))
+
+/// The confirmation for re-pointing the agent at a folder OUTSIDE the protected
+/// zones. Two things it must say out loud, because both are surprising:
+///   · WHY it fixes anything — the home root is not a TCC zone at all, so there is
+///     no dialog, no Full Disk Access and no wedged probe to get wrong;
+///   · WHAT IT DOES NOT DO — it does not carry the user's files across. That is on
+///     purpose (`book_id = sha256(абсолютный путь)`: moving files re-arms the whole
+///     library and every finished book comes back as new), and it is also the one
+///     thing a user would assume happened.
+private struct RelocateNoticeOverlay: View {
+    let prompt: RelocatePrompt
+    let onProceed: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.55).ignoresSafeArea()
+            VStack(spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(Tokens.C.rowIcBrandTealBg)
+                    Image(systemName: "house")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Tokens.C.brandTeal)
+                }
+                .frame(width: 48, height: 48)
+
+                Text("Перенести работу в домашнюю папку")
+                    .font(.system(size: 18, weight: .bold))
+                    .tracking(-0.3)
+                    .foregroundColor(Tokens.C.textHigh)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Рабочий стол, Документы и Загрузки macOS защищает и спрашивает про них разрешение. Домашняя папка в этот список не входит — там разрешение не нужно вообще: ни окна с вопросом, ни Системных настроек.")
+                    .font(.system(size: Tokens.F.emptyBody))
+                    .foregroundColor(Tokens.C.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(spacing: 6) {
+                    if let from = prompt.from, !from.isEmpty {
+                        pathRow(caption: "БЫЛО", path: from, color: Tokens.C.textTertiary)
+                    }
+                    pathRow(caption: "СТАНЕТ", path: prompt.to, color: Tokens.C.accentTealText)
+                }
+                .frame(maxWidth: .infinity)
+
+                Text("Файлы не переносятся: приложение сейчас не может прочитать старую папку. Всё, что там лежит — исходники и собранные .m4b — останется на прежнем месте, его видно в Finder по старому пути.")
+                    .font(.system(size: Tokens.F.small))
+                    .foregroundColor(Tokens.C.textTertiary)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                PrimaryPillButton(title: "Перенести и перезапустить агента",
+                                  icon: "house", action: onProceed)
+                GhostPillButton(title: "Отмена", icon: "xmark", action: onCancel)
+            }
+            .padding(.init(top: 22, leading: 22, bottom: 20, trailing: 22))
+            .frame(width: Tokens.M.windowSheet)
+            .background(
+                RoundedRectangle(cornerRadius: Tokens.R.window, style: .continuous)
+                    .fill(Tokens.Canvas.sheetGradient)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Tokens.R.window, style: .continuous)
+                    .stroke(Tokens.C.borderFieldInput, lineWidth: 1)
+            )
+            .shadow(color: Color.black.opacity(0.85), radius: 35, x: 0, y: 28)
+            .padding(.vertical, 24)
+        }
+    }
+
+    private func pathRow(caption: String, path: String, color: Color) -> some View {
+        HStack(spacing: 8) {
+            Text(caption)
+                .font(.system(size: Tokens.F.cap, weight: .bold))
+                .tracking(0.8)
+                .foregroundColor(Tokens.C.textTertiary)
+                .frame(width: 54, alignment: .leading)
+            Text(LocalWatchFolder.tildeAbbreviated(path))
+                .font(.system(size: Tokens.F.small, design: .monospaced))
+                .foregroundColor(color)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 0)
+        }
+        .padding(.init(top: 7, leading: 10, bottom: 7, trailing: 10))
+        .background(
+            RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
+                .fill(Tokens.C.bgInput)
+        )
+    }
+}
+
+// MARK: - Shared bits for the install/diagnostics screens
+
+// `PrimaryPillButton` / `GhostPillButton` moved to app/FolderAccessCard.swift —
+// the access card needs them WITHOUT the AppKit host (its self-check compiles that
+// file on its own), and two copies of the same pill would drift apart on the first
+// token change. Same tokens, plus an `enabled` flag the card uses to freeze its
+// actions while a probe is in flight.
+
+/// The collapsible «Подробности» block: every source, side by side, plus the
+/// installer's stderr tail. Collapsed by default so the screen leads with actions;
+/// its content scrolls inside a capped box so a long stderr tail can never push the
+/// buttons off the bottom of the window (lesson native-window-cap-height).
+private struct DiagnosticsDisclosure: View {
+    let diagnostics: InstallDiagnostics
+    let onCopy: () -> Void
+
+    @State private var expanded = false
+
+    var body: some View {
+        disclosure
+            // Same wiring as the access card's fallback block, and the same bug
+            // without it: «Подробности» grows the CONTENT while the window stays put,
+            // so the stderr tail is cut off with empty screen underneath.
+            .onChange(of: expanded) { _ in
+                NotificationCenter.default.post(name: .mp3ContentHeightDidChange, object: nil)
+            }
+    }
+
+    private var disclosure: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: { expanded.toggle() }) {
+                HStack(spacing: 6) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                    Text("Подробности")
+                        .font(.system(size: Tokens.F.caption, weight: .semibold))
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Tokens.C.textTertiary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(diagnostics.rows.enumerated()), id: \.offset) { _, row in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(row.0)
+                                    .font(.system(size: Tokens.F.cap, weight: .bold))
+                                    .tracking(0.6)
+                                    .foregroundColor(Tokens.C.textTertiary)
+                                Text(row.1)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(Tokens.C.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        if !diagnostics.installerStderrTail.isEmpty {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("УСТАНОВЩИК")
+                                    .font(.system(size: Tokens.F.cap, weight: .bold))
+                                    .tracking(0.6)
+                                    .foregroundColor(Tokens.C.textTertiary)
+                                Text(diagnostics.installerStderrTail)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(Tokens.C.dangerText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+                }
+                .frame(maxHeight: 200)
+                .background(
+                    RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
+                        .fill(Tokens.C.surfaceControlSoft)
+                )
+                GhostPillButton(title: "Скопировать диагностику", icon: "doc.on.doc",
+                                action: onCopy)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -3968,13 +4620,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         //   3) INSTALLED and current (or undecidable, e.g. a dev run with no bundled
         //      agent) → the normal landing (D8): a pending book's confirm window, else
         //      Status (home). A pending grouping prompt overlays the landing screen.
-        if !isAgentInstalled() {
+        //   2a) INSTALLED, bytes ALREADY CURRENT, but ProgramArguments[0] is not our
+        //      frozen helper → repair it SYNCHRONOUSLY, right here, BEFORE the first
+        //      frame. Affordable only because `--repair-launchd-only` is strictly
+        //      offline (no ffmpeg detection, no venv, no pip) — a full installer
+        //      would block the window on `pip install --upgrade pip`, which has no
+        //      timeout. Doing it before the UI matters because everything the UI
+        //      could say about folder access is a lie until PA0 is right.
+        //
+        //      ORDER IS LOAD-BEARING: the full-update branch wins. On a v0.9 install
+        //      PA0 is also wrong, but the frozen helper was never staged there, so an
+        //      offline repair has nothing to point at and dies on its golden-SHA
+        //      check — the correct answer is the full install that stages it (plan
+        //      §6.2: "bytes stale" → full, "PA0-only" → offline repair).
+        let action = startupInstallAction()
+        if action == .repairLaunchdOnly { repairProgramArgument0IfNeeded() }
+        refreshInstallTruth()
+
+        switch action {
+        case .setup:
             model.screen = .setup
-        } else if shouldAutoUpdateAgent() {
+        case .fullInstall:
             model.screen = .updating
             model.agentUpdatePhase = .running
-        } else {
-            model.screen = model.manifest != nil ? .confirm : .status
+        case .repairLaunchdOnly, .none:
+            // The repair above either was not applicable or did not make the job
+            // provable — in which case that surface owns the window.
+            model.screen = model.surface.ownsWindow
+                ? .agentNotRunning
+                : normalLanding()
         }
 
         let root = RootView(
@@ -4005,8 +4679,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onRetryAgentUpdate: { [weak self] in self?.startAgentAutoUpdate() },
             agentFreshness: { [weak self] in
                 guard let self = self else { return .undecidable }
-                return AgentUpdate.freshness(store: self.store)
-            })
+                return AgentUpdate.combinedFreshness(store: self.store)
+            },
+            onChooseFolderAndRetry: { [weak self] in self?.chooseFolderAndRetryUpdate() },
+            onContinueWithoutUpdate: { [weak self] in self?.continueWithoutUpdate() },
+            onRepairAgent: { [weak self] in self?.startLaunchdRepair() },
+            onCopyDiagnostics: { [weak self] in self?.copyDiagnostics() },
+            onCopyHelperPath: { [weak self] in self?.copyHelperPathFailClosed() ?? false },
+            requestConsentNotice: { [weak self] folder, go in
+                self?.requestConsentNotice(folder: folder, proceed: go)
+            },
+            resolvedWatchDir: { [weak self] in self?.currentWatchDir() },
+            installIsNewerThanApp: { [weak self] in
+                guard let self = self else { return false }
+                return AgentUpdate.isDowngrade(store: self.store)
+            },
+            onAccessAction: { [weak self] action in self?.handleAccessAction(action) })
         let hosting = NSHostingView(rootView: root)
         self.hosting = hosting
 
@@ -4091,36 +4779,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Callers guard on `isAgentInstalled()` first (auto-update only makes sense for a
     /// non-first launch), so this does not re-check that.
     private func shouldAutoUpdateAgent() -> Bool {
-        guard AgentUpdate.freshness(store: store) == .outdated else { return false }
-        return currentWatchDir() != nil
+        startupInstallAction() == .fullInstall
     }
 
-    /// The folder the agent is CURRENTLY watching, resolved WITHOUT falling back to
-    /// the default (a re-install must keep the user's folder, brief §2):
-    ///   1) state.json `agent.watch_dir` (the agent stamps it on every write), then
-    ///   2) the LaunchAgent plist's `EnvironmentVariables.MP3TOM4B_WATCH_DIR` (survives
-    ///      even if state.json is absent/stale), else
-    ///   3) nil — we don't know, so we must NOT auto-run the installer.
-    /// Honors MP3TOM4B_LABEL (plist path) + MP3TOM4B_SUPPORT_DIR (via the store), so a
-    /// scratch-tree test resolves its own folder and never the real one.
+    /// Gather the six facts and let `StartupPlan` decide (the ordering rationale
+    /// lives with the rule, in StateModel.swift). Everything here is a read.
+    private func startupInstallAction() -> StartupInstallAction {
+        StartupPlan.decide(
+            isInstalled: isAgentInstalled(),
+            bytesStale: AgentUpdate.combinedFreshness(store: store) == .outdated,
+            bundledIsOlderThanInstall: AgentUpdate.isDowngrade(store: store),
+            watchDirKnown: currentWatchDir() != nil,
+            pa0IsHelper: store.installedRunnerIsHelper(),
+            helperStaged: FileManager.default.fileExists(atPath: store.installedHelperPath))
+    }
+
+    /// The folder the agent is CURRENTLY watching, resolved receipt → plist →
+    /// same-generation state, with NO default (WatchDirTruth, plan v2 M2f).
+    ///
+    /// The order used to be state-first, and that is a real hazard: state.json is
+    /// rewritten on every scan, so an agent from the PREVIOUS generation that is
+    /// still alive keeps stamping the OLD folder over a newer install's value. A
+    /// re-install taking that value would silently re-point the user's agent back.
+    /// The receipt is written last (after launchd was verified), so it is the only
+    /// self-dated proof; state.json is accepted only when it carries the SAME
+    /// generation, i.e. proves it belongs to the install on disk.
+    ///
+    /// nil is a real answer: "we don't know" ⇒ never auto-run the installer, because
+    /// it would default to ~/Desktop/mp3-to-m4b.
     private func currentWatchDir() -> String? {
-        // 1) state.json
-        let fromState = model.state.agent.watchDir
-        if let d = fromState, !d.isEmpty { return d }
-        // 2) LaunchAgent plist EnvironmentVariables.MP3TOM4B_WATCH_DIR
-        let label = ProcessInfo.processInfo.environment["MP3TOM4B_LABEL"]
-            ?? "com.arrivarus.mp3tom4b.agent"
-        let plist = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
-        if let data = try? Data(contentsOf: plist),
-           let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-           let dict = obj as? [String: Any],
-           let env = dict["EnvironmentVariables"] as? [String: Any],
-           let watch = env["MP3TOM4B_WATCH_DIR"] as? String,
-           !watch.isEmpty {
-            return watch
-        }
-        return nil   // unknown → caller must not auto-run the installer
+        store.resolvedWatchDir(state: model.state)
     }
 
     /// Run the bundled installer to REFRESH the stale staged agent in place, keeping
@@ -4137,37 +4825,487 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         guard let dir = currentWatchDir() else {
-            // We reached here without a known folder — bail to the normal landing
-            // rather than risk a silent re-point. (shouldAutoUpdateAgent guards this
-            // for the launch path; this covers a manual retry after state changed.)
-            model.agentUpdatePhase = .failed("Не удалось определить отслеживаемую папку — обновите через Настройки.")
+            // We reached here without a known folder — refuse rather than risk a
+            // silent re-point. The `.failed` screen now offers «Выбрать папку…»,
+            // which is the honest way out of exactly this refusal.
+            model.agentUpdatePhase = .failed("Не удалось определить отслеживаемую папку — выберите её кнопкой ниже.")
+            navigate(to: .updating)
             return
         }
+        // The install ends with a bootstrap whose first tick raises the system
+        // consent dialog — warn first (addendum §5.2).
+        requestConsentNotice(folder: dir) { [weak self] in
+            self?.runAgentInstaller(installer: installer, watchDir: dir)
+        }
+    }
+
+    private func runAgentInstaller(installer: String, watchDir dir: String) {
         model.agentUpdatePhase = .running
         if model.screen != .updating { navigate(to: .updating) }
         let env = agentInstallerExtraEnv
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = InstallRunner.run(installerPath: installer, watchDir: dir, extraEnv: env)
-            DispatchQueue.main.async {
+        InstallCoordinator.shared.submit(
+            id: "agent-update",
+            work: { InstallOutcome(InstallRunner.runCapturing(
+                installerPath: installer, watchDir: dir, extraEnv: env).phase) },
+            completion: { [weak self] outcome in
                 guard let self = self else { return }
-                self.model.agentUpdatePhase = result
-                if case .done = result {
+                self.model.agentUpdatePhase = outcome.phase
+                if case .done = outcome {
+                    self.installSettledAt = Date()
+                    self.agentStallDismissed = false
                     // Engine refreshed → proceed exactly like a fresh install (re-read,
                     // re-arm the watcher, land on Status / a pending book's confirm).
                     self.handleInstalled()
                 }
                 // On .failed we STAY on the `.updating` screen (the card shows the
-                // error + "Повторить"); the agent is untouched-or-old but the app is
-                // not bricked. refit so the taller error card fits.
+                // error + four exits + diagnostics); the agent is untouched-or-old
+                // but the app is not bricked. refit so the taller card fits.
+                self.refreshInstallTruth()
                 self.hosting?.layoutSubtreeIfNeeded()
                 self.refitWindowHeight()
+            })
+    }
+
+    // MARK: PA0 self-repair (offline, synchronous, BEFORE the first frame)
+
+    /// If the LaunchAgent's `ProgramArguments[0]` is not our frozen helper, run
+    /// `installer.sh --repair-launchd-only` and BLOCK until it finishes.
+    ///
+    /// Synchronous on purpose. Everything the UI could say about folder access is
+    /// meaningless while PA0 is wrong (the TCC subject is the Mach-O image of that
+    /// exact path), so showing a window first would mean showing a window that
+    /// lies. The donor does this asynchronously; we can afford the stricter shape
+    /// because the repair mode is strictly offline — verify installed files against
+    /// the golden SHA, re-bake the plist, reload, verify, write the receipt. No
+    /// engine detection, no venv, no `pip install --upgrade pip` (which has no
+    /// timeout and is precisely why a synchronous FULL install would be unshippable).
+    ///
+    /// It runs at most once per launch and only when we already know the folder:
+    /// an unknown folder must never be repaired into the default (see currentWatchDir).
+    private func repairProgramArgument0IfNeeded() {
+        // Only when there is a real job to repair. A bare staged tree (a dev /
+        // NO_LAUNCHCTL install: no plist, no receipt) has no launchd job at all, so
+        // "repair" would just be a subprocess that fails on every launch.
+        guard store.hasInstallEvidence() else { return }
+        guard !store.installedRunnerIsHelper() else { return }
+        // The offline mode only re-points launchd at a helper that is ALREADY
+        // staged and passes the golden SHA. Without the file there is nothing to
+        // repair (v0.9, or a half-removed tree) — that case belongs to the full
+        // installer, and calling repair here would just fail noisily every launch.
+        guard FileManager.default.fileExists(atPath: store.installedHelperPath) else {
+            NSLog("[repair] skipped: no staged helper at %@ (full install needed)",
+                  store.installedHelperPath)
+            return
+        }
+        guard let installer = InstallRunner.bundledInstallerPath() else { return }
+        // Repair carries the folder over from receipt/plist itself; we pass ours
+        // when the stricter resolution knows it, and "" when it does not — never a
+        // default. A repair with no folder anywhere fails loudly in the installer
+        // rather than silently re-pointing the user at ~/Desktop/mp3-to-m4b.
+        let dir = currentWatchDir() ?? ""
+        let result = InstallRunner.runRepair(installerPath: installer, watchDir: dir,
+                                             extraEnv: agentInstallerExtraEnv)
+        lastInstallerStderrTail = result.stderrTail
+        if case .done = result.phase {
+            installSettledAt = Date()
+            agentStallDismissed = false
+            model.refresh()
+            NSLog("[repair] ProgramArguments[0] repaired offline (watch=%@)",
+                  dir.isEmpty ? "<carried over>" : dir)
+            // The repaired job's FIRST tick raises the system consent dialog, and
+            // this path had no window to warn in beforehand — so the notice goes up
+            // with the very first frame instead. Slightly after the fact by design:
+            // a card that appears with the dialog still answers «кто это спрашивает
+            // и почему», which is the whole job. Only for a folder we actually know
+            // (the repair may have carried one over that we cannot name).
+            if let known = store.resolvedWatchDir(state: model.state) {
+                model.consentPrompt = ConsentPrompt(folder: known, proceed: {})
             }
+        } else if case .failed(let msg) = result.phase {
+            NSLog("[repair] offline repair FAILED: %@", msg)
         }
     }
 
+    /// Manual «Починить» from the «Агент не запустился» screen — the same offline
+    /// repair, off the main thread this time (the window already exists).
+    private func startLaunchdRepair() {
+        guard let installer = InstallRunner.bundledInstallerPath() else {
+            model.agentUpdatePhase = .failed("Установщик не найден в приложении (пересоберите .app).")
+            navigate(to: .updating)
+            return
+        }
+        let dir = currentWatchDir() ?? ""
+        // A repair re-bootstraps the job, so its first tick raises the system
+        // dialog — warn first, exactly like the full install does.
+        requestConsentNotice(folder: dir) { [weak self] in
+            self?.runLaunchdRepair(installer: installer, watchDir: dir)
+        }
+    }
+
+    private func runLaunchdRepair(installer: String, watchDir dir: String) {
+        let env = agentInstallerExtraEnv
+        model.agentUpdatePhase = .running
+        navigate(to: .updating)
+        InstallCoordinator.shared.submit(
+            id: "launchd-repair",
+            work: { [weak self] in
+                let r = InstallRunner.runRepair(installerPath: installer,
+                                                watchDir: dir, extraEnv: env)
+                self?.lastInstallerStderrTail = r.stderrTail
+                return InstallOutcome(r.phase)
+            },
+            completion: { [weak self] outcome in
+                guard let self = self else { return }
+                self.model.agentUpdatePhase = outcome.phase
+                if case .done = outcome {
+                    self.installSettledAt = Date()
+                    self.agentStallDismissed = false
+                    self.handleInstalled()
+                }
+                self.refreshInstallTruth()
+                self.hosting?.layoutSubtreeIfNeeded()
+                self.refitWindowHeight()
+            })
+    }
+
+    // MARK: The live install truth (recomputed on every refresh)
+
+    /// When the last install/repair settled — the clock the generation grace runs
+    /// on. Seeded at launch so a cold start also gives the agent its first tick
+    /// before we accuse it of not running.
+    private var installSettledAt = Date()
+    /// stderr tail of the most recent installer run (diagnostics block).
+    private var lastInstallerStderrTail = ""
+    /// The user pressed «Продолжить» on the «Агент не запустился» screen. Suppresses
+    /// the automatic re-raise for the rest of the session so that button is not a
+    /// no-op — it is reset by any install/repair, which changes the facts underneath.
+    /// The GATE is untouched by this: the access surface stays forbidden either way,
+    /// so dismissing the screen can never make the app claim something it cannot
+    /// prove — it only stops the app from blocking the user with it.
+    private var agentStallDismissed = false
+
+    /// Re-read PA0 + receipt + state, recompute the surface and the diagnostics.
+    /// Cheap enough for every refresh (one `plutil` + two small file reads) and it
+    /// MUST be fresh: a cached "PA0 is fine" from launch is exactly the stale fact
+    /// that would let the app claim access help for a job that no longer exists.
+    private func refreshInstallTruth() {
+        let occupies: Bool
+        switch model.agentUpdatePhase {
+        case .running, .failed: occupies = (model.screen == .updating)
+        case .idle, .done: occupies = false
+        }
+        let truth = store.installTruth(
+            state: model.state,
+            updateOccupiesWindow: occupies,
+            secondsSinceInstallSettled: Date().timeIntervalSince(installSettledAt))
+        model.surface = truth.surface
+        model.diagnostics = store.diagnostics(state: model.state,
+                                              stderrTail: lastInstallerStderrTail)
+    }
+
+    // MARK: Exits out of the dead ends (M12f)
+
+    /// «Выбрать папку…» on the failed-update screen: pick explicitly, then retry.
+    /// This is the ONLY way the app ever learns a folder it could not resolve — it
+    /// refuses to guess, so the user supplies the answer instead of the default.
+    private func chooseFolderAndRetryUpdate() {
+        let panel = NSOpenPanel()
+        panel.title = "Выберите отслеживаемую папку"
+        panel.prompt = "Выбрать"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let installer = InstallRunner.bundledInstallerPath() else {
+            model.agentUpdatePhase = .failed("Установщик не найден в приложении (пересоберите .app).")
+            return
+        }
+        requestConsentNotice(folder: url.path) { [weak self] in
+            self?.runAgentInstaller(installer: installer, watchDir: url.path)
+        }
+    }
+
+    /// «Продолжить без обновления» / «Продолжить»: land normally. The agent may be
+    /// old or unproven — but the access surface stays suppressed by the gate, so the
+    /// app cannot mislead from here; it simply stops blocking the user.
+    private func continueWithoutUpdate() {
+        model.agentUpdatePhase = .idle
+        agentStallDismissed = true
+        handleInstalled()
+    }
+
+    /// «Скопировать диагностику» — the whole block as plain text, for a bug report.
+    private func copyDiagnostics() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(model.diagnostics.plainText, forType: .string)
+    }
+
+    /// «Скопировать путь агента» — FAIL-CLOSED (plan v2 §6.3).
+    ///
+    /// This is the one action that hands the user a path they will then grant system
+    /// access to, so it does not trust the router that put the button on screen: it
+    /// re-reads `ProgramArguments[0]` from disk AT THIS MOMENT and refuses when it
+    /// is not the helper. A dead path must not be able to reach the clipboard even
+    /// if the routing above it is buggy — the user would grant access to a binary
+    /// launchd is not running and have no way to tell it did nothing.
+    @discardableResult
+    private func copyHelperPathFailClosed() -> Bool {
+        guard store.installedRunnerIsHelper() else {
+            NSLog("[access] refusing to copy the helper path: live PA0 is %@, expected %@",
+                  store.diskProgramArgument0() ?? "<unreadable>", store.installedHelperPath)
+            return false
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        let ok = pb.setString(store.installedHelperPath, forType: .string)
+        // Verify the clipboard really took it (the ack must not lie either).
+        return ok && pb.string(forType: .string) == store.installedHelperPath
+    }
+
+    // MARK: - M6: the folder-access card's actions
+
+    /// The recheck in flight: the token we saw before dropping the command, and the
+    /// deadline after which silence stops being "wait a moment" (plan v2 M5f).
+    private var recheckTokenBefore: String?
+    private var recheckDeadline: Date?
+    private var recheckTimer: Timer?
+
+    /// Every button on the access card, in one place. The card is a pure view; the
+    /// rules that make these actions safe (a move is refused mid-build, the path
+    /// copy is fail-closed, a recheck waits for a TOKEN and not for a verdict) live
+    /// here, next to the state they read.
+    private func handleAccessAction(_ action: FolderAccessAction) {
+        switch action {
+        case .showRequestAgain, .recheck:
+            startFolderRecheck()
+        case .moveOutOfProtectedZone:
+            requestRelocateToLocalFolder()
+        case .chooseFolder:
+            chooseWatchFolderAndRepoint()
+        case .openAppSettings:
+            navigate(to: .settings)
+        case .copyHelperPath:
+            let ok = copyHelperPathFailClosed()
+            model.accessPathCopied = ok
+            model.accessCopyRefused = !ok
+        case .openPrivacyPane:
+            openFullDiskAccessPane()
+        }
+    }
+
+    /// «Проверить снова» / «Показать запрос ещё раз».
+    ///
+    /// Both labels drive the SAME mechanism, and that is honest rather than lazy: a
+    /// fresh probe is literally what re-raises the system dialog in `blocked` (there
+    /// is no TCC record yet, so macOS must ask again), and literally what re-reads
+    /// the recorded "no" in `denied` (where no dialog will ever appear). One
+    /// mechanism, two truthful promises.
+    ///
+    /// The wait is on `folder_access_ts` MOVING, never on the verdict changing —
+    /// "checked again, still denied" is the most common outcome and has to end the
+    /// wait as cleanly as a success (agent/scan.py bumps the token on every probe).
+    private func startFolderRecheck() {
+        guard let current = model.accessCardState else { return }
+        guard !current.actionsAreInert else { return }
+
+        recheckTimer?.invalidate()
+        recheckTokenBefore = model.state.agent.folderAccessTs
+        model.accessPin = .checking(current.problem)
+        // A copy ack from the previous round says nothing about this one.
+        model.accessPathCopied = false
+        model.accessCopyRefused = false
+
+        do {
+            try engine.writeRecheckAccess()
+        } catch {
+            // The command never reached the queue — that is a local failure, and
+            // pretending to wait 10 s for an answer nobody was asked for would only
+            // waste the user's time.
+            NSLog("[access] recheck-access drop failed: %@", String(describing: error))
+            model.accessPin = .timeout(current.problem)
+            return
+        }
+
+        recheckDeadline = Date().addingTimeInterval(FolderRecheck.timeout)
+        let timer = Timer.scheduledTimer(withTimeInterval: FolderRecheck.pollInterval,
+                                         repeats: true) { [weak self] _ in
+            self?.pollFolderRecheck()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        recheckTimer = timer
+    }
+
+    /// One poll tick: re-read the state, and settle as soon as the token moves or
+    /// the deadline passes.
+    private func pollFolderRecheck() {
+        guard let pin = model.accessPin, pin.isChecking else {
+            finishFolderRecheck(); return
+        }
+        model.refresh()
+        refreshInstallTruth()
+
+        let agent = model.state.agent
+        let expired = (recheckDeadline.map { Date() >= $0 } ?? true)
+        let outcome = FolderRecheck.evaluate(
+            tokenBefore: recheckTokenBefore,
+            tokenAfter: agent.folderAccessTs,
+            verdict: agent.folderAccess,
+            agentIsBuilding: model.state.currentlyBuilding != nil)
+
+        // Before the deadline, only a MOVED token is an answer: `.busy` /
+        // `.probeFailed` at t=0.25s just mean "not yet".
+        switch outcome {
+        case .ok, .stillProblem:
+            break
+        case .busy, .probeFailed:
+            guard expired else { return }
+        }
+
+        switch outcome {
+        case .ok:
+            // The live verdict is now `ok`, so the router drops the surface by
+            // itself; clearing the pin keeps a stale «проверяю…» from outliving it.
+            model.accessPin = nil
+        case .stillProblem(let verdict):
+            model.accessPin = .stillDenied(verdict)
+        case .busy:
+            model.accessPin = .busy(pin.problem)
+        case .probeFailed:
+            model.accessPin = .timeout(pin.problem)
+        }
+        finishFolderRecheck()
+        hosting?.layoutSubtreeIfNeeded()
+        refitWindowHeight()
+    }
+
+    private func finishFolderRecheck() {
+        recheckTimer?.invalidate()
+        recheckTimer = nil
+        recheckDeadline = nil
+        recheckTokenBefore = nil
+    }
+
+    /// A PINNED card (stillDenied / busy / timeout) is the app's own memory of a
+    /// finished recheck, not a fact the state file can refresh — so it has to be
+    /// dropped explicitly, or the user grants access, the agent starts building,
+    /// and «доступа пока нет» stays on screen anyway. Also drops a pin whose
+    /// problem no longer matches the live verdict: a `blocked` pin over a live
+    /// `denied` would keep offering «Показать запрос ещё раз» for a dialog macOS
+    /// has already decided never to show again.
+    private func dissolveStaleAccessPin() {
+        guard model.accessPin != nil else { return }
+        if FolderRecheck.terminalRecheckDissolves(
+            pinned: model.accessPin,
+            live: model.state.agent.folderAccess,
+            agentIsBuilding: model.state.currentlyBuilding != nil) {
+            model.accessPin = nil
+            model.accessPathCopied = false
+            model.accessCopyRefused = false
+        }
+    }
+
+    /// «Выбрать папку вне защищённой зоны» — the one-click repair (addendum §2 (г)).
+    ///
+    /// SCOPE, stated plainly: this re-points the agent, it does not move files. The
+    /// full migration in addendum §3 (carry unbuilt sources across, leave finished
+    /// `.m4b` where they are, rebuild the ledgers) needs an agent-side command that
+    /// does not exist yet — and doing HALF of it from the app would be the worst of
+    /// both worlds, because `book_id = sha256(абсолютный путь)` and a partial move
+    /// re-arms the library. So the app does the part it can do transactionally, and
+    /// the confirmation says out loud what stays behind.
+    private func requestRelocateToLocalFolder() {
+        // Refused mid-build (addendum §3.2 rule 5): the agent is writing the .m4b
+        // INTO the watched folder right now, and re-pointing it there and then would
+        // orphan a half-written file.
+        if model.state.currentlyBuilding != nil {
+            if let current = model.accessCardState { model.accessPin = .busy(current.problem) }
+            return
+        }
+        let target = LocalWatchFolder.path
+        model.relocatePrompt = RelocatePrompt(
+            from: currentWatchDir() ?? model.state.agent.watchDir,
+            to: target,
+            proceed: { [weak self] in self?.relocateToLocalFolder(target) })
+    }
+
+    /// The confirmed move: create the folder, then re-point through the SAME
+    /// transactional installer path Настройки' «Сменить папку» uses (new plist +
+    /// bootstrap + receipt + generation). No new mechanism, so no new failure mode.
+    private func relocateToLocalFolder(_ target: String) {
+        do {
+            try FileManager.default.createDirectory(
+                atPath: target, withIntermediateDirectories: true)
+        } catch {
+            model.agentUpdatePhase = .failed("Не удалось создать папку \(target): \(error.localizedDescription)")
+            navigate(to: .updating)
+            return
+        }
+        guard let installer = InstallRunner.bundledInstallerPath() else {
+            model.agentUpdatePhase = .failed("Установщик не найден в приложении (пересоберите .app).")
+            navigate(to: .updating)
+            return
+        }
+        // No consent notice here, and that is the point of the whole action: the
+        // home root is not a TCC zone, so nothing will ask. Announcing a dialog that
+        // never arrives would teach the user to ignore the notice that matters.
+        model.accessPin = nil
+        runAgentInstaller(installer: installer, watchDir: target)
+    }
+
+    /// «Выбрать другую папку…» — an explicit pick, then the same re-point. The
+    /// consent notice is shown only when the chosen folder is in a protected zone,
+    /// because only then will macOS actually ask.
+    private func chooseWatchFolderAndRepoint() {
+        if model.state.currentlyBuilding != nil {
+            if let current = model.accessCardState { model.accessPin = .busy(current.problem) }
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Выберите отслеживаемую папку"
+        panel.prompt = "Выбрать"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let installer = InstallRunner.bundledInstallerPath() else {
+            model.agentUpdatePhase = .failed("Установщик не найден в приложении (пересоберите .app).")
+            navigate(to: .updating)
+            return
+        }
+        model.accessPin = nil
+        let go: () -> Void = { [weak self] in
+            self?.runAgentInstaller(installer: installer, watchDir: url.path)
+        }
+        if LocalWatchFolder.isProtected(url.path, home: NSHomeDirectory()) {
+            requestConsentNotice(folder: url.path, proceed: go)
+        } else {
+            go()
+        }
+    }
+
+    // MARK: Consent notice
+
+    /// Put the "macOS is about to ask" card up and run `proceed` on acknowledgement.
+    private func requestConsentNotice(folder: String, proceed: @escaping () -> Void) {
+        model.consentPrompt = ConsentPrompt(folder: folder, proceed: proceed)
+        hosting?.layoutSubtreeIfNeeded()
+        refitWindowHeight()
+        bringWindowForward()
+    }
+
     /// Extra env for the auto-update installer run. Empty in production (a real update
-    /// touches the live launchd agent). A test seam can inject NO_LAUNCHCTL/NO_VENV +
-    /// a scratch LABEL/SUPPORT so a run never touches the real system.
+    /// touches the live launchd agent).
+    ///
+    /// TEST SEAM — read this before setting it. `installer.sh` now keeps every escape
+    /// hatch behind a two-stage latch: `MP3TOM4B_NO_LAUNCHCTL` / `MP3TOM4B_NO_VENV`
+    /// are IGNORED and `MP3TOM4B_SUPPORT_DIR` is REFUSED unless `MP3TOM4B_TEST_MODE=1`
+    /// and `MP3TOM4B_TEST_ROOT=<dir containing every redirected path>` are set too
+    /// (the neighbour's lesson: a test override once rewrote the human's production
+    /// LaunchAgent). Build the dictionary with `InstallerTestEnv.latched` rather than
+    /// by hand — a half-armed latch fails the install instead of isolating it.
     var agentInstallerExtraEnv: [String: String] = [:]
 
     /// Called by the Setup screen after a successful install (the agent is now
@@ -4176,10 +5314,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// and refit. Idempotent — safe if the watcher was already running.
     private func handleInstalled() {
         model.refresh()
+        refreshInstallTruth()
         lastPendingIDs = Set(model.state.pendingConfirm.map { $0.bookID })
         lastGroupIDs = Set(model.state.pendingGroups.map { $0.groupID })
-        let target: Screen = model.manifest != nil ? .confirm : .status
-        navigate(to: target)
+        navigate(to: normalLanding())
         startStateWatcher()
         bringWindowForward()
     }
@@ -4231,23 +5369,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let becameActive = nc.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.refreshNow() }
-        focusObservers = [becameKey, becameActive]
+        // A disclosure block opened/closed → the CONTENT changed height, so the
+        // window must be re-measured. The hop to the next runloop turn is
+        // load-bearing: the notification is posted from inside the SwiftUI state
+        // change, and `fittingSize` still reports the OLD height until that update
+        // has been laid out. Measuring synchronously here would refit to the size we
+        // are trying to leave.
+        let heightChanged = nc.addObserver(
+            forName: .mp3ContentHeightDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.hosting?.layoutSubtreeIfNeeded()
+                self.refitWindowHeight()
+            }
+        }
+        focusObservers = [becameKey, becameActive, heightChanged]
     }
 
     /// Re-read state + manifest, raise the window if a NEW pending book appeared
     /// (rising edge), then refit the window height. Main thread only.
     private func refreshNow() {
-        // While the Setup or auto-update screen is up, a focus/activate event must NOT
-        // yank the user off it — Setup is left only via the explicit install handoff
-        // (handleInstalled), and `.updating` is left only when the re-install finishes
-        // (also handleInstalled) or on a retry. Just refit and bail.
-        if model.screen == .setup || model.screen == .updating {
+        // While a modal flow is up (Setup / auto-update / «агент не запустился»), a
+        // focus/activate event must NOT yank the user off it — those screens are
+        // left only via an explicit handoff (handleInstalled) or a chosen exit.
+        // Just refit and bail.
+        if model.screen.isModalFlow {
             hosting?.layoutSubtreeIfNeeded()
             refitWindowHeight()
             return
         }
 
         model.refresh()
+        refreshInstallTruth()
+        dissolveStaleAccessPin()
+
+        // The gate can fail at ANY time, not just at launch: an installer killed
+        // mid-bootstrap, a plist edited by hand, an agent left over from a previous
+        // generation. When it does, that surface takes the window — showing access
+        // help for a job we cannot prove is running is the exact lie B3 forbids.
+        // …unless the user has explicitly chosen «Продолжить»: re-raising it on the
+        // next file event would make that button a no-op, and a control that does
+        // nothing is worse than no control (lesson 005).
+        if model.surface.ownsWindow, !agentStallDismissed,
+           model.consentPrompt == nil, model.relocatePrompt == nil {
+            // Keep the rising-edge baselines current even on this path, or the first
+            // refresh after leaving the screen would fire a raise for books that
+            // appeared while it was up.
+            lastPendingIDs = Set(model.state.pendingConfirm.map { $0.bookID })
+            lastGroupIDs = Set(model.state.pendingGroups.map { $0.groupID })
+            navigate(to: .agentNotRunning)
+            hosting?.layoutSubtreeIfNeeded()
+            refitWindowHeight()
+            return
+        }
 
         let nowPending = Set(model.state.pendingConfirm.map { $0.bookID })
         let nowGroups = Set(model.state.pendingGroups.map { $0.groupID })
@@ -4268,7 +5443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // user opened by hand earlier.
             if newPending {
                 model.clearSelection()
-                navigate(to: .confirm)
+                navigate(to: normalLanding())
             }
             bringWindowForward()
         } else if !hasActive && model.screen == .confirm {
@@ -4282,6 +5457,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hosting?.layoutSubtreeIfNeeded()
         refitWindowHeight()
+    }
+
+    /// Where the app lands when nothing is claiming the window: the presented
+    /// book's confirm view, or Status (home, D8).
+    ///
+    /// A LIVE access problem sends it to Status regardless, and that is the router's
+    /// own priority applied one level down (`folderAccess > normal`). Otherwise the
+    /// app would open the confirm window over a folder the agent has just said it
+    /// cannot read, offer «Собрать», and hide the one card that explains why nothing
+    /// happens — the access card lives on Status. It cannot swallow a NEW book,
+    /// either: with the probe not `ok` the agent exits before scanning (Р3), so no
+    /// new book can appear while this branch is taken; the books that are already
+    /// there stay visible behind the Status banner.
+    private func normalLanding() -> Screen {
+        if model.accessCardState != nil { return .status }
+        return model.manifest != nil ? .confirm : .status
     }
 
     /// Bring the already-running window forward (rising edge of a new pending book).
@@ -4310,7 +5501,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // book count (a constant 32pt frame/content unit mismatch, independent of
         // content). frameRect(forContentRect:) is the single source of truth for
         // the chrome inset, so this stays correct if the style mask changes.
-        let contentHeight = cappedContentHeight(hosting.fittingSize.height)
+        let desired = hosting.fittingSize.height
+        let contentHeight = cappedContentHeight(desired)
+        // Did the screen actually bind? Then the content really is scrolling, and
+        // that has to be VISIBLE — a scroll nobody knows about is just text cut off
+        // mid-word. Computed from two numbers we already have, so no self-measuring
+        // GeometryReader (.patches/002) and no chance of it disagreeing with the
+        // clamp it describes. The hint is an OVERLAY (zero layout impact): if it
+        // added height it would change `fittingSize` and refit itself in a loop.
+        model.contentClipped = WindowGeometry.contentOverflows(desired: desired,
+                                                               cap: contentHeight)
         let contentRect = NSRect(x: 0, y: 0, width: currentScreenWidth, height: contentHeight)
         let newFrameHeight = window.frameRect(forContentRect: contentRect).height
         guard abs(window.frame.height - newFrameHeight) > 0.5 else { return }

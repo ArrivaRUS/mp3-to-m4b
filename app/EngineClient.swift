@@ -256,6 +256,39 @@ struct EngineClient {
         }
     }
 
+    /// «Проверить снова» on the access card (plan v2 M5f + addendum §4.5).
+    ///
+    /// The lightest command in the protocol: no book, no manifest, no ledger, no
+    /// build. The agent re-runs the folder probe (behind its own watchdog) and
+    /// republishes `folder_access` + `folder_access_ts` — and `folder_access_ts`
+    /// moves on EVERY probe, even when the verdict is unchanged, which is exactly
+    /// what makes the app's wait terminable.
+    ///
+    /// Why a command file and not `launchctl kickstart`: kickstart without `-k` is
+    /// a no-op on a job that is already running, so during a build the button would
+    /// silently do nothing. `queue/commands/` is in the plist's `WatchPaths`, so
+    /// dropping a file wakes the agent by itself — and if it is mid-build, the
+    /// command simply waits its turn, which the UI reports as «проверим после
+    /// сборки» rather than as a failure.
+    struct RecheckAccessCommand: Codable, Equatable {
+        let cmdID: String
+        let action: String          // always "recheck-access"
+        let ts: Double
+
+        enum CodingKeys: String, CodingKey {
+            case cmdID = "cmd_id"
+            case action
+            case ts
+        }
+    }
+
+    /// Build the `recheck-access` payload (no I/O).
+    func makeRecheckAccess() -> RecheckAccessCommand {
+        RecheckAccessCommand(cmdID: UUID().uuidString,
+                             action: "recheck-access",
+                             ts: Date().timeIntervalSince1970)
+    }
+
     // MARK: - Idempotency
 
     /// Stable idempotency key for "build THIS book at THIS revision". Two clicks on
@@ -499,6 +532,16 @@ struct EngineClient {
     @discardableResult
     func writeSkip(bookID: String) throws -> URL {
         let command = makeSkip(bookID: bookID)
+        return try dropCommand(command, cmdID: command.cmdID)
+    }
+
+    /// Write a `recheck-access` command and return the URL that now exists. The
+    /// caller then waits for `agent.folder_access_ts` to MOVE (never for a
+    /// particular verdict — "checked again, still denied" is the most common
+    /// outcome and must terminate the wait just as cleanly as a success).
+    @discardableResult
+    func writeRecheckAccess() throws -> URL {
+        let command = makeRecheckAccess()
         return try dropCommand(command, cmdID: command.cmdID)
     }
 }

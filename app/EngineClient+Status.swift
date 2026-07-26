@@ -1,4 +1,8 @@
-// EngineClient+Status — app-side "Очистить" / "Сбросить статистику" (Status screen).
+// EngineClient+Status — app-side "Очистить" / "Сбросить статистику" (Status screen)
+// plus `InstallCoordinator`, the process-wide single-flight over installer runs
+// (plan v2 B4 — see its own doc comment at the bottom of this file). Both live
+// here because both are Foundation-only app-owned WRITE-side concerns, and this
+// file is compiled by the Swift self-check runner as well as the app.
 //
 // PORTED 1:1 from the fb2-to-epub neighbor (fb2/app/EngineClient+Status.swift
 // ~41-101 + 218-285). The architecture is identical: the AGENT is the SINGLE
@@ -185,6 +189,123 @@ struct StatusMarkers {
         f.timeZone = TimeZone.current
         f.dateFormat = "yyyy-MM-dd"
         return f.string(from: now)
+    }
+}
+
+// MARK: - InstallCoordinator (single-flight over the installer, plan v2 B4)
+
+/// The terminal result of an install flow, in a Foundation-only shape.
+///
+/// The UI's `InstallPhase` (SetupView.swift) carries `.idle`/`.running` too and
+/// lives next to SwiftUI; this type is the SUBSET the coordinator needs, so the
+/// coordinator (and its self-check) stay free of the view layer.
+enum InstallOutcome: Equatable {
+    case done
+    case failed(String)
+}
+
+/// ONE installer flow at a time, per process.
+///
+/// The installer replaces a directory tree, re-bakes the LaunchAgent plist and
+/// does bootout→bootstrap. Two of them interleaving can leave the tree half
+/// swapped and the job pointing at a plist from the other run. `installer.sh` has
+/// a cross-process lock (`mkdir $APP_SUPPORT/.install.lock`) — but a lock only
+/// makes the SECOND process fail; it does not stop us from launching it. And our
+/// own Settings screen shipped with TWO independent `InstallPhase`s ("сменить
+/// папку" and "обновить агент"), i.e. two installers were allowed BY DESIGN, with
+/// the auto-update at launch as a third. This is the layer that stops us from
+/// being our own attacker.
+///
+/// Admission rules, driven by an `id` that names the operation:
+///   · nothing running → `.started`, the work runs;
+///   · SAME id already running → `.joined` — no second process; the caller's
+///     completion fires with the running flow's result (pressing «Обновить» twice
+///     is one update with two acks, which is what the user meant);
+///   · DIFFERENT id running → `.refused`, completion fires immediately with a
+///     `.failed` explaining what is in the way. Joining would be WRONG here: a
+///     folder re-point that "succeeds" because an unrelated update succeeded would
+///     tell the user their folder changed when it did not.
+final class InstallCoordinator {
+    /// The process-wide instance every install path goes through.
+    static let shared = InstallCoordinator()
+
+    enum Admission: Equatable {
+        case started
+        case joined
+        case refused
+    }
+
+    private let lock = NSLock()
+    private var runningID: String?
+    private var waiters: [(InstallOutcome) -> Void] = []
+    private let workQueue: DispatchQueue
+    private let completionQueue: DispatchQueue
+
+    /// `completionQueue` defaults to main (the UI callers). Self-checks inject a
+    /// plain queue because a command-line binary has no main run loop.
+    init(workQueue: DispatchQueue = DispatchQueue.global(qos: .userInitiated),
+         completionQueue: DispatchQueue = .main) {
+        self.workQueue = workQueue
+        self.completionQueue = completionQueue
+    }
+
+    /// The operation currently in flight, or nil.
+    var busyWith: String? {
+        lock.lock(); defer { lock.unlock() }
+        return runningID
+    }
+
+    /// Admit (or reject) an install flow. `work` runs off the calling thread and
+    /// exactly once per admitted flow; every caller's `completion` is delivered on
+    /// `completionQueue`.
+    @discardableResult
+    func submit(id: String,
+                work: @escaping () -> InstallOutcome,
+                completion: @escaping (InstallOutcome) -> Void) -> Admission {
+        lock.lock()
+        if let current = runningID {
+            if current == id {
+                waiters.append(completion)
+                lock.unlock()
+                return .joined
+            }
+            lock.unlock()
+            completionQueue.async {
+                completion(.failed(InstallCoordinator.busyMessage(current)))
+            }
+            return .refused
+        }
+        runningID = id
+        waiters = [completion]
+        lock.unlock()
+
+        workQueue.async { [weak self] in
+            let outcome = work()
+            guard let self = self else { return }
+            self.lock.lock()
+            let pending = self.waiters
+            self.waiters = []
+            self.runningID = nil
+            self.lock.unlock()
+            self.completionQueue.async {
+                for done in pending { done(outcome) }
+            }
+        }
+        return .started
+    }
+
+    /// The human reason a second, DIFFERENT operation was refused.
+    static func busyMessage(_ runningID: String) -> String {
+        switch runningID {
+        case "agent-update":
+            return "Сейчас обновляется фоновый агент — дождитесь окончания."
+        case "watch-repoint":
+            return "Сейчас меняется отслеживаемая папка — дождитесь окончания."
+        case "launchd-repair":
+            return "Сейчас чинится фоновый агент — дождитесь окончания."
+        default:
+            return "Установщик уже работает — дождитесь окончания."
+        }
     }
 }
 

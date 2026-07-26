@@ -178,28 +178,137 @@ struct BookSummary: Codable, Identifiable, Equatable {
     }
 }
 
+/// The agent's verdict on whether it can actually READ the watched folder
+/// (`agent.folder_access` in state.json — plan v2 M4 + addendum §4.1).
+///
+/// FOUR known values, and they are NOT interchangeable — the addendum measured
+/// what each one costs the user if we merge them:
+///   · `ok`      — the probe listed the folder; nothing to show.
+///   · `denied`  — TCC has a "no" on record (the user pressed «Не разрешать»), or
+///                 plain chmod/ACL. The refusal is instant. The fix is a settings
+///                 trip / a folder outside the protected zone.
+///   · `blocked` — no decision exists yet: macOS is holding the call open while it
+///                 waits for the user to answer the CONSENT DIALOG. The fix is to
+///                 look at the screen and press «Разрешить». Telling this user to
+///                 go to System Settings is wrong; telling a `denied` user to wait
+///                 for a dialog that will never appear is worse.
+///   · `missing` — the folder is gone.
+///
+/// `unknown(raw)` is the FIFTH, deliberate case: a value this app build has never
+/// heard of. The tempting shape is "unknown → nil ⇒ no surface", and that is
+/// exactly how the neighbour shipped a lie — a newer agent published a problem
+/// state and the older UI rendered a calm "всё хорошо". So an unrecognized value
+/// is CARRIED, not dropped, and the router turns it into its own honest surface
+/// (`StatusSurface.accessUnknown`). Absent / empty stays nil = "the agent has not
+/// told us anything yet", which is a different fact from "it told us something we
+/// don't understand".
+enum FolderAccess: Equatable {
+    case ok
+    case denied
+    case blocked
+    case missing
+    case unknown(String)
+
+    /// The exact strings the agent writes (agent/scan.py). Anything else is
+    /// preserved verbatim as `.unknown`.
+    init(raw: String) {
+        switch raw {
+        case "ok": self = .ok
+        case "denied": self = .denied
+        case "blocked": self = .blocked
+        case "missing": self = .missing
+        default: self = .unknown(raw)
+        }
+    }
+
+    var rawValue: String {
+        switch self {
+        case .ok: return "ok"
+        case .denied: return "denied"
+        case .blocked: return "blocked"
+        case .missing: return "missing"
+        case .unknown(let raw): return raw
+        }
+    }
+
+    /// The values that OWN the window when the access gate holds (a card, not a
+    /// silent status). `ok` needs nothing; `unknown` gets its own surface because
+    /// we cannot honestly claim to know what it means.
+    var needsSurface: Bool {
+        switch self {
+        case .denied, .blocked, .missing: return true
+        case .ok, .unknown: return false
+        }
+    }
+}
+
+extension FolderAccess: Codable {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        self = FolderAccess(raw: try c.decode(String.self))
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        try c.encode(rawValue)
+    }
+}
+
 /// `agent` block of the showcase — the watched folder + a liveness flag the agent
 /// stamps when it writes state (scan.py `build_state`: `agent.active = true`). The
 /// Status screen (spec §5) reads `active` for the "Активен / Пауза" pill; absent on
 /// older states → defaults to `true` (the file exists ⇒ the agent has run).
+///
+/// Three more fields land here with release 1.0 (plan v2 B3 / M4):
+///   · `folder_access` + `folder_access_ts` — the probe verdict and its opaque
+///     freshness token (the app compares tokens, it never parses the instant);
+///   · `install_generation` — the UUID launchd handed the agent through the plist
+///     env. Present ONLY when launchd started us, so a hand-run agent says nothing
+///     instead of lying with a stale value. Compared against the receipt's
+///     generation: that comparison is the ONLY proof that the job launchd is
+///     actually running is the job we installed (a correct plist on disk is not).
 struct AgentInfo: Codable, Equatable {
     var watchDir: String?
     var active: Bool
+    /// The probe verdict. nil = the agent has not published one yet (older state,
+    /// or a scan that predates 1.0) — distinct from `.unknown`, which means it
+    /// published something this build does not recognize.
+    var folderAccess: FolderAccess?
+    /// Opaque freshness token for `folderAccess` (ISO-8601 UTC as written, but the
+    /// app treats it as an opaque string: "changed" is the only question it asks).
+    var folderAccessTs: String?
+    /// The install generation launchd passed through. nil ⇒ no proof.
+    var installGeneration: String?
 
     enum CodingKeys: String, CodingKey {
         case watchDir = "watch_dir"
         case active
+        case folderAccess = "folder_access"
+        case folderAccessTs = "folder_access_ts"
+        case installGeneration = "install_generation"
     }
 
-    init(watchDir: String?, active: Bool = true) {
+    init(watchDir: String?, active: Bool = true,
+         folderAccess: FolderAccess? = nil, folderAccessTs: String? = nil,
+         installGeneration: String? = nil) {
         self.watchDir = watchDir
         self.active = active
+        self.folderAccess = folderAccess
+        self.folderAccessTs = folderAccessTs
+        self.installGeneration = installGeneration
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         watchDir = try? c.decodeIfPresent(String.self, forKey: .watchDir)
         active = (try? c.decodeIfPresent(Bool.self, forKey: .active)) ?? true
+        // Decode the raw string ourselves: an unrecognized value must survive as
+        // `.unknown(raw)` (see FolderAccess). An empty string is treated as absent.
+        let rawAccess = (try? c.decodeIfPresent(String.self, forKey: .folderAccess)) ?? nil
+        folderAccess = (rawAccess?.isEmpty == false) ? FolderAccess(raw: rawAccess!) : nil
+        let rawTs = (try? c.decodeIfPresent(String.self, forKey: .folderAccessTs)) ?? nil
+        folderAccessTs = (rawTs?.isEmpty == false) ? rawTs : nil
+        let rawGen = (try? c.decodeIfPresent(String.self, forKey: .installGeneration)) ?? nil
+        installGeneration = (rawGen?.isEmpty == false) ? rawGen : nil
     }
 }
 
@@ -866,5 +975,555 @@ struct StateStore {
               let m = try? JSONDecoder().decode(BookManifest.self, from: data)
         else { return nil }
         return m
+    }
+}
+
+// MARK: - install-receipt.json — the installer's proof-of-install (plan v2 B3)
+
+/// `<support>/install-receipt.json`, written by `packaging/installer.sh` as the
+/// VERY LAST step of a successful install (after `launchctl print` confirmed the
+/// loaded ProgramArguments[0]). Its existence is therefore the only honest signal
+/// that an install went all the way through; a half-finished one leaves no receipt.
+///
+/// It lives in the App Support ROOT — deliberately NOT under `state/` — so writing
+/// it never wakes the app's state-directory watcher.
+///
+/// Parsed with JSONSerialization rather than Codable on purpose: the file is
+/// produced by `plutil -convert json`, and a single unexpected/renamed key must
+/// degrade one field, never the whole receipt (the receipt is what the fail-closed
+/// gate leans on — losing it wholesale would be the worst possible failure mode).
+struct InstallReceipt: Equatable {
+    let schema: Int
+    /// The install generation UUID. The agent echoes it back through state.json
+    /// only when launchd handed it over — equality of the two is the proof.
+    let generation: String
+    /// The app version this install shipped (receipt's `engine_version`), used by
+    /// the `bundled >= installed` rule (M11f) so a downgrade is never mistaken for
+    /// an update.
+    let engineVersion: String
+    let installedAt: String
+    /// "full" | "repair" — which installer mode wrote this receipt.
+    let mode: String
+    let watchDir: String
+    let helperPath: String
+    let plistPath: String
+    let supportDir: String
+
+    /// nil when the file is absent / unreadable / not a JSON object, or when it
+    /// carries no `generation` (a receipt without a generation proves nothing, so
+    /// it is treated as no receipt at all — fail-closed).
+    init?(data: Data) {
+        guard let obj = try? JSONSerialization.jsonObject(with: data),
+              let d = obj as? [String: Any] else { return nil }
+        let gen = (d["generation"] as? String) ?? ""
+        guard !gen.isEmpty else { return nil }
+        schema = (d["schema"] as? Int) ?? 0
+        generation = gen
+        engineVersion = (d["engine_version"] as? String) ?? ""
+        installedAt = (d["installed_at"] as? String) ?? ""
+        mode = (d["mode"] as? String) ?? ""
+        watchDir = (d["watch_dir"] as? String) ?? ""
+        helperPath = (d["helper_path"] as? String) ?? ""
+        plistPath = (d["plist"] as? String) ?? ""
+        supportDir = (d["support_dir"] as? String) ?? ""
+    }
+}
+
+/// `bundled >= installed` (M11f), as a pure value rule.
+///
+/// Lives here rather than next to `AgentUpdate` (SetupView.swift) so the Swift
+/// self-check can drive it without dragging the view layer in — and because it is
+/// a comparison of two strings, not a UI concern.
+///
+/// Mirrors `installer.sh::ver_ge`: dotted components compared as integers, each
+/// component truncated at its first non-digit ("1.0-beta" → 1.0), missing
+/// components = 0. Kept identical on purpose — a Swift side that judged downgrades
+/// differently from the installer would either block updates the installer accepts
+/// or wave through ones it refuses.
+enum EngineVersion {
+    static func atLeast(_ a: String, _ b: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.split(separator: ".").map { comp in
+                Int(String(comp.prefix { $0.isNumber })) ?? 0
+            }
+        }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0
+            let r = i < y.count ? y[i] : 0
+            if l != r { return l > r }
+        }
+        return true
+    }
+}
+
+// MARK: - LaunchAgent plist reads (the DISK truth about ProgramArguments[0])
+
+/// Reads facts out of a LaunchAgent plist. Two of them matter:
+///
+///   · `programArgument0` — WHICH executable the plist points launchd at. On macOS
+///     26 the TCC subject of the job is the Mach-O image of exactly this path, so
+///     it is the single fact that decides whether a folder-access grant can even
+///     exist. Read through `plutil -extract … raw` with **no fallback**: if we
+///     cannot prove what PA0 is, we must report "unknown" and let the caller fail
+///     closed. A fallback that guesses the expected path would turn "I don't know"
+///     into "it's fine", which is the precise lie this whole milestone exists to
+///     prevent.
+///   · `environmentValue` — the plist's `EnvironmentVariables.<key>` (watch dir,
+///     install generation). Read in-process (PropertyListSerialization) because
+///     nothing fails closed on it — it is a fallback source, not a proof.
+enum LaunchAgentPlist {
+    /// `ProgramArguments[0]` exactly as the plist carries it, or nil when the file
+    /// is absent / unreadable / has no ProgramArguments / plutil is unavailable.
+    /// NEVER substitutes a default.
+    static func programArgument0(plistPath: String) -> String? {
+        guard !plistPath.isEmpty,
+              FileManager.default.fileExists(atPath: plistPath) else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/plutil")
+        p.arguments = ["-extract", "ProgramArguments.0", "raw", "-o", "-", plistPath]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    /// `EnvironmentVariables.<key>` from the plist, or nil when absent/empty.
+    static func environmentValue(_ key: String, plistPath: String) -> String? {
+        guard !plistPath.isEmpty,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
+              let obj = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil),
+              let dict = obj as? [String: Any],
+              let env = dict["EnvironmentVariables"] as? [String: Any],
+              let value = env[key] as? String,
+              !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    /// Path equality for the helper check: trailing-slash / `~` / `.` noise removed
+    /// on BOTH sides. Deliberately NOT `resolvingSymlinksInPath` — a symlinked
+    /// helper path is a DIFFERENT file to TCC (installer guard `nosymlink`), so
+    /// resolving one here would paper over exactly the case that breaks the grant.
+    static func samePath(_ a: String?, _ b: String?) -> Bool {
+        guard let a = a, let b = b, !a.isEmpty, !b.isEmpty else { return false }
+        return (a as NSString).standardizingPath == (b as NSString).standardizingPath
+    }
+}
+
+// MARK: - Which surface owns the window (the fail-closed router, plan v2 §6.3)
+
+/// Why the app says "агент не запустился" instead of offering access help.
+enum AgentStallReason: String, Equatable {
+    /// The plist on disk points launchd at something that is not our frozen helper
+    /// (a v0.9 install, or a repair that never happened).
+    case pa0Mismatch = "pa0"
+    /// PA0 is right, but no install receipt exists — nothing proves the install
+    /// finished, so nothing may be claimed about access.
+    case receiptMissing = "receipt"
+    /// The receipt exists; the agent has published no generation at all (it has
+    /// not run under this install yet, past the grace window).
+    case generationMissing = "generation-missing"
+    /// The agent is running a DIFFERENT install than the one on disk — the classic
+    /// "installer died between publish and bootstrap" window.
+    case generationMismatch = "generation-mismatch"
+}
+
+/// The single destination router. Priority is fixed by plan v2 §6.3:
+/// `agentRepair > agentNotRunning > folderAccess > normal`.
+enum StatusSurface: Equatable {
+    /// An install/repair is running or has failed — that screen owns the window.
+    case agentRepair
+    /// We cannot prove launchd is running the job we installed.
+    case agentNotRunning(AgentStallReason)
+    /// The gate holds AND the agent reports a problem we understand.
+    case folderAccess(FolderAccess)
+    /// The gate holds and the agent reported a value this build does not know.
+    /// Never folded into `normal`: a silent calm status over an unknown problem is
+    /// the exact failure this case exists to prevent.
+    case accessUnknown(String)
+    case normal
+
+    /// The stall reason when this is `.agentNotRunning`, else nil.
+    var stallReason: AgentStallReason? {
+        if case .agentNotRunning(let reason) = self { return reason }
+        return nil
+    }
+
+    /// True when this surface must OWN the window (a full screen), as opposed to
+    /// the access family, which M6 renders as a card over the normal landing.
+    var ownsWindow: Bool {
+        switch self {
+        case .agentRepair, .agentNotRunning: return true
+        case .folderAccess, .accessUnknown, .normal: return false
+        }
+    }
+}
+
+/// Everything the router needs, as PLAIN VALUES — no disk, no processes, no
+/// clocks. That is the point: the fail-closed rule is then a pure function that a
+/// self-check can drive through every combination, including the ones that are
+/// hard to stage on a real machine (installer killed mid-bootstrap, agent from a
+/// previous generation still alive, an agent newer than the app).
+struct InstallTruth: Equatable {
+    /// An install exists at all (a receipt or a LaunchAgent plist). False ⇒ Setup
+    /// owns the window and none of this applies.
+    var hasInstall: Bool
+    /// `disk PA0 == installedHelperPath`, read live. False also covers "could not
+    /// read PA0" — unknown is treated as wrong (fail-closed).
+    var pa0IsHelper: Bool
+    /// Generation from `install-receipt.json` (nil = no receipt / no generation).
+    var receiptGeneration: String?
+    /// Generation the RUNNING agent published into state.json (nil = it published
+    /// none, e.g. it has not ticked yet or launchd did not hand it one).
+    var stateGeneration: String?
+    /// The agent's access verdict (nil = never published).
+    var folderAccess: FolderAccess?
+    /// An install/repair is running, or failed and still owns the screen.
+    var updateOccupiesWindow: Bool
+    /// Seconds since the install "settled" (app launch, or the moment an install
+    /// finished). Only used to hold back the "агент не запустился" verdict while
+    /// the freshly-bootstrapped agent has not had its first tick yet.
+    var secondsSinceInstallSettled: TimeInterval
+
+    /// How long a fresh install is allowed to have no/stale generation before we
+    /// call it stalled (plan v2 §6.3: "отсутствует дольше ~15 с").
+    static let generationGrace: TimeInterval = 15
+
+    init(hasInstall: Bool, pa0IsHelper: Bool,
+         receiptGeneration: String?, stateGeneration: String?,
+         folderAccess: FolderAccess?, updateOccupiesWindow: Bool = false,
+         secondsSinceInstallSettled: TimeInterval = .greatestFiniteMagnitude) {
+        self.hasInstall = hasInstall
+        self.pa0IsHelper = pa0IsHelper
+        self.receiptGeneration = receiptGeneration
+        self.stateGeneration = stateGeneration
+        self.folderAccess = folderAccess
+        self.updateOccupiesWindow = updateOccupiesWindow
+        self.secondsSinceInstallSettled = secondsSinceInstallSettled
+    }
+
+    /// THE invariant (plan v2 §6.3 as amended by addendum §4.5):
+    ///
+    ///     показываем поверхность доступа  ⇔  disk PA0 == installedHelperPath
+    ///                                     ∧  state.install_generation == receipt.generation
+    ///                                     ∧  updatePhase ∉ {running, failed}
+    ///
+    /// Why both halves are load-bearing: a CORRECT plist on disk does not prove
+    /// launchd is running it. The installer can die between `publish plist` and
+    /// `bootstrap`, leaving a perfect plist while the OLD job keeps running. If we
+    /// showed the access card then, the user would grant access to the NEW binary
+    /// while the OLD one kept doing the work — a grant that looks given and does
+    /// nothing, with no way for the user to tell.
+    var allowsFolderAccessSurface: Bool {
+        guard hasInstall, !updateOccupiesWindow, pa0IsHelper else { return false }
+        guard let receipt = receiptGeneration, !receipt.isEmpty else { return false }
+        guard let live = stateGeneration, !live.isEmpty else { return false }
+        return live == receipt
+    }
+
+    /// The destination, in fixed priority order.
+    var surface: StatusSurface {
+        if updateOccupiesWindow { return .agentRepair }
+        guard hasInstall else { return .normal }
+        // Disk proof first: a wrong PA0 is not a timing problem, so no grace.
+        guard pa0IsHelper else { return .agentNotRunning(.pa0Mismatch) }
+        // A generation that has not landed yet is a TIMING problem right after an
+        // install — hold the verdict for the grace window, then be honest.
+        let settling = secondsSinceInstallSettled < InstallTruth.generationGrace
+        guard let receipt = receiptGeneration, !receipt.isEmpty else {
+            return settling ? .normal : .agentNotRunning(.receiptMissing)
+        }
+        guard let live = stateGeneration, !live.isEmpty else {
+            return settling ? .normal : .agentNotRunning(.generationMissing)
+        }
+        guard live == receipt else {
+            return settling ? .normal : .agentNotRunning(.generationMismatch)
+        }
+        // Gate holds — now, and only now, the agent's own verdict is trustworthy.
+        guard let access = folderAccess else { return .normal }
+        if access.needsSurface { return .folderAccess(access) }
+        if case .unknown(let raw) = access { return .accessUnknown(raw) }
+        return .normal
+    }
+}
+
+// MARK: - What the app does to the install AT LAUNCH (plan v2 §6.2)
+
+/// The one thing launch is allowed to do to the installation, before any UI.
+enum StartupInstallAction: Equatable {
+    /// Nothing is installed — the Setup screen owns the window.
+    case setup
+    /// The staged bytes are behind the bundle → the FULL installer, asynchronously,
+    /// behind the `.updating` screen (venv/pip can take tens of seconds).
+    case fullInstall
+    /// The bytes are current but `ProgramArguments[0]` is wrong → the OFFLINE
+    /// `--repair-launchd-only`, synchronously, before the first frame.
+    case repairLaunchdOnly
+    /// Touch nothing.
+    case none
+}
+
+/// The launch decision, as a pure function of six facts.
+///
+/// The ORDER is the part that bites, and it bit once already while writing this:
+/// on a v0.9 install `ProgramArguments[0]` is wrong AND the bytes are stale. Doing
+/// the "cheap" offline repair first looks right and is wrong — v0.9 never staged
+/// the frozen helper, so the repair has nothing to point launchd at and dies on its
+/// golden-SHA check, every launch, while the actual fix (the full install that
+/// stages the helper) never runs. Full update wins; the offline repair is only for
+/// the case it cannot help with — bytes already current, job pointed at the wrong
+/// executable (the installer died between `publish plist` and `bootstrap`).
+enum StartupPlan {
+    static func decide(isInstalled: Bool,
+                       bytesStale: Bool,
+                       bundledIsOlderThanInstall: Bool,
+                       watchDirKnown: Bool,
+                       pa0IsHelper: Bool,
+                       helperStaged: Bool) -> StartupInstallAction {
+        guard isInstalled else { return .setup }
+        // M11f — an older .app must never "update" a newer install: its installer
+        // would downgrade the engine, and a v0.9 installer re-points PA0 back at
+        // runner.sh, killing folder access for good.
+        guard !bundledIsOlderThanInstall else { return .none }
+        // Our advantage over the donor, kept deliberately: with no PROVEN watch
+        // folder we run nothing at all. The donor falls back to its default here,
+        // which silently re-points the user's agent at a folder they left.
+        if bytesStale && watchDirKnown { return .fullInstall }
+        // The offline repair needs a staged helper to point at; without one this is
+        // a full-install case that we simply cannot do automatically.
+        if !pa0IsHelper && helperStaged { return .repairLaunchdOnly }
+        return .none
+    }
+}
+
+// MARK: - Which folder is really watched (plan v2 M2f)
+
+/// Resolves the watched folder from the three sources IN ORDER OF PROOF, and
+/// never invents a default.
+///
+/// The order is not cosmetic. `state.json` is written by the agent on every scan,
+/// so it can easily be NEWER in wall-clock terms while describing an OLDER install
+/// — the classic case being an agent from the previous generation that is still
+/// alive and still stamping the old folder. Re-running the installer with that
+/// value would silently RE-POINT the user's agent at a folder they moved away
+/// from. So: the receipt (written last, after launchd was verified) wins; the
+/// plist (what launchd was actually handed) is second; state.json is accepted ONLY
+/// when it proves it belongs to the current install by carrying the same
+/// generation.
+///
+/// nil is a real, useful answer: "we do not know" ⇒ the caller must NOT run the
+/// installer, because that would fall back to `~/Desktop/mp3-to-m4b`.
+enum WatchDirTruth {
+    static func resolve(receiptWatchDir: String?,
+                        receiptGeneration: String?,
+                        plistWatchDir: String?,
+                        stateWatchDir: String?,
+                        stateGeneration: String?) -> String? {
+        if let d = receiptWatchDir, !d.isEmpty { return d }
+        if let d = plistWatchDir, !d.isEmpty { return d }
+        // state.json only counts when it demonstrably belongs to this install.
+        guard let d = stateWatchDir, !d.isEmpty,
+              let live = stateGeneration, !live.isEmpty,
+              let receipt = receiptGeneration, !receipt.isEmpty,
+              live == receipt
+        else { return nil }
+        return d
+    }
+}
+
+// MARK: - StateStore: the disk side of the install truth
+
+extension StateStore {
+    /// The frozen helper's file name. It is a grant identity (the string the user
+    /// sees in the privacy panel and in the consent dialog), so it is a literal in
+    /// exactly one place per language: `installer.sh` (HELPER_NAME),
+    /// `build/helper-guard.sh`, and here.
+    static let helperName = "mp3-to-m4b-agent"
+
+    /// `<support>/bin/mp3-to-m4b-agent` — where the installer puts PA0. This path
+    /// is half of the TCC grant identity (path + bytes), which is why it is derived
+    /// from `supportRoot` and never hardcoded to the production tree.
+    var installedHelperPath: String {
+        supportRoot.appendingPathComponent("bin/\(StateStore.helperName)").path
+    }
+
+    /// `<support>/bin/runner.sh` — the helper's sibling by a contract baked into
+    /// the frozen bytes.
+    var installedRunnerPath: String {
+        supportRoot.appendingPathComponent("bin/runner.sh").path
+    }
+
+    /// The LaunchAgent label, honoring MP3TOM4B_LABEL exactly like installer.sh.
+    var launchAgentLabel: String {
+        let raw = ProcessInfo.processInfo.environment["MP3TOM4B_LABEL"] ?? ""
+        return raw.isEmpty ? "com.arrivarus.mp3tom4b.agent" : raw
+    }
+
+    /// Where the LaunchAgent plist lives. Honors MP3TOM4B_LAUNCHAGENTS_DIR too (the
+    /// installer supports it under its test latch), so a scratch run never reads
+    /// the human's real plist.
+    var launchAgentPlistPath: String {
+        let override = ProcessInfo.processInfo.environment["MP3TOM4B_LAUNCHAGENTS_DIR"] ?? ""
+        let dir = override.isEmpty
+            ? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            : URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        return dir.appendingPathComponent("\(launchAgentLabel).plist").path
+    }
+
+    /// `<support>/install-receipt.json` (App Support ROOT, not `state/`).
+    var receiptPath: String {
+        supportRoot.appendingPathComponent("install-receipt.json").path
+    }
+
+    /// The install receipt, or nil when absent / unreadable / generation-less.
+    func loadReceipt() -> InstallReceipt? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: receiptPath)) else {
+            return nil
+        }
+        return InstallReceipt(data: data)
+    }
+
+    /// LIVE read of `ProgramArguments[0]` — no cache, no fallback. Every caller
+    /// that is about to tell the user something about access must go through this
+    /// AT THE MOMENT OF THE CLAIM, not through a value read at launch.
+    func diskProgramArgument0() -> String? {
+        LaunchAgentPlist.programArgument0(plistPath: launchAgentPlistPath)
+    }
+
+    /// LIVE `disk PA0 == installedHelperPath`. Unreadable ⇒ false (fail-closed).
+    func installedRunnerIsHelper() -> Bool {
+        LaunchAgentPlist.samePath(diskProgramArgument0(), installedHelperPath)
+    }
+
+    /// The watch dir the plist hands launchd, or nil.
+    func plistWatchDir() -> String? {
+        LaunchAgentPlist.environmentValue("MP3TOM4B_WATCH_DIR",
+                                          plistPath: launchAgentPlistPath)
+    }
+
+    /// True when SOMETHING is installed: a receipt or a LaunchAgent plist. A bare
+    /// staged tree (a NO_LAUNCHCTL dev install) deliberately does not count — there
+    /// is no job to be "not running", so nothing should be claimed about one.
+    func hasInstallEvidence() -> Bool {
+        let fm = FileManager.default
+        return fm.fileExists(atPath: receiptPath)
+            || fm.fileExists(atPath: launchAgentPlistPath)
+    }
+
+    /// Assemble the live truth. One disk pass, then a pure decision.
+    /// `state` is passed in so the caller reuses the showcase it already loaded.
+    func installTruth(state: ShowcaseState,
+                      updateOccupiesWindow: Bool,
+                      secondsSinceInstallSettled: TimeInterval) -> InstallTruth {
+        InstallTruth(
+            hasInstall: hasInstallEvidence(),
+            pa0IsHelper: installedRunnerIsHelper(),
+            receiptGeneration: loadReceipt()?.generation,
+            stateGeneration: state.agent.installGeneration,
+            folderAccess: state.agent.folderAccess,
+            updateOccupiesWindow: updateOccupiesWindow,
+            secondsSinceInstallSettled: secondsSinceInstallSettled)
+    }
+
+    /// The watched folder, resolved receipt → plist → same-generation state, with
+    /// NO default (M2f). nil ⇒ callers must not run the installer.
+    func resolvedWatchDir(state: ShowcaseState) -> String? {
+        let receipt = loadReceipt()
+        return WatchDirTruth.resolve(
+            receiptWatchDir: receipt?.watchDir,
+            receiptGeneration: receipt?.generation,
+            plistWatchDir: plistWatchDir(),
+            stateWatchDir: state.agent.watchDir,
+            stateGeneration: state.agent.installGeneration)
+    }
+
+    /// Everything the diagnostics block needs, read fresh. `stderrTail` comes from
+    /// the caller (the last installer run) — the disk cannot know it.
+    func diagnostics(state: ShowcaseState, stderrTail: String = "") -> InstallDiagnostics {
+        let receipt = loadReceipt()
+        return InstallDiagnostics(
+            expectedHelperPath: installedHelperPath,
+            actualPA0: diskProgramArgument0(),
+            plistPath: launchAgentPlistPath,
+            receiptPath: receiptPath,
+            receiptGeneration: receipt?.generation,
+            stateGeneration: state.agent.installGeneration,
+            receiptWatchDir: receipt?.watchDir,
+            plistWatchDir: plistWatchDir(),
+            stateWatchDir: state.agent.watchDir,
+            folderAccess: state.agent.folderAccess?.rawValue,
+            installerStderrTail: stderrTail)
+    }
+}
+
+// MARK: - Diagnostics (what the dead-end screens must show — M12f)
+
+/// The facts a stuck user (or a support conversation) needs, all in one value.
+///
+/// M12f: the `.failed` update screen used to show ONE line — «обновите через
+/// Настройки» — from a screen with no way to reach Настройки. The block below is
+/// the other half of that fix: not "an error happened", but WHICH of the three
+/// sources disagree, so the next action is obvious rather than guessed.
+struct InstallDiagnostics: Equatable {
+    /// Where PA0 must point for a folder grant to be possible at all.
+    var expectedHelperPath: String
+    /// Where it actually points. nil = could not be read (which is why the gate
+    /// fails closed — unknown is not "fine").
+    var actualPA0: String?
+    var plistPath: String
+    var receiptPath: String
+    var receiptGeneration: String?
+    var stateGeneration: String?
+    /// The watch dir as each source sees it. Shown side by side on purpose: a
+    /// disagreement here is the whole reason `WatchDirTruth` refuses to guess.
+    var receiptWatchDir: String?
+    var plistWatchDir: String?
+    var stateWatchDir: String?
+    var folderAccess: String?
+    /// Last few stderr lines of the most recent installer run ("" when none).
+    var installerStderrTail: String
+
+    static let empty = InstallDiagnostics(
+        expectedHelperPath: "", actualPA0: nil, plistPath: "", receiptPath: "",
+        receiptGeneration: nil, stateGeneration: nil,
+        receiptWatchDir: nil, plistWatchDir: nil, stateWatchDir: nil,
+        folderAccess: nil, installerStderrTail: "")
+
+    /// `(label, value)` rows in display order. One place builds them so the screen
+    /// stays a renderer and every field is guaranteed to be shown.
+    var rows: [(String, String)] {
+        func show(_ v: String?) -> String {
+            guard let v = v, !v.isEmpty else { return "—" }
+            return v
+        }
+        return [
+            ("Запускается сейчас (PA0)", show(actualPA0)),
+            ("Должен запускаться", show(expectedHelperPath)),
+            ("LaunchAgent", show(plistPath)),
+            ("Чек установки", show(receiptPath)),
+            ("Поколение: чек / агент", "\(show(receiptGeneration)) / \(show(stateGeneration))"),
+            ("Папка: чек", show(receiptWatchDir)),
+            ("Папка: LaunchAgent", show(plistWatchDir)),
+            ("Папка: агент", show(stateWatchDir)),
+            ("Доступ к папке", show(folderAccess)),
+        ]
+    }
+
+    /// One-line copyable summary (the «Скопировать диагностику» action).
+    var plainText: String {
+        var out = rows.map { "\($0.0): \($0.1)" }.joined(separator: "\n")
+        if !installerStderrTail.isEmpty {
+            out += "\n\nУстановщик (stderr):\n" + installerStderrTail
+        }
+        return out
     }
 }

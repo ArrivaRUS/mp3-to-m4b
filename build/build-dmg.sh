@@ -46,6 +46,10 @@ DIST_DIR="$BUILD_DIR/dist"
 APP="$DIST_DIR/$APP_NAME.app"
 DMG="$DIST_DIR/$APP_NAME-$VERSION.dmg"
 
+# Frozen-helper byte guard — border 4/4 (the .app inside the finished image).
+# shellcheck source=helper-guard.sh
+. "$BUILD_DIR/helper-guard.sh"
+
 # Test mode: unique volume name so Finder can't reuse a stale remembered window
 # geometry for a volume it has seen before (neighbor .patches/003). Writes a
 # throwaway dmg next to dist.
@@ -60,16 +64,17 @@ for t in hdiutil ditto codesign shasum; do
 done
 [[ -d "$APP" ]] || { echo "build-dmg: $APP not found — run build/build-app.sh first" >&2; exit 1; }
 
-# Sanity: the bundle should at least pass a non-strict signature check (the FDA
-# grant / Gatekeeper launch relies on this). Warn (don't fail) so a still-usable
-# bundle can be packaged; the neighbor proved --deep (without --strict) is the
-# right gauge for an ad-hoc bundle that may carry a FinderInfo xattr.
-if codesign --verify --deep "$APP" >/dev/null 2>&1; then
-  echo "==> app signature verifies (--deep)"
-else
-  echo "build-dmg: WARNING — '$APP' did not pass 'codesign --verify --deep'." >&2
-  echo "           Packaging anyway, but the app may be rejected by Gatekeeper." >&2
-fi
+# The bundle must pass a non-strict signature check (the folder-access grant and
+# the Gatekeeper launch both rely on it). RELEASE-BLOCKING, with a retry loop for
+# the iCloud/fileprovider FinderInfo race — see guard_bundle_signature() for why
+# --deep without --strict is the correct gauge here, and why this is a failure
+# rather than the warning it used to be.
+echo "==> app signature (release-blocking)"
+guard_bundle_signature "$APP" "dist .app"
+
+# Same reasoning as make-dmg.sh: the installer inside the bundle we are about to
+# ship must agree with PROVENANCE.md about the frozen helper's bytes.
+guard_installer_constant "$APP/Contents/Resources/installer.sh" "bundled in dist .app"
 
 # --- stage the DMG payload --------------------------------------------------
 # Assemble a clean staging dir (the future DMG root): the .app plus an
@@ -77,7 +82,21 @@ fi
 # faithfully. Staging under TMPDIR keeps the iCloud/fileprovider daemon from
 # re-stamping xattrs onto the payload mid-build (neighbor .patches/003).
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/mp3tom4b-dmg.XXXXXX")"
-trap 'rm -rf "$STAGE"' EXIT
+
+# One EXIT handler for both jobs: drop the staging dir always, and drop a
+# REJECTED image so it cannot be mistaken for a release candidate later. Every
+# gate below the image build is release-blocking, and a .dmg left behind by a
+# failed run looks exactly like one left by a good run.
+DMG_COMMITTED=0
+_on_exit_build_dmg() {
+  local rc=$?
+  rm -rf "$STAGE"
+  if [[ "$rc" -ne 0 && "$DMG_COMMITTED" -ne 1 && -f "$DMG" ]]; then
+    rm -f "$DMG" "$DMG.sha256"
+    echo "build-dmg: removed the rejected image $(basename "$DMG") — it is not a release candidate." >&2
+  fi
+}
+trap _on_exit_build_dmg EXIT
 
 echo "==> staging payload (.app + /Applications symlink)"
 ditto "$APP" "$STAGE/$APP_NAME.app"
@@ -101,14 +120,22 @@ hdiutil create \
   -ov \
   "$DMG" >/dev/null
 
-# --- verify the image is well-formed + mountable ---------------------------
+# --- verify the image is well-formed + mountable (release-blocking) --------
 echo "==> verifying image (hdiutil verify)"
-hdiutil verify "$DMG" >/dev/null 2>&1 \
-  && echo "    image verifies" \
-  || echo "    WARNING: hdiutil verify reported an issue" >&2
+guard_image_verify "$DMG"
+
+# --- BORDER 4/4: the frozen helper INSIDE the finished image -----------------
+# Same last-mile check as make-dmg.sh: this fallback path stages through its own
+# ditto + xattr sweep, so it needs its own proof that the shipped helper is still
+# the frozen artifact. Release-blocking.
+echo "==> frozen helper: border 4/4 (.app extracted from the mounted DMG)"
+guard_helper_in_dmg "$DMG" "$APP_NAME" "mounted final DMG"
 
 # --- checksum --------------------------------------------------------------
+# Reached only with every gate green, so the .sha256 means "this image passed",
+# not merely "this image exists".
 ( cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256" )
+DMG_COMMITTED=1
 
 echo ""
 echo "Built: $DMG"

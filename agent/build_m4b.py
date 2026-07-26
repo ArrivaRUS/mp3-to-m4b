@@ -52,7 +52,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, cover, state
+from . import config, cover, shutdown, state
 
 # Build params (decisions D2): AAC 192 kbps, stereo, 44100 Hz by default. A
 # manifest's ``params`` overrides any of these per-book (set in the confirm
@@ -86,6 +86,24 @@ CANCEL_POLL_INTERVAL_S = 0.3
 # to SIGKILL. ffmpeg traps SIGTERM and finalizes quickly; this is just headroom so
 # we almost never need the hard kill (but we always guarantee the child dies).
 CANCEL_TERM_GRACE_S = 3.0
+
+# ── Progress deadline (addendum §4.4: «дедлайн фазы сборки — по ПРОГРЕССУ») ───
+# A fixed build timeout cannot protect us here: audiobooks are legitimately
+# multi-hour, so BUILD_TIMEOUT_S has to stay huge (6 h) — and a job wedged for 6 h
+# is a dead product, because launchd will not start a second instance of the same
+# label while this one hangs. The failure mode we must catch is a TCC/network wedge:
+# the output ``.m4b`` is written INSIDE the watched folder, so an ffmpeg that is
+# blocked on a protected/unavailable path sits there alive but frozen forever.
+# Hence the deadline is on PROGRESS, not on wall time: no forward motion for this
+# long ⇒ tear the encoder down exactly like a signal would (arch addendum proposes
+# 300 s; a real encode emits a progress block ~2×/s, so this is ~600× the normal gap).
+BUILD_STALL_S = 300.0
+_STALL_ENV = "MP3TOM4B_BUILD_STALL_S"
+
+# How often the stall guard is allowed to ``stat`` the output file. The poll loop
+# itself runs ~3×/s (cancel cadence); one stat per second per live output is plenty
+# to notice motion and keeps the syscall traffic invisible next to the encode.
+_STALL_STAT_INTERVAL_S = 1.0
 
 # E5 free-space pre-flight margins. The output-size estimate is approximate
 # (bitrate × duration + cover + a small mux allowance), so we require headroom
@@ -171,6 +189,36 @@ class BuildCancelled(Exception):
     def __init__(self, book_id: object) -> None:
         self.book_id = book_id
         super().__init__(f"build cancelled for book {book_id!r}")
+
+
+class BuildInterrupted(BuildError):
+    """The build was aborted by the PROCESS, not by the user (M3).
+
+    Two causes, one outcome:
+      · ``"signal"`` — a TERM/INT/HUP reached the agent (``launchctl bootout``
+        during an installer update is the everyday case). :mod:`agent.shutdown`
+        raised the flag; the encoder poll loop saw it.
+      · ``"stall"`` — no forward progress for :data:`BUILD_STALL_S` (addendum §4.4):
+        ffmpeg is alive but frozen, e.g. blocked writing the ``.m4b`` into a folder
+        macOS has not (yet) granted us.
+
+    It is a :class:`BuildError` with ``reason == "interrupted"`` **on purpose**:
+    that is the exact reason ``recover_interrupted`` stamps on a build whose process
+    was killed outright, the app already renders it («Сборка была прервана»), and
+    the dispatcher's existing ``except BuildError`` therefore does the right thing
+    with zero changes — sweep the temps, flip the manifest to ``error: interrupted``,
+    refresh the showcase. The discriminator lives in ``cause`` + ``detail`` (and in
+    the ``build_interrupted`` journal event), not in a new user-facing reason.
+
+    NOT a :class:`BuildCancelled`: a cancel means "the user changed their mind, put
+    the book back in the queue"; an interrupt means "we were stopped mid-flight" —
+    the book must surface as interrupted, and the user's cancel command (if any)
+    stays on disk to be resolved as ``cancel_moot`` on the next run.
+    """
+
+    def __init__(self, cause: str, detail: str = "") -> None:
+        self.cause = cause  # "signal" | "stall"
+        super().__init__("interrupted", detail)
 
 
 class _FastPathUnusable(Exception):
@@ -835,6 +883,135 @@ def _terminate_ffmpeg_many(children: "list[subprocess.Popen]") -> None:
             pass
 
 
+def _interrupted(cause: str, detail: str, children: "list[subprocess.Popen]",
+                 book_id: object = None) -> BuildInterrupted:
+    """Kill every ffmpeg child, journal the abort, RETURN the exception to raise.
+
+    Returning (instead of raising) keeps the ``raise`` visible at the call site
+    while the teardown stays in one place. Order matters: children die FIRST — the
+    journal write is best-effort and must never come between a signal and a live
+    encoder. Safe to call twice (``_terminate_ffmpeg_many`` no-ops on dead pids).
+    """
+    _terminate_ffmpeg_many(children)
+    state.append_event("build_interrupted", cause=cause, detail=detail,
+                       book_id=book_id, children=len(children))
+    return BuildInterrupted(cause, detail)
+
+
+def _interrupt_if_shutdown(children: "list[subprocess.Popen]",
+                           book_id: object = None) -> None:
+    """If a signal asked us to stop: kill every ffmpeg child, then raise (M3).
+
+    This is THE hand-off between :mod:`agent.shutdown` (which only raises a flag,
+    because a signal handler must stay trivial) and the process tree (which only
+    the main loop can safely take down). Called from every encoder poll tick, so
+    the worst-case latency between ``launchctl bootout`` and a dead ffmpeg is one
+    :data:`CANCEL_POLL_INTERVAL_S` plus the SIGTERM grace — far inside launchd's
+    own exit timeout, so the SIGKILL that follows finds nothing left to orphan.
+
+    Idempotent by construction: it raises, so the unwind happens once;
+    :func:`_terminate_ffmpeg_many` itself tolerates already-dead children, so a
+    repeated signal (or a second call from an enclosing loop) is a no-op.
+    """
+    if not shutdown.requested():
+        return
+    raise _interrupted("signal", f"agent received {shutdown.name()}",
+                       children, book_id)
+
+
+def _build_stall_s() -> float:
+    """Resolve the no-progress deadline (seconds), env-overridable for tests.
+
+    Defaults to :data:`BUILD_STALL_S`; ``MP3TOM4B_BUILD_STALL_S`` lets a self-check
+    shrink it to a few seconds so a genuinely wedged encoder can be proven in a test
+    run rather than argued about. A malformed / non-positive value falls back to the
+    default — the deadline can be tuned, never disabled.
+    """
+    raw = os.environ.get(_STALL_ENV)
+    if raw is None:
+        return BUILD_STALL_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return BUILD_STALL_S
+    return val if val > 0 else BUILD_STALL_S
+
+
+class _StallGuard:
+    """Watches an encode for *forward motion* and reports a wedge (addendum §4.4).
+
+    Two independent liveness signals, either of which resets the clock:
+
+    1. **the reported position advanced** — ffmpeg's ``-progress`` stream is parsed
+       by the reader threads anyway, so this is free;
+    2. **the output file changed** (size *or* mtime). This second signal is what
+       keeps the guard from murdering a healthy build: ``-movflags +faststart``
+       relocates the moov atom AFTER the last progress block, so a big book ends
+       with a silent stretch where only the file keeps moving. Under a real wedge
+       (TCC prompt on the watch folder, vanished network volume) neither moves.
+
+    ``stalled()`` is therefore honest in both directions: it fires on a frozen
+    encoder and stays quiet on a slow one.
+    """
+
+    __slots__ = ("limit", "_stat_every", "_best_ms", "_sigs", "_since", "_next_stat")
+
+    def __init__(self, limit_s: float | None = None) -> None:
+        self.limit = _build_stall_s() if limit_s is None else float(limit_s)
+        # Sample the file at least ~4× per deadline window, so the second liveness
+        # signal is never starved by the throttle when the deadline is tuned down
+        # (a self-check runs with seconds, production with 300 s → the plain 1 s).
+        self._stat_every = max(0.05, min(_STALL_STAT_INTERVAL_S, self.limit / 4.0))
+        self._best_ms = -1
+        self._sigs: dict[str, tuple[int, int]] = {}
+        self._since = time.monotonic()
+        self._next_stat = 0.0
+
+    @staticmethod
+    def _signature(path: "Path") -> tuple[int, int] | None:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
+    def stalled(self, pos_ms: int | None = None,
+                paths: "tuple[Path, ...] | list[Path]" = ()) -> bool:
+        """Feed this tick's liveness signals; True ⇔ nothing moved for ``limit``.
+
+        ``pos_ms`` is the aggregate encoded position (ms) — compared against the
+        BEST seen, so the momentary dip when the parallel pool retires one group
+        and starts the next is not mistaken for progress *or* for a stall.
+        """
+        now = time.monotonic()
+        moved = False
+
+        if pos_ms is not None and pos_ms > self._best_ms:
+            self._best_ms = int(pos_ms)
+            moved = True
+
+        # The stat pass is throttled — it is a fallback signal, not the main one.
+        if paths and now >= self._next_stat:
+            self._next_stat = now + self._stat_every
+            for p in paths:
+                sig = self._signature(p)
+                if sig is None:
+                    continue
+                key = str(p)
+                if self._sigs.get(key) != sig:
+                    self._sigs[key] = sig
+                    moved = True
+
+        if moved:
+            self._since = now
+            return False
+        return (now - self._since) >= self.limit
+
+    def detail(self) -> str:
+        """Journal/manifest detail describing the wedge we just caught."""
+        return f"no ffmpeg progress for {int(self.limit)}s"
+
+
 def _progress_snapshot(
     out_time_ms: int, total_ms: int, chapters: list[dict], start_monotonic: float
 ) -> dict:
@@ -945,7 +1122,8 @@ def _parse_progress_out_time_ms(block: dict) -> int | None:
 def _run_ffmpeg(
     argv: list[str], *, reason_on_fail: str, book_id: object = None,
     total_ms: int = 0, chapters: list[dict] | None = None,
-    progress_cb=None,
+    progress_cb=None, output_path: "Path | None" = None,
+    timeout_s: float | None = None, reason_on_timeout: str = "timeout",
 ) -> None:
     """Run ffmpeg (argv array) interruptibly; raise on failure OR cancel.
 
@@ -967,14 +1145,35 @@ def _run_ffmpeg(
     ``progress_cb`` is ``None`` the reader still drains the pipes (so ffmpeg never
     blocks on a full stdout buffer) but computes nothing.
 
+    Interruption + wedge protection (M3). The same poll loop now watches three
+    things besides the child's exit:
+      · :func:`_interrupt_if_shutdown` — a TERM/INT/HUP reached the agent
+        (``launchctl bootout``): kill the child, raise :class:`BuildInterrupted`.
+        Checked FIRST — the process is going away regardless, and we have only
+        launchd's exit timeout to get ffmpeg down before the SIGKILL;
+      · the cooperative cancel (unchanged, D13);
+      · :class:`_StallGuard` — no forward progress for :data:`BUILD_STALL_S` while
+        ffmpeg sits alive (addendum §4.4): same teardown, ``cause="stall"``.
+    ``output_path`` (the temp ffmpeg writes) gives the guard its second liveness
+    signal, so a long ``+faststart`` finalization is never mistaken for a wedge.
+
+    ``timeout_s`` / ``reason_on_timeout`` let a caller with a different ceiling
+    (``split``: minutes, not hours) reuse this runner without inheriting the
+    6-hour build timeout or its reason string.
+
     Outcomes:
       - exit 0 → return (success, unchanged);
       - non-zero exit / missing binary / OS error / timeout → :class:`BuildError`
         with ``reason_on_fail`` and a short stderr tail (the diagnostic);
       - a pending cancel for ``book_id`` → child SIGTERM→SIGKILL'd and reaped, then
-        :class:`BuildCancelled` raised (the caller sweeps the temp).
+        :class:`BuildCancelled` raised (the caller sweeps the temp);
+      - a signal / a stall → child SIGTERM→SIGKILL'd and reaped, then
+        :class:`BuildInterrupted` (a ``BuildError`` with ``reason="interrupted"``).
     """
     chapters = chapters or []
+    # A signal that arrived before we even spawned: do not start a new encoder we
+    # would have to kill a moment later (launchd is already counting down to KILL).
+    _interrupt_if_shutdown([])
     try:
         proc = subprocess.Popen(
             argv,
@@ -1004,6 +1203,11 @@ def _run_ffmpeg(
         except (OSError, ValueError):
             pass
 
+    # Latest position (ms) the reader thread saw — read by the stall guard in the
+    # poll loop below. Parsed ALWAYS (not only when progress_cb is set), because the
+    # wedge detector needs the liveness signal even for a caller that shows no bar.
+    pos_box: dict[str, int] = {"ms": -1}
+
     def _read_progress() -> None:
         block: dict = {}
         try:
@@ -1018,9 +1222,10 @@ def _run_ffmpeg(
                 val = val.strip()
                 if key == "progress":
                     # Terminator: compute + emit one snapshot for this block.
-                    if progress_cb is not None:
-                        out_ms = _parse_progress_out_time_ms(block)
-                        if out_ms is not None:
+                    out_ms = _parse_progress_out_time_ms(block)
+                    if out_ms is not None:
+                        pos_box["ms"] = out_ms          # liveness for _StallGuard
+                        if progress_cb is not None:
                             try:
                                 progress_cb(_progress_snapshot(
                                     out_ms, total_ms, chapters, start_monotonic))
@@ -1037,7 +1242,10 @@ def _run_ffmpeg(
     stderr_thread.start()
     progress_thread.start()
 
-    deadline = start_monotonic + BUILD_TIMEOUT_S
+    ceiling_s = BUILD_TIMEOUT_S if timeout_s is None else float(timeout_s)
+    deadline = start_monotonic + ceiling_s
+    watched = (output_path,) if output_path is not None else ()
+    stall = _StallGuard()
     while True:
         try:
             proc.wait(timeout=CANCEL_POLL_INTERVAL_S)
@@ -1045,15 +1253,24 @@ def _run_ffmpeg(
         except subprocess.TimeoutExpired:
             pass  # still running — run the periodic checks below
 
-        # (a) cooperative cancel: a cancel command landed for this book.
+        # (a) process shutdown (M3): a signal outranks everything — we are leaving,
+        #     and ffmpeg must not outlive us as an orphan writing into a dead temp.
+        _interrupt_if_shutdown([proc], book_id)
+
+        # (b) cooperative cancel: a cancel command landed for this book.
         if _cancel_requested(book_id):
             _terminate_ffmpeg(proc)
             raise BuildCancelled(book_id)
 
-        # (b) hard ceiling: a wedged ffmpeg must not hang the agent forever.
+        # (c) progress deadline (addendum §4.4): alive but frozen (e.g. blocked
+        #     writing into a folder we have no access to) → same teardown.
+        if stall.stalled(pos_box["ms"], watched):
+            raise _interrupted("stall", stall.detail(), [proc], book_id)
+
+        # (d) hard ceiling: a wedged ffmpeg must not hang the agent forever.
         if time.monotonic() >= deadline:
             _terminate_ffmpeg(proc)
-            raise BuildError("timeout", f"ffmpeg exceeded {BUILD_TIMEOUT_S}s")
+            raise BuildError(reason_on_timeout, f"ffmpeg exceeded {int(ceiling_s)}s")
 
     # Child exited on its own — let the reader threads finish draining the pipes.
     progress_thread.join(timeout=CANCEL_TERM_GRACE_S)
@@ -1131,7 +1348,7 @@ def _build_with_filter(
     try:
         _run_ffmpeg(argv, reason_on_fail="ffmpeg_concat_filter_failed",
                     book_id=book_id, total_ms=total_ms, chapters=chapters,
-                    progress_cb=progress_cb)
+                    progress_cb=progress_cb, output_path=tmp_out)
     finally:
         _unlink_quiet(script_path)
 
@@ -1202,7 +1419,7 @@ def _build_with_demuxer(
     try:
         _run_ffmpeg(argv, reason_on_fail="ffmpeg_concat_demuxer_failed",
                     book_id=book_id, total_ms=total_ms, chapters=chapters,
-                    progress_cb=progress_cb)
+                    progress_cb=progress_cb, output_path=tmp_out)
     finally:
         _unlink_quiet(list_path)
 
@@ -1369,6 +1586,7 @@ def _run_group_pool(
 
     done_planned = 0            # Σ planned_ms of fully-finished groups
     deadline = start_monotonic + BUILD_TIMEOUT_S
+    stall = _StallGuard()       # wedge detector across the WHOLE pool (addendum §4.4)
 
     def _emit_progress() -> None:
         if progress_cb is None:
@@ -1385,6 +1603,8 @@ def _run_group_pool(
 
     try:
         while next_to_launch < n or procs:
+            # A signal before/between launches: stop filling the pool at once (M3).
+            _interrupt_if_shutdown(list(procs.values()), book_id)
             # Fill the pool up to ``workers``.
             while len(procs) < workers and next_to_launch < n:
                 idx = next_to_launch
@@ -1411,12 +1631,21 @@ def _run_group_pool(
                 readers[idx] = rt
                 next_to_launch += 1
 
-            # Poll the running children for exit / cancel / timeout.
+            # Poll the running children for exit / shutdown / cancel / stall / timeout.
             time.sleep(CANCEL_POLL_INTERVAL_S)
 
+            # (a) process shutdown (M3) — gas the WHOLE pool, not one child.
+            _interrupt_if_shutdown(list(procs.values()), book_id)
             if _cancel_requested(book_id):
                 _terminate_ffmpeg_many(list(procs.values()))
                 raise BuildCancelled(book_id)
+            # (c) progress deadline: the aggregate position across the pool plus the
+            #     live fragments' file signatures — a frozen pool moves neither.
+            with live_lock:
+                pooled_ms = done_planned + sum(live_ms[i] for i in procs)
+            if stall.stalled(pooled_ms, [fragments[i] for i in procs]):
+                raise _interrupted("stall", stall.detail(),
+                                   list(procs.values()), book_id)
             if time.monotonic() >= deadline:
                 _terminate_ffmpeg_many(list(procs.values()))
                 raise BuildError("timeout", f"ffmpeg exceeded {BUILD_TIMEOUT_S}s")
@@ -1572,7 +1801,7 @@ def _build_with_parallel_groups(
         # bar. Kept silent + still cancellable/bounded — the bar holds at the encode's
         # final value until build_done clears the row.
         _run_ffmpeg(concat_argv, reason_on_fail="ffmpeg_concat_copy_failed",
-                    book_id=book_id)
+                    book_id=book_id, output_path=joined)
         if not joined.exists() or joined.stat().st_size == 0:
             raise _FastPathUnusable("joined_empty")
 
@@ -1627,7 +1856,10 @@ def _build_with_parallel_groups(
         argv += ["-f", "ipod", "-movflags", "+faststart", str(tmp_out)]
 
         # Silent finalize copy too (see the concat note) — cancellable + bounded.
-        _run_ffmpeg(argv, reason_on_fail="ffmpeg_remux_copy_failed", book_id=book_id)
+        # This one writes STRAIGHT INTO the watched folder (tmp_out), so it is the
+        # step the addendum's progress deadline is really aimed at.
+        _run_ffmpeg(argv, reason_on_fail="ffmpeg_remux_copy_failed", book_id=book_id,
+                    output_path=tmp_out)
     finally:
         _cleanup_temp_tree(chunks_dir)
 
@@ -1673,9 +1905,21 @@ def build(manifest: dict, *, out_path: Path | None = None, progress_cb=None) -> 
     ffmpeg runs) a :class:`BuildCancelled` is raised instead — the ffmpeg child is
     SIGTERM→SIGKILL'd and reaped first, and the SAME ``except`` sweeps every temp,
     so a cancel also leaves NO half-written ``.m4b`` and NO orphaned ffmpeg.
+    A process-level interrupt (M3) — a TERM/INT/HUP from ``launchctl bootout``, or a
+    :data:`BUILD_STALL_S` stretch with no forward progress — raises
+    :class:`BuildInterrupted` through the very same path: children killed and reaped
+    first, then the identical temp sweep, so the guarantee "no orphan, no half
+    ``.m4b``" holds for a killed agent exactly as it does for a cancel.
     Source mp3s are only read (I1). Raises :class:`BuildError` with no usable
     chapters.
     """
+    # M3 entry gate: if a signal already asked us to stop, do NOT start a new
+    # encode. The drain loop may still have queued books when the TERM lands, and
+    # spawning ffmpeg while launchd counts down to SIGKILL is exactly how an orphan
+    # is born. The book surfaces as ``error: interrupted`` — the same, honest state
+    # a build killed mid-flight lands in — and is re-triggerable by the user.
+    _interrupt_if_shutdown([], manifest.get("book_id"))
+
     # E3: a single unreadable chapter fails the WHOLE book — we never ship a
     # silently-partial .m4b. The user fixes / removes the offending file and a
     # re-scan (new source_rev) re-arms the book for a fresh build. The detail

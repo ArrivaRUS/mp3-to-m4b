@@ -107,28 +107,88 @@ def append_event(kind: str, **fields: Any) -> None:
         pass
 
 
+# ── Journal rotation (plan v2 Р6 / risk M7f) ─────────────────────────────────
+#: Rotate once the live journal passes this size. Generous: at ~200 B per record
+#: this is tens of thousands of events, i.e. months of normal operation, so the
+#: rotation is a safety valve against unbounded growth rather than a routine event.
+EVENTS_ROTATE_BYTES = 2 * 1024 * 1024
+_ROTATE_ENV = "MP3TOM4B_EVENTS_ROTATE_BYTES"
+
+
+def _rotate_threshold() -> int:
+    """Rotation threshold in bytes (``MP3TOM4B_EVENTS_ROTATE_BYTES`` overrides)."""
+    raw = os.environ.get(_ROTATE_ENV)
+    if raw is None:
+        return EVENTS_ROTATE_BYTES
+    try:
+        val = int(raw)
+    except ValueError:
+        return EVENTS_ROTATE_BYTES
+    return val if val > 0 else EVENTS_ROTATE_BYTES
+
+
+def rotate_events_if_needed() -> bool:
+    """Rotate ``events.jsonl`` → ``events.jsonl.1`` once, at PROCESS START.
+
+    Returns True if a rotation happened. Call this before the first
+    :func:`append_event` of the run and nowhere else — that timing is the whole
+    safety argument (plan v2 Р6):
+
+      · the agent is the single writer AND launchd never starts a second instance
+        of the same label, so at process start there is provably no concurrent
+        appender. Rotating mid-run would be a race with our own open handles;
+      · the journal carries GATE invariants, so the reader must keep seeing the
+        records that moved. :func:`read_events` therefore reads ``.1`` and then the
+        live file as one ordered sequence — a ``build_started`` can never be
+        separated from its ``confirm_accepted`` just because a rename happened
+        between them;
+      · exactly ONE generation is kept: ``.1`` is replaced, not chained. Bounded
+        disk use, and a reader that never has to guess how many files exist.
+
+    NOTE — the launchd ``StandardOutPath`` log is a different problem and is NOT
+    handled here: launchd holds that fd open for the life of the job, so renaming
+    the file from inside the agent would leave us writing into the rotated inode.
+    That one belongs to the plist/installer (it re-opens the path on every job
+    start), and is tracked as such.
+    """
+    path = config.events_file()
+    try:
+        if path.stat().st_size <= _rotate_threshold():
+            return False
+        os.replace(path, config.events_prev_file())
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A journal that cannot be rotated is not a reason to fail a run.
+        return False
+
+
 def read_events() -> list[dict[str, Any]]:
     """Read every record from ``events.jsonl`` (oldest-first); ``[]`` if absent.
 
-    Used by the §M0 self-check to assert journal invariants (e.g. no
-    ``build_started`` without a preceding ``confirm_accepted``). Malformed lines
-    are skipped rather than raising — the journal is diagnostics, never a
-    correctness dependency of the running agent.
+    Reads the rotated generation ``events.jsonl.1`` FIRST and the live file after
+    it, so the result is one continuous oldest-first sequence across a rotation.
+    That is not a convenience: the §M0 gate asserts journal invariants (e.g. no
+    ``build_started`` without a preceding ``confirm_accepted``), and a reader that
+    only saw the live file would report a violation the moment rotation split a
+    pair. Malformed lines are skipped rather than raising — the journal is
+    diagnostics, never a correctness dependency of the running agent.
     """
-    path = config.events_file()
     out: list[dict[str, Any]] = []
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(rec, dict):
-                    out.append(rec)
-    except FileNotFoundError:
-        return []
+    for path in (config.events_prev_file(), config.events_file()):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(rec, dict):
+                        out.append(rec)
+        except FileNotFoundError:
+            continue
     return out

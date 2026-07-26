@@ -50,6 +50,10 @@ ICON="$APP/Contents/Resources/AppIcon.icns"      # volume icon
 SETTINGS="$BUILD_DIR/dmg-settings.py"
 VENV_DMGBUILD="$BUILD_DIR/.venv/bin/dmgbuild"
 
+# Frozen-helper byte guard — border 4/4 (the .app inside the finished image).
+# shellcheck source=helper-guard.sh
+. "$BUILD_DIR/helper-guard.sh"
+
 # Test mode: unique volume name so Finder can't reuse a stale remembered window
 # geometry for a volume it has seen before (neighbor .patches/003). Writes a
 # throwaway dmg next to dist.
@@ -78,16 +82,18 @@ if [[ ! -f "${BG%.png}@2x.png" ]]; then
   echo "make-dmg: WARNING — ${BG%.png}@2x.png missing; background will be 1x only (blurry on Retina)" >&2
 fi
 
-# Sanity: the bundle should at least pass a non-strict signature check (the FDA
-# grant / Gatekeeper launch relies on this). Warn (don't fail) so a still-usable
-# bundle can be packaged; --deep (without --strict) is the right gauge for an ad-hoc
-# bundle that may carry a FinderInfo xattr (neighbor lesson).
-if codesign --verify --deep "$APP" >/dev/null 2>&1; then
-  echo "==> app signature verifies (--deep)"
-else
-  echo "make-dmg: WARNING — '$APP' did not pass 'codesign --verify --deep'." >&2
-  echo "           Packaging anyway, but the app may be rejected by Gatekeeper." >&2
-fi
+# The bundle must pass a non-strict signature check (the folder-access grant and
+# the Gatekeeper launch both rely on it). RELEASE-BLOCKING, with a retry loop for
+# the iCloud/fileprovider FinderInfo race — see guard_bundle_signature() for why
+# --deep without --strict is the correct gauge here, and why this is a failure
+# rather than the warning it used to be.
+echo "==> app signature (release-blocking)"
+guard_bundle_signature "$APP" "dist .app"
+
+# The .app being packaged may have been built before packaging/installer.sh last
+# changed. Re-assert here, on the copy that is actually about to ship, that the
+# bundled installer is looking for the same helper bytes PROVENANCE.md pins.
+guard_installer_constant "$APP/Contents/Resources/installer.sh" "bundled in dist .app"
 
 # Background must be >= the window (920x440) so the Finder window (macOS 26 opens the
 # DMG window ~920 wide, ignoring the remembered size) is fully covered — dark filler to
@@ -101,6 +107,20 @@ if [[ -n "$BG_W" && -n "$BG_H" ]] && { [[ "$BG_W" -lt 920 ]] || [[ "$BG_H" -lt 4
 fi
 
 # --- build the dmg ---------------------------------------------------------
+# From here on an image FILE exists on disk. Every gate below is release-blocking,
+# and a rejected image must not survive the failure: a .dmg sitting in build/dist
+# is indistinguishable from a release candidate, and picking up the wrong one is
+# exactly how a bad build reaches a user. Arm the cleanup before creating it.
+DMG_COMMITTED=0
+_on_exit_make_dmg() {
+  local rc=$?
+  if [[ "$rc" -ne 0 && "$DMG_COMMITTED" -ne 1 && -f "$DMG" ]]; then
+    rm -f "$DMG" "$DMG.sha256"
+    echo "make-dmg: removed the rejected image $(basename "$DMG") — it is not a release candidate." >&2
+  fi
+}
+trap _on_exit_make_dmg EXIT
+
 rm -f "$DMG"
 echo "==> dmgbuild  vol='$VOLNAME'  (window 920x440, app@(290,190), /Applications@(630,190))"
 "$DMGBUILD" \
@@ -112,14 +132,23 @@ echo "==> dmgbuild  vol='$VOLNAME'  (window 920x440, app@(290,190), /Application
   "$VOLNAME" \
   "$DMG"
 
-# --- verify the image is well-formed + mountable ---------------------------
+# --- verify the image is well-formed + mountable (release-blocking) --------
 echo "==> verifying image (hdiutil verify)"
-hdiutil verify "$DMG" >/dev/null 2>&1 \
-  && echo "    image verifies" \
-  || echo "    WARNING: hdiutil verify reported an issue" >&2
+guard_image_verify "$DMG"
+
+# --- BORDER 4/4: the frozen helper INSIDE the finished image -----------------
+# The last border, and the only one that looks at what a user actually receives.
+# hdiutil verify above proves the image is well-formed, and codesign proves the
+# bundle is signed — neither says a word about the helper's bytes. Mount the
+# image, read the helper back out of it, compare, unmount. Release-blocking.
+echo "==> frozen helper: border 4/4 (.app extracted from the mounted DMG)"
+guard_helper_in_dmg "$DMG" "$APP_NAME" "mounted final DMG"
 
 # --- checksum --------------------------------------------------------------
+# Reached only with every gate green, so the .sha256 means "this image passed",
+# not merely "this image exists".
 ( cd "$DIST_DIR" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256" )
+DMG_COMMITTED=1
 
 echo ""
 echo "Built: $DMG"

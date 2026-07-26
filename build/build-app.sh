@@ -9,7 +9,8 @@
 # Steps:
 #   1. compile app/*.swift for arm64 + x86_64 (xcrun swiftc) and lipo them into a
 #      universal Contents/MacOS/mp3-to-m4b
-#   2. copy bin/runner.sh + the python `agent/` package into Contents/Resources
+#   2. copy bin/runner.sh + the python `agent/` package + packaging/installer.sh +
+#      the FROZEN packaging/mp3-to-m4b-agent helper into Contents/Resources
 #   3. build AppIcon.icns from branding/icon-app.svg (cairosvg → else sips → else
 #      skip with a warning — see ICON section)
 #   4. write a clean Info.plist: CFBundleIdentifier=com.arrivarus.mp3tom4b
@@ -17,6 +18,11 @@
 #      CFBundleExecutable=mp3-to-m4b, LSMinimumSystemVersion=11.0
 #   5. ad-hoc codesign (-s -) + strict verify, inside a retry loop (iCloud/
 #      fileprovider FinderInfo race — neighbor's .patches/003 lesson)
+#   6. verify the frozen helper's SHA-256 on three of its four borders — repo,
+#      signed staging bundle, build/dist after ditto (border 4, the mounted final
+#      DMG, is in make-dmg.sh / build-dmg.sh). Any mismatch is release-blocking:
+#      those bytes are the identity the user's folder-access grant is pinned to.
+#      See build/helper-guard.sh.
 #
 # Unsandboxed, no external Swift deps (SwiftUI/AppKit/Foundation), offline build.
 #
@@ -47,6 +53,12 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$REPO_DIR/build"
 DIST_DIR="$BUILD_DIR/dist"
 
+# Frozen-helper byte guard (borders 1-3 below; border 4 lives in the DMG scripts).
+# The user's folder-access grant is pinned to the helper's bytes — see the header
+# of helper-guard.sh for why a byte change here is a silent, total failure.
+# shellcheck source=helper-guard.sh
+. "$BUILD_DIR/helper-guard.sh"
+
 # Build + sign the bundle in a STAGING dir OUTSIDE the (iCloud/fileprovider-synced)
 # repo, then move the finished, strict-verified bundle into build/dist. When the
 # repo lives under iCloud, the fileprovider daemon re-stamps com.apple.FinderInfo /
@@ -75,6 +87,7 @@ SWIFT_SRCS=(
   "$REPO_DIR/app/QueueView.swift"
   "$REPO_DIR/app/StatusView.swift"
   "$REPO_DIR/app/SetupView.swift"
+  "$REPO_DIR/app/FolderAccessCard.swift"
 )
 ICON_SVG="$REPO_DIR/branding/icon-app.svg"
 
@@ -89,6 +102,17 @@ done
 
 SDK_PATH="$(xcrun --show-sdk-path --sdk macosx)"
 [[ -d "$SDK_PATH" ]] || { echo "build-app: macOS SDK not found via xcrun" >&2; exit 1; }
+
+# --- BORDER 1/4: the artifact in the repo ------------------------------------
+# Checked BEFORE anything is compiled: if the checkout itself already carries the
+# wrong bytes (a bad merge, a git filter, a stray rebuild, an editor that
+# "fixed" the file), there is nothing worth building. Fail in a second, not after
+# a full compile+sign+package cycle.
+echo "==> frozen helper: border 1/4 (repo artifact vs PROVENANCE.md)"
+guard_helper_bytes "$HELPER_REPO_PATH" "repo"
+# ...and the installer we are about to bundle must be checking for the SAME bytes.
+# Otherwise all four borders pass and the shipped installer still refuses to run.
+guard_installer_constant "$REPO_DIR/packaging/installer.sh" "repo"
 
 # --- clean + build native universal binary ---------------------------------
 rm -rf "$APP"
@@ -122,13 +146,21 @@ lipo -info "$MACOS/$APP_NAME" | sed 's/^/    /'
 # The app is a reader; the agent (this python package) is the engine and single
 # writer. We ship both inside the bundle so the installer can stage them to App
 # Support. The runner is the stable FDA target → `exec python3 -m agent`.
-# packaging/installer.sh is bundled too: it resolves runner.sh + agent/ as its
-# SIBLINGS (its find_runner/find_agent_dir check "$SELF_DIR"), so dropping all
-# three into Resources lets a "do shell script <installer.sh>" front-end (the
-# applet, or the app's Setup screen) install the background agent from the bundle.
-echo "==> copying engine (agent/ + runner.sh + installer.sh) into Resources"
+# packaging/installer.sh is bundled too: it resolves runner.sh + agent/ + the
+# frozen helper as its SIBLINGS (its find_runner/find_agent_dir/find_agent_bin all
+# check "$SELF_DIR"), so dropping all four into Resources lets a
+# "do shell script <installer.sh>" front-end (the applet, or the app's Setup
+# screen) install the background agent from the bundle.
+#
+# mp3-to-m4b-agent is the FROZEN Mach-O the LaunchAgent's ProgramArguments[0]
+# points at — the file the user's folder-access grant is bound to. It is COPIED
+# verbatim, never rebuilt, and its bytes are re-verified after signing (border 2)
+# and after ditto (border 3). Its location here is not free to change: the
+# installer looks for it beside itself.
+echo "==> copying engine (agent/ + runner.sh + installer.sh + frozen helper) into Resources"
 install -m 0755 "$REPO_DIR/bin/runner.sh" "$RES/runner.sh"
 install -m 0755 "$REPO_DIR/packaging/installer.sh" "$RES/installer.sh"
+install -m 0755 "$HELPER_REPO_PATH" "$APP/$HELPER_BUNDLE_RELPATH"
 # Copy the python package verbatim (skip __pycache__ / pyc).
 AGENT_DST="$RES/agent"
 rm -rf "$AGENT_DST"
@@ -357,6 +389,16 @@ if [[ "$CODESIGN_OK" -ne 1 ]]; then
 fi
 { codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 || true; } | sed 's/^/    /'
 
+# --- BORDER 2/4: the signed staging bundle -----------------------------------
+# `codesign --force --deep` walks the bundle and re-signs nested code. Empirically
+# it leaves a bare Mach-O in Contents/Resources alone (it seals it as a resource
+# instead) — but that is a property of today's toolchain, not a contract, and the
+# xattr sweep above (`xattr -cr`, find -delete) runs over the same tree. So verify
+# rather than assume: whatever the signing step did, the helper must come out of
+# it byte-identical.
+echo "==> frozen helper: border 2/4 (signed staging bundle, after codesign)"
+guard_helper_bytes "$APP/$HELPER_BUNDLE_RELPATH" "signed staging .app"
+
 # --- move the staged, signed bundle into build/dist --------------------------
 # The signature lives inside the bundle (Contents/_CodeSignature, embedded sigs),
 # so it travels with the move. The destination wrapper dir may get re-stamped with
@@ -369,14 +411,24 @@ mkdir -p "$DIST_DIR"
 rm -rf "$DEST_APP"
 # Use ditto to preserve the signed bundle structure/attributes faithfully.
 ditto "$APP" "$DEST_APP"
-xattr -d com.apple.FinderInfo "$DEST_APP" 2>/dev/null || true
-if codesign --verify "$DEST_APP" >/dev/null 2>&1; then
-  echo "    destination signature verifies"
-else
-  echo "    WARNING: destination signature verify reported an issue (likely the" >&2
-  echo "             fileprovider FinderInfo xattr on the wrapper dir; the embedded" >&2
-  echo "             signature is intact and the app will launch)." >&2
-fi
+# Destination signature: RELEASE-BLOCKING, not a warning.
+# This used to warn and continue on the theory that a failure here is only ever
+# the fileprovider FinderInfo xattr on the wrapper directory. That theory is
+# right about the common case and useless as a policy: the same check is what
+# fails when the payload really was modified, and a warning that scrolls past is
+# how a broken bundle reaches the DMG step. guard_bundle_signature handles the
+# xattr race properly (clear + retry ×5) and fails hard on anything else. It also
+# uses --deep, which the old check did not — so this is a stronger test, not just
+# a louder one.
+guard_bundle_signature "$DEST_APP" "build/dist .app"
+
+# --- BORDER 3/4: build/dist, after ditto -------------------------------------
+# The staging bundle was verified, but what leaves this script is the ditto'd
+# copy in build/dist — and build/dist is inside the (iCloud/fileprovider-synced)
+# repo, where a daemon touches files behind our back. ditto is a copy, so this
+# border also covers the copy itself.
+echo "==> frozen helper: border 3/4 (build/dist bundle, after ditto)"
+guard_helper_bytes "$DEST_APP/$HELPER_BUNDLE_RELPATH" "build/dist .app (post-ditto)"
 
 echo ""
 echo "Built: $DEST_APP"
@@ -385,3 +437,5 @@ echo "  CFBundleExecutable: $(plutil -extract CFBundleExecutable raw -o - "$DEST
 echo "  Version:            $(plutil -extract CFBundleShortVersionString raw -o - "$DEST_APP/Contents/Info.plist")"
 echo "  Architectures:      $(lipo -archs "$DEST_APP/Contents/MacOS/$APP_NAME")"
 echo "  Icon:               $([[ "$ICON_OK" -eq 1 ]] && echo 'AppIcon.icns' || echo '(skipped — generic)')"
+echo "  Frozen helper:      $HELPER_BUNDLE_RELPATH"
+echo "                      sha256 $(helper_sha256 "$DEST_APP/$HELPER_BUNDLE_RELPATH")  (borders 1-3 verified)"

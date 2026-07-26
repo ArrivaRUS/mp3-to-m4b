@@ -53,6 +53,23 @@ struct StatusView: View {
     /// done/error book built AT OR BEFORE this instant is hidden from the list. nil
     /// = nothing cleared. Passed down by the host so Status stays a pure reader.
     let recentClearedAt: Date?
+    /// M6 — the folder-access card, already wired by the host. nil = either the
+    /// folder is fine or the fail-closed gate forbids claiming anything about it
+    /// (`InstallTruth.allowsFolderAccessSurface`); Status never decides this itself.
+    ///
+    /// Two подачи, picked by whether there is anything to look at:
+    ///   · no history yet → BLOCKER. There is nothing else on this screen worth
+    ///     seeing (an empty hero next to "нет доступа" is noise), and access is the
+    ///     one thing standing between the user and their first book.
+    ///   · history exists → BANNER above the content. The books stay visible; the
+    ///     conversion is equally stuck either way, but hiding what already works
+    ///     would read as "the app lost my books".
+    var accessCard: FolderAccessCard? = nil
+    /// The window is at the screen ceiling, so the blocker's card really is
+    /// scrolling. Drives a bottom fade + chevron so the cut is legible as "there is
+    /// more below" instead of as a bug. Host-computed (`refitWindowHeight` owns both
+    /// numbers); Status only renders it.
+    var contentClipped: Bool = false
 
     // Showcase projections (agent-owned; we only read).
     private var pendingCount: Int { state.pendingConfirm.count }
@@ -62,8 +79,88 @@ struct StatusView: View {
     }
 
     var body: some View {
+        if let card = accessCard, !hasHistory {
+            blockedBody(card)
+        } else {
+            normalBody
+        }
+    }
+
+    /// Whether there is anything on this screen worth keeping visible behind a
+    /// banner: a built/errored book in the digest, or a lifetime "собрано" count
+    /// (the digest can be empty after «Очистить» while the counter is not).
+    private var hasHistory: Bool {
+        !orderedRecent.isEmpty || state.totals.built > 0 || !state.books.isEmpty
+    }
+
+    /// BLOCKER подача: header + the access card + the footer. No hero, no queue
+    /// row, no recent list — none of it can change until the folder is readable.
+    ///
+    /// The card GROWS the window: opening the FDA fallback adds a measured +354 pt
+    /// (409 → 763). The scroll area therefore has NO height cap of its own, and that
+    /// is the fix, not an oversight.
+    ///
+    /// It used to carry a flat 460 pt. That constant bound long before the screen
+    /// did — on the human's 897 pt display the window froze at 560 pt, cut the
+    /// instruction mid-word and left ~300 pt of empty screen underneath (measured:
+    /// the old cap clipped exactly 303 pt). Raising the constant would only move the
+    /// wall. Two caps for one dimension is the actual bug: whichever binds first
+    /// wins, and the OTHER one is the one that knows the screen.
+    ///
+    /// So there is one cap now — `cappedContentHeight` in the AppDelegate, which is
+    /// derived from the real screen and the real titlebar inset. A bare ScrollView
+    /// reports its content's ideal height (measured: 395 pt for a 395 pt card), so
+    /// the window grows with the card; when the screen finally binds, the VStack
+    /// squeezes the flexible child — the scroll area — and never the fixed chrome
+    /// (measured at a 400 pt window: header kept all 72 pt, footer all 91 pt, the
+    /// scroll area took the whole 237 pt hit). That is also what makes
+    /// `contentClipped` honest: with no second cap swallowing the overflow, the
+    /// window cap is the only thing that can clip, and it is the thing that reports.
+    private func blockedBody(_ card: FolderAccessCard) -> some View {
         VStack(spacing: 0) {
             header
+            ScrollView {
+                card.presented(as: .blocker).padding(.bottom, 12)
+            }
+            .overlay(scrollMoreHint, alignment: .bottom)
+            footer
+            credit
+        }
+        .frame(width: Tokens.M.windowStandard)
+    }
+
+    /// Shown ONLY when the host says the window is at the screen ceiling. A pure
+    /// overlay: it must not add height, or it would change the measurement that
+    /// produced it. A fade alone reads as decoration, so it carries a chevron —
+    /// the point is that the user understands there is more text, not that the edge
+    /// looks softer.
+    @ViewBuilder
+    private var scrollMoreHint: some View {
+        if contentClipped {
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                LinearGradient(
+                    gradient: Gradient(colors: [Tokens.C.bgApp.opacity(0), Tokens.C.bgApp]),
+                    startPoint: .top, endPoint: .bottom)
+                    .frame(height: 28)
+                    .overlay(
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundColor(Tokens.C.textTertiary)
+                            .padding(.bottom, 2),
+                        alignment: .bottom)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var normalBody: some View {
+        VStack(spacing: 0) {
+            header
+
+            // BANNER подача — above the hero, below the header (the access problem
+            // outranks everything on this screen, but never hides it).
+            if let card = accessCard { card.presented(as: .banner) }
 
             // FIXED chrome (always shown, true intrinsic height): the COMPACT hero
             // (badge + ring + the two counters stacked) and the queue row. Kept OUT
@@ -409,9 +506,9 @@ struct StatusView: View {
             Rectangle().fill(Tokens.C.borderCard).frame(height: 1)
             HStack(spacing: 10) {
                 Circle()
-                    .fill(state.agent.active ? Tokens.C.liveDot : Tokens.C.textTertiary)
+                    .fill(footerDotColor)
                     .frame(width: 7, height: 7)
-                    .shadow(color: state.agent.active ? Tokens.C.liveDot.opacity(0.8) : .clear,
+                    .shadow(color: footerDotGlows ? Tokens.C.liveDot.opacity(0.8) : .clear,
                             radius: 4)
                 Text(footerText)
                     .font(.system(size: Tokens.F.caption))
@@ -425,7 +522,23 @@ struct StatusView: View {
         }
     }
 
+    /// The footer говорит про ПРОЦЕСС, карточка — про ДОСТУП, и по отдельности оба
+    /// правы: агент действительно жив, а папку действительно не читает. Рядом это
+    /// читается как «всё в порядке» — зелёная точка сильнее любого текста над ней.
+    /// Поэтому при живой проблеме доступа точка гаснет до нейтральной, а подпись
+    /// говорит, что именно агент сейчас делать не может. Никакого нового источника
+    /// правды: тот же `accessCard`, который уже прошёл fail-closed-гейт.
+    private var accessIsBroken: Bool { accessCard != nil }
+
+    private var footerDotColor: Color {
+        if accessIsBroken { return Tokens.C.warnBase }
+        return state.agent.active ? Tokens.C.liveDot : Tokens.C.textTertiary
+    }
+
+    private var footerDotGlows: Bool { !accessIsBroken && state.agent.active }
+
     private var footerText: String {
+        if accessIsBroken { return "Агент запущен, но папку не читает" }
         if let batch = state.batch, batch.active, batch.total > 0 {
             return "Собираю \(batch.done) из \(batch.total)"
         }

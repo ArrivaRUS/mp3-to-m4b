@@ -135,6 +135,29 @@ enum InstallPhase: Equatable {
     case failed(String)   // human message (stderr tail)
 }
 
+/// Bridge between the UI phase and the coordinator's terminal-only `InstallOutcome`
+/// (EngineClient+Status.swift). The coordinator stays Foundation-only — it must
+/// compile in the Swift self-check without the view layer — so the mapping lives
+/// here, next to the phase it maps.
+extension InstallOutcome {
+    init(_ phase: InstallPhase) {
+        switch phase {
+        case .done: self = .done
+        case .failed(let msg): self = .failed(msg)
+        // A finished run can only be done/failed; anything else means the runner
+        // returned without a verdict, which is a failure, not a silent success.
+        case .idle, .running: self = .failed("Установка не завершилась.")
+        }
+    }
+
+    var phase: InstallPhase {
+        switch self {
+        case .done: return .done
+        case .failed(let msg): return .failed(msg)
+        }
+    }
+}
+
 /// Locates + runs the bundled installer. Kept tiny: build argv, run, capture
 /// stderr for a failure message. The agent (installed by the script) takes over
 /// from there; this never writes the support tree itself.
@@ -157,14 +180,48 @@ enum InstallRunner {
     /// + scratch-HOME escape hatches so a real run never touches the live system.
     static func run(installerPath: String, watchDir: String,
                     extraEnv: [String: String] = [:]) -> InstallPhase {
+        runCapturing(installerPath: installerPath, watchDir: watchDir,
+                     extraEnv: extraEnv).phase
+    }
+
+    /// The OFFLINE repair mode (`--repair-launchd-only`, plan v2 B2): verify the
+    /// already-installed files, re-bake the plist, reload, verify the loaded PA0,
+    /// write the receipt. No engine detection, no venv, no pip — nothing that can
+    /// reach the network. That is what makes it safe to call SYNCHRONOUSLY before
+    /// the first frame: the full installer's `pip install --upgrade pip` (no
+    /// timeout) is exactly why this mode exists.
+    ///
+    /// `watchDir` may be empty — the installer then carries the folder over from
+    /// the receipt/plist itself. We still pass ours when we know it, because the
+    /// resolution order on our side (receipt → plist → same-generation state) is
+    /// the stricter one.
+    static func runRepair(installerPath: String, watchDir: String,
+                          extraEnv: [String: String] = [:])
+        -> (phase: InstallPhase, stderrTail: String) {
+        runCapturing(installerPath: installerPath, watchDir: watchDir,
+                     extraEnv: extraEnv, repairOnly: true)
+    }
+
+    /// The single implementation. Also returns the last few stderr lines so the
+    /// `.failed` screen can show real diagnostics instead of one cryptic line
+    /// (M12f: that screen used to be a dead end with nothing to act on).
+    static func runCapturing(installerPath: String, watchDir: String,
+                             extraEnv: [String: String] = [:],
+                             repairOnly: Bool = false)
+        -> (phase: InstallPhase, stderrTail: String) {
         guard FileManager.default.fileExists(atPath: installerPath) else {
-            return .failed("Установщик не найден в приложении.")
+            return (.failed("Установщик не найден в приложении."), "")
         }
         let p = Process()
         // Invoke via /bin/bash so an un-executable-bit copy still runs; the script
         // is also chmod 0755 in the bundle, but bash is the robust path.
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
-        p.arguments = [installerPath, watchDir]
+        // The installer ignores an empty positional argument on purpose, so an
+        // unknown folder is passed as "" rather than omitted (argv shape stays
+        // stable) — in repair mode it then carries the folder over itself.
+        p.arguments = repairOnly
+            ? [installerPath, "--repair-launchd-only", watchDir]
+            : [installerPath, watchDir]
         var env = ProcessInfo.processInfo.environment
         for (k, v) in extraEnv { env[k] = v }
         p.environment = env
@@ -177,7 +234,7 @@ enum InstallRunner {
         do {
             try p.run()
         } catch {
-            return .failed("Не удалось запустить установщик: \(error.localizedDescription)")
+            return (.failed("Не удалось запустить установщик: \(error.localizedDescription)"), "")
         }
         // Drain pipes before waiting so a chatty installer can't deadlock on a full
         // pipe buffer.
@@ -185,15 +242,55 @@ enum InstallRunner {
         _ = outPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
 
-        if p.terminationStatus == 0 { return .done }
         let stderr = String(data: errData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let tail = stderr.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .suffix(8).joined(separator: "\n")
+
+        if p.terminationStatus == 0 { return (.done, tail) }
         // Surface the last meaningful stderr line (the installer prints a clear
         // reason on each failure path); fall back to a generic message.
         let lastLine = stderr.components(separatedBy: "\n")
             .reversed().first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         let msg = (lastLine?.isEmpty == false ? lastLine! : "Установка не удалась (код \(p.terminationStatus)).")
-        return .failed(msg)
+        return (.failed(msg), tail)
+    }
+}
+
+// MARK: - Installer test env (the two-stage latch, mirrored on the Swift side)
+
+/// Builds a COMPLETE `extraEnv` for an isolated installer run.
+///
+/// `installer.sh` used to honour `MP3TOM4B_NO_LAUNCHCTL` / `MP3TOM4B_NO_VENV` /
+/// `MP3TOM4B_SUPPORT_DIR` on their own. It no longer does: after the neighbour's
+/// lesson (a verify-override that rewrote the human's real LaunchAgent), every
+/// hatch sits behind a two-stage latch — `MP3TOM4B_TEST_MODE=1` PLUS
+/// `MP3TOM4B_TEST_ROOT=<existing dir>` that CONTAINS every redirected path. Half an
+/// arming is worse than none: the redirecting variables are then REFUSED (the run
+/// fails) and the work-skipping ones are ignored (the run touches the real system).
+///
+/// So the app never assembles that dictionary by hand. Anything setting one of the
+/// three seams (`SetupView.installerExtraEnv`, `SettingsView.installerExtraEnv`,
+/// `AppDelegate.agentInstallerExtraEnv`) goes through here, and the latch is armed
+/// by construction.
+enum InstallerTestEnv {
+    /// `root` must EXIST and contain `supportDir` (and the LaunchAgents dir, when
+    /// redirected). `label` keeps a throwaway job off the production label.
+    static func latched(root: String, supportDir: String, label: String,
+                        launchAgentsDir: String? = nil,
+                        skipLaunchctl: Bool = true,
+                        skipVenv: Bool = true) -> [String: String] {
+        var env: [String: String] = [
+            "MP3TOM4B_TEST_MODE": "1",
+            "MP3TOM4B_TEST_ROOT": root,
+            "MP3TOM4B_SUPPORT_DIR": supportDir,
+            "MP3TOM4B_LABEL": label,
+        ]
+        if let dir = launchAgentsDir { env["MP3TOM4B_LAUNCHAGENTS_DIR"] = dir }
+        if skipLaunchctl { env["MP3TOM4B_NO_LAUNCHCTL"] = "1" }
+        if skipVenv { env["MP3TOM4B_NO_VENV"] = "1" }
+        return env
     }
 }
 
@@ -283,6 +380,87 @@ enum AgentUpdate {
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
+
+    // MARK: Non-python artifacts (frozen helper + runner.sh) — plan v2 M5
+
+    /// The frozen helper the .app ships: `Contents/Resources/mp3-to-m4b-agent`
+    /// (build/helper-guard.sh `HELPER_BUNDLE_RELPATH`). nil on a bare-binary dev run.
+    static func bundledHelperPath() -> URL? {
+        bundledResource(StateStore.helperName)
+    }
+
+    /// `Contents/Resources/runner.sh` — the helper's sibling, freely mutable
+    /// content under a frozen NAME. nil on a bare-binary dev run.
+    static func bundledRunnerPath() -> URL? {
+        bundledResource("runner.sh")
+    }
+
+    private static func bundledResource(_ name: String) -> URL? {
+        guard let res = Bundle.main.resourceURL else { return nil }
+        let url = res.appendingPathComponent(name)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Freshness over the two NON-python artifacts the installer also stages.
+    ///
+    /// `AgentFreshness` above only compares `agent/*.py`, because that is the tree
+    /// `agent/agent_version.py` mirrors. But an update also carries `runner.sh`
+    /// (signal handling, the donor process shape) — a UI that thinks it is current
+    /// while the staged runner is a release behind is the same class of bug the py
+    /// comparison exists to kill. The helper is frozen and must therefore be
+    /// byte-identical; a difference here is not "an update is available", it is
+    /// "something is wrong", and either way the correct action is the same: run the
+    /// installer, which refuses on a golden-SHA mismatch.
+    ///
+    /// `.undecidable` when the bundle carries neither artifact (dev run) → don't touch.
+    static func artifactFreshness(store: StateStore) -> AgentFreshness {
+        let pairs: [(URL?, String)] = [
+            (bundledHelperPath(), store.installedHelperPath),
+            (bundledRunnerPath(), store.installedRunnerPath),
+        ]
+        var decided = false
+        for (bundled, installedPath) in pairs {
+            guard let bundled = bundled,
+                  let bundledData = try? Data(contentsOf: bundled) else { continue }
+            decided = true
+            guard let installedData = try? Data(
+                contentsOf: URL(fileURLWithPath: installedPath)) else { return .outdated }
+            if sha256Hex(bundledData) != sha256Hex(installedData) { return .outdated }
+        }
+        return decided ? .upToDate : .undecidable
+    }
+
+    /// The verdict the launch path acts on: the python tree AND the artifacts.
+    /// `.outdated` wins over everything (something concrete is behind); otherwise
+    /// `.upToDate` only when at least one half could actually be decided.
+    static func combinedFreshness(store: StateStore) -> AgentFreshness {
+        let py = freshness(store: store)
+        let art = artifactFreshness(store: store)
+        if py == .outdated || art == .outdated { return .outdated }
+        if py == .upToDate || art == .upToDate { return .upToDate }
+        return .undecidable
+    }
+
+    // MARK: bundled >= installed (M11f)
+
+    /// This .app's version (`CFBundleShortVersionString`), or nil outside a bundle.
+    static func bundledVersion() -> String? {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        return (v?.isEmpty == false) ? v : nil
+    }
+
+    /// TRUE when this .app is OLDER than the install already on disk (receipt's
+    /// `engine_version`). An outdated-looking staged tree then means "you opened an
+    /// old app", not "the agent needs updating" — and re-running this bundle's
+    /// installer would DOWNGRADE the engine, which on Tahoe re-points PA0 back at
+    /// runner.sh and kills folder access. Unknown on either side → false (no
+    /// opinion), matching the installer's own guard.
+    static func isDowngrade(store: StateStore) -> Bool {
+        guard let bundled = bundledVersion(),
+              let installed = store.loadReceipt()?.engineVersion,
+              !installed.isEmpty else { return false }
+        return !EngineVersion.atLeast(bundled, installed)
+    }
 }
 
 // MARK: - SetupView (spec §01 / §6, mockup 01)
@@ -294,9 +472,17 @@ struct SetupView: View {
     /// Called once the install succeeds (the agent is now live) — the host flips
     /// to Status and starts the state watcher.
     let onInstalled: () -> Void
-    /// Test seam: extra env for the installer process (NO_LAUNCHCTL / NO_VENV /
-    /// scratch HOME). Empty in production — a real user install touches the system.
+    /// Test seam: extra env for the installer process. Empty in production — a real
+    /// user install touches the system. Build it with `InstallerTestEnv.latched`:
+    /// the installer refuses a half-armed latch (see that type).
     var installerExtraEnv: [String: String] = [:]
+    /// Show the "macOS is about to ask for folder access" notice and call the
+    /// continuation when the user acknowledges it (or never, if they back out).
+    /// The host owns the notice so the SAME screen appears for every path that can
+    /// trigger the system dialog (first install, launch-time update, repair).
+    /// Default = run immediately, which keeps a bare SetupView (previews, unit
+    /// compiles) behaving exactly as before.
+    var requestConsentNotice: (String, @escaping () -> Void) -> Void = { _, go in go() }
 
     @State private var probe: FFmpegProbe = FFmpegProbe(ffmpegPath: nil, ffprobePath: nil, version: nil)
     @State private var probing = true
@@ -629,25 +815,50 @@ struct SetupView: View {
         return watchDir
     }
 
-    // MARK: Footnote — FDA hint (shown when ffmpeg found, per mockup STATE B).
+    // MARK: Footnote — the access forecast (shown when ffmpeg found; mockup STATE B).
+    //
+    // REWRITTEN after T0 (addendum §5.1–5.2). The old line said «может понадобиться
+    // разовый Full Disk Access» — measurably wrong, and wrong in the expensive
+    // direction: the grant our helper actually receives is a plain consent dialog
+    // (`auth_reason=2`), while its Full Disk Access preflight is refused on every
+    // run, including the successful ones. The FDA panel is now the fallback for
+    // «Не разрешать», not the first step.
+    //
+    // This is also the single highest-value sentence in the whole newcomer path.
+    // The dialog is raised by the AGENT, seconds after «Установить», and it names
+    // the helper file, not this app. A user who does not know that is one click
+    // away from «Не разрешать» — and that answer is final: macOS records it and
+    // never asks again. So the forecast is shown BEFORE the install, in the card's
+    // own words (FolderAccessCard.setupStep), and repeats verbatim what the system
+    // dialog will say.
+    //
+    // Shown only for a folder inside a protected zone: in `~/mp3-to-m4b` nothing
+    // will ask, and promising a dialog that never comes is its own kind of lying.
 
     @ViewBuilder
     private var footnote: some View {
-        if ffmpegFound {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "info.circle")
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundColor(Tokens.C.textSecondary)
-                    .padding(.top, 1)
-                Text("При папке в Desktop / Documents может понадобиться разовый Full Disk Access.")
-                    .font(.system(size: Tokens.F.small))
-                    .foregroundColor(Tokens.C.textSecondary)
-                    .lineSpacing(3)
-                    .fixedSize(horizontal: false, vertical: true)
+        if ffmpegFound && selectedIsInProtectedZone {
+            HStack(alignment: .top, spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: Tokens.R.chip, style: .continuous)
+                        .fill(Tokens.C.rowIcBrandTealBg)
+                    Image(systemName: "hand.raised.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Tokens.C.brandTeal)
+                }
+                .frame(width: 28, height: 28)
+                FolderAccessCard(state: .awaitingConsent, presentation: .setupStep)
                 Spacer(minLength: 0)
             }
             .padding(.init(top: 4, leading: 20, bottom: 16, trailing: 20))
         }
+    }
+
+    /// The folder chosen on this screen sits inside a TCC-protected zone (Рабочий
+    /// стол / Документы / Загрузки), so the consent dialog WILL appear after the
+    /// install. Same pure rule the access card and Настройки use.
+    private var selectedIsInProtectedZone: Bool {
+        LocalWatchFolder.isProtected(watchDir, home: NSHomeDirectory())
     }
 
     // MARK: Footer — live dot + status text + the install action button.
@@ -886,9 +1097,24 @@ struct SetupView: View {
         pb.setString("brew install ffmpeg", forType: .string)
     }
 
-    /// Run the bundled installer with the chosen folder, off the main thread.
+    /// «Завершить установку» — ask for consent-notice first, then install.
+    ///
+    /// The install ends with launchd bootstrapping the agent, whose FIRST tick
+    /// probes the watch folder — and on macOS 26 that probe is what makes the
+    /// system put up its own «Разрешить / Не разрешать» dialog (addendum §5.1: both
+    /// grants we measured were `auth_reason=2`, i.e. user consent in that dialog,
+    /// not a trip to System Settings). A dialog nobody warned about is the single
+    /// cheapest way to lose the grant forever: «Не разрешать» writes `auth_value=0`
+    /// and the dialog never comes back. So the host gets a chance to explain what
+    /// is about to be asked BEFORE we start the installer.
     private func startInstall() {
         guard ffmpegFound else { return }
+        requestConsentNotice(watchDir) { runInstall() }
+    }
+
+    /// The install itself, off the main thread. Separated from `startInstall` so
+    /// the consent notice sits in front of it without duplicating this logic.
+    private func runInstall() {
         guard let installer = InstallRunner.bundledInstallerPath() else {
             phase = .failed("Установщик не найден в приложении (пересоберите .app).")
             return
@@ -896,19 +1122,25 @@ struct SetupView: View {
         let dir = watchDir
         let env = installerExtraEnv
         phase = .running
-        DispatchQueue.global(qos: .userInitiated).async {
-            let result = InstallRunner.run(installerPath: installer, watchDir: dir,
-                                           extraEnv: env)
-            DispatchQueue.main.async {
-                self.phase = result
-                if case .done = result {
+        // Single-flight (B4): the same coordinator the Settings re-point and the
+        // launch-time auto-update go through, so an install can never overlap one
+        // of those. A refusal comes back as .failed with an honest reason.
+        InstallCoordinator.shared.submit(
+            id: "setup-install",
+            work: { InstallOutcome(InstallRunner.run(installerPath: installer,
+                                                     watchDir: dir, extraEnv: env)) },
+            completion: { outcome in
+                switch outcome {
+                case .done:
+                    self.phase = .done
                     // Give the agent a beat to write its first state, then hand off.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                         self.onInstalled()
                     }
+                case .failed(let m):
+                    self.phase = .failed(m)
                 }
-            }
-        }
+            })
     }
 }
 

@@ -4,8 +4,9 @@ M0.5 (arch/synthesis.md §B): the app drops ``queue/commands/<cmd_id>.json``
 atomically; launchd wakes the agent because ``queue/commands/`` is a
 ``WatchPaths`` entry. Each command carries ``action``
 (``confirm-build`` | ``grouping-choice`` | ``cover-choice`` | ``cancel`` |
-``skip`` | ``apply-to-all``), ``book_id``, ``source_rev``, ``confirm_token`` and
-``idempotency_key``.
+``skip`` | ``recheck-access`` | ``apply-to-all``), ``book_id``, ``source_rev``,
+``confirm_token`` and ``idempotency_key``. The book-less actions
+(``grouping-choice``, ``recheck-access``) are dispatched before the book lookup.
 
 This module wires the happy path plus the M0.6 protocol protections:
   - malformed / unreadable command JSON → quarantined in ``queue/commands/bad/``
@@ -49,7 +50,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import build_m4b, config, scan, split, state
+from . import build_m4b, config, scan, shutdown, split, state
 
 # Actions that may trigger a build. Per I2 this is the ONLY gate to the engine.
 BUILD_ACTION = "confirm-build"
@@ -120,6 +121,21 @@ GROUPING_ACTION = "grouping-choice"
 GROUPING_CHOICE_COMBINE = "combine"
 GROUPING_CHOICE_SEPARATE = "separate"
 GROUPING_VALID_CHOICES = (GROUPING_CHOICE_COMBINE, GROUPING_CHOICE_SEPARATE)
+
+# «Проверить снова» in the access card (plan v2 M5f, addendum §4.5). The app does
+# NOT use ``launchctl kickstart`` for this: kickstart without ``-k`` is a no-op on
+# a running job, and WITH ``-k`` it would kill a build in progress. Instead the app
+# drops this command — ``queue/commands/`` is already a ``WatchPaths`` entry, so
+# launchd wakes the agent by itself and no extra permission or tooling is involved.
+#
+# It carries no book_id, never builds, and always re-publishes ``folder_access``
+# with a FRESH ``folder_access_ts``, even when the verdict is unchanged: the app
+# treats that timestamp as an opaque token and waits for it to MOVE. Refusing to
+# move it because "nothing changed" would false-timeout a perfectly good recheck.
+# A recheck queued behind a running build simply waits its turn — that is the
+# «проверим сразу после текущей сборки» case, which the app tells apart from a
+# failed probe by asking launchctl whether the job is running (M5f).
+RECHECK_ACCESS_ACTION = "recheck-access"
 
 # Manifest status transitions driven by the fake-engine.
 STATUS_PENDING = "pending-confirm"
@@ -935,6 +951,29 @@ def _handle_skip(command: dict, command_path: Path, manifest: dict | None,
     return False
 
 
+def _handle_recheck_access(command: dict, command_path: Path) -> bool:
+    """«Проверить снова» — re-probe the watched folder and republish the verdict.
+
+    Deliberately the *whole* handler: probe (behind its watchdog, so this can never
+    be the thing that hangs the job), publish, journal, consume. It NEVER builds
+    and never touches a manifest or a ledger, so it is safe to run in any state,
+    including the `denied`/`blocked` states it exists to get the user out of.
+
+    Note it re-probes rather than reporting the verdict this process already has:
+    the run that published `denied` may be minutes old, and the entire point of the
+    button is "check again NOW". Publishing always bumps ``folder_access_ts``, which
+    is the signal the app is blocking on (plan v2 M5f).
+    """
+    access = scan.probe_watch_dir_access()
+    scan.publish_folder_access(access)
+    state.append_event(
+        "recheck_access", file=command_path.name, access=access,
+        requested_ts=command.get("ts"),
+    )
+    _delete_command(command_path)
+    return False
+
+
 def handle_command(command_path: Path) -> bool:
     """Parse, validate and dispatch a single command file.
 
@@ -957,6 +996,11 @@ def handle_command(command_path: Path) -> bool:
     # build — dispatch them in their own validated branch before the book lookup.
     if action == GROUPING_ACTION:
         return _handle_grouping_choice(command, command_path)
+
+    # «Проверить снова»: re-run the access probe and republish. No book, no
+    # manifest, no build — handled before the book lookup for exactly that reason.
+    if action == RECHECK_ACCESS_ACTION:
+        return _handle_recheck_access(command, command_path)
 
     manifest_path = config.books_dir() / f"{book_id}.json" if book_id else None
     manifest = state.read_json(manifest_path, default=None) if manifest_path else None
@@ -1129,10 +1173,29 @@ def drain_commands() -> int:
     quarantined). One bad file never stops the drain — each is handled in
     isolation. After draining, the state showcase is refreshed so the app sees
     the new ``done`` statuses.
+
+    SHUTDOWN (M3): a TERM/INT/HUP mid-drain stops the loop AT THE BOUNDARY, before
+    the next command is opened. Without that stop every book still queued behind
+    the interrupted one would be dragged through :func:`handle_command` while the
+    flag is up — the encoder refuses to start, the build raises ``BuildInterrupted``
+    and the manifest lands at ``error: interrupted``. For a book nobody ever
+    touched that is simply a lie, and the user sees a row of failures after an
+    update that only cancelled one build. Stopping instead leaves those books at
+    ``pending-confirm`` WITH their command files on disk, so the next launchd tick
+    (``queue/commands/`` is a WatchPaths entry) picks up exactly where we left off.
     """
     files = _pending_command_files()
     handled = 0
-    for command_path in files:
+    for index, command_path in enumerate(files):
+        if shutdown.requested():
+            state.append_event(
+                "drain_stopped",
+                signal=shutdown.name(),
+                handled=handled,
+                remaining=len(files) - index,
+                next_file=command_path.name,
+            )
+            break
         try:
             handle_command(command_path)
         except Exception as exc:  # defensive: never let one command kill the loop
@@ -1142,8 +1205,12 @@ def drain_commands() -> int:
             _move_to_bad(command_path, f"handler_exception:{type(exc).__name__}")
         handled += 1
 
-    if handled:
-        # Reflect the new manifest statuses in the showcase the app reads.
+    if handled and not shutdown.requested():
+        # Reflect the new manifest statuses in the showcase the app reads. Skipped
+        # while shutting down: an interrupted build has already refreshed the
+        # showcase on its own error path, and a fresh scan here would start a new
+        # access probe (and possibly a consent window) while the process is on its
+        # way out — the opposite of leaving promptly.
         scan.run_scan()
     return handled
 

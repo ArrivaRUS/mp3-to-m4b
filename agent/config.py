@@ -53,6 +53,21 @@ def events_file() -> Path:
     return state_dir() / "events.jsonl"
 
 
+def events_prev_file() -> Path:
+    """events.jsonl.1 — the ONE rotated generation of the journal (plan v2 Р6).
+
+    The journal is not just diagnostics: the gate invariants are asserted over it
+    («no ``build_started`` without a preceding ``confirm_accepted``»), so rotating
+    it naively would manufacture violations — the ``build_started`` still in the
+    live file, its ``confirm_accepted`` already moved out of sight. Hence exactly
+    one generation, and :func:`agent.state.read_events` reads ``.1`` + current as a
+    single ordered sequence. Rotation happens only at process start, before the
+    first append (single writer + launchd's one-instance-per-label rule = no
+    concurrent appender at that moment).
+    """
+    return state_dir() / "events.jsonl.1"
+
+
 def notified_file() -> Path:
     """notified.json — agent-owned ledger of already-raised confirm/grouping edges.
 
@@ -75,6 +90,23 @@ def presence_file() -> Path:
     this file.
     """
     return state_dir() / "presence.json"
+
+
+def install_receipt_file() -> Path:
+    """install-receipt.json — the installer's proof that an install COMPLETED.
+
+    Written LAST by ``packaging/installer.sh`` (after the plist was published,
+    the job bootstrapped and ``launchctl print`` confirmed the loaded
+    ``ProgramArguments[0]``), so its presence means every earlier step succeeded.
+    It carries the install ``generation`` UUID the agent also receives through
+    ``MP3TOM4B_INSTALL_GENERATION`` — the app compares the two to tell "the plist
+    on disk is right" from "launchd is actually RUNNING that plist" (plan v2, B3).
+
+    It lives in the App Support ROOT, deliberately NOT under ``state/``: the app
+    watches the state directory, and an install must not masquerade as a state
+    update.
+    """
+    return support_root() / "install-receipt.json"
 
 
 def queue_dir() -> Path:

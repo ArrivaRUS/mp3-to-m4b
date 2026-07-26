@@ -18,19 +18,47 @@ each suite's ``X/Y + exit`` line, prints a tidy summary, and exits
 No suite launches another (the nesting is gone), so total time ≈ Σ of each suite
 once — in the same ballpark as one heavy suite, not its product.
 
-Each child re-derives its own throwaway data tree (it sets ``MP3TOM4B_SUPPORT_DIR``
-/ ``MP3TOM4B_WATCH_DIR`` itself); we clear any inherited overrides so a child is
-never pinned to a parent's tree. ffmpeg/ffprobe + Pillow are required by the
-suites themselves — a suite that is missing a tool SKIPS with a non-zero exit,
-which this runner surfaces as a failure (never a silent green).
+ISOLATION IS THE RUNNER'S JOB, NOT THE SUITE'S (.patches/005)
+    Twice in one day a self-check reached the user's real system: once a negative
+    control bootstrapped a live launchd job, once a suite redirected
+    ``MP3TOM4B_WATCH_DIR`` but not ``MP3TOM4B_SUPPORT_DIR`` and journalled into the
+    real Application Support. Both were fixed where they happened — and that is
+    exactly the problem: the next suite starts from scratch and re-arms the mine.
+    The neighbour hit this class THREE times, once overwriting the user's live
+    plist. So isolation stopped being a matter of author discipline:
+
+      · this runner ARMS every redirection for each child — support tree, watch
+        folder, LaunchAgent label, LaunchAgents dir, ``TMPDIR`` — inside one
+        sandbox it owns. A suite that also sets its own (all of today's do) simply
+        wins inside that sandbox; a suite that forgets is covered for free;
+      · a redirection that is missing, or that points OUTSIDE the sandbox, is a
+        LOUD refusal to launch the suite — never a silent fallback to the real
+        path, which is precisely how the first incident looked green while writing
+        to the live system;
+      · a ``blast_radius`` snapshot of the production artifacts is taken before AND
+        after EVERY suite (App Support, ``~/Library/LaunchAgents/*mp3*``, the agent
+        log, the default watch folder, loaded launchd jobs). Any difference fails
+        the run and names the suite that caused it.
+
+    Because ``TMPDIR`` is redirected too, each suite's own ``mkdtemp`` tree lands
+    inside the sandbox: a green suite's tree is deleted with it, a FAILED suite's
+    tree is kept and its path printed (a red run has to stay diagnosable), and an
+    interrupted run cleans up after itself instead of leaving gigabytes behind.
+
+ffmpeg/ffprobe + Pillow are required by the suites themselves — a suite that is
+missing a tool SKIPS with a non-zero exit, which this runner surfaces as a failure
+(never a silent green).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -68,6 +96,26 @@ SUITES: list[tuple[str, str]] = [
     ("agent.selfcheck_queue", "§queue self-check:"),
     ("agent.selfcheck_status", "§status self-check:"),
     ("agent.selfcheck_cancel", "§cancel self-check:"),
+    # M3 — the agent must never leave an orphaned ffmpeg. Sibling of ``cancel``: same
+    # teardown machinery, but triggered by the PROCESS dying rather than by the user.
+    # Kills real builds with a real SIGTERM (through bin/runner.sh, i.e. the shape
+    # ``launchctl bootout`` produces) and asserts by PID that every encoder died, the
+    # temps were swept, no partial .m4b was published and the exit code is 143 —
+    # WITH a negative control that removes the handler and proves the orphan appears.
+    # Also covers the progress deadline on a frozen (SIGSTOP'd) encoder.
+    ("agent.selfcheck_signals", "§signals self-check:"),
+    # M4 — the watch-folder ACCESS GATE. Sibling of ``signals``: both are about the
+    # process surviving something it cannot control. Here it is macOS declining to
+    # answer at all (measured: with an attributable Mach-O runner and no grant,
+    # ``os.listdir`` never returns — the system wants to ask the human and a
+    # background LaunchAgent cannot show the dialog). Green ⇔ the probe always
+    # answers (`blocked` is a verdict, not a hang), a refused/absent folder never
+    # re-arms the library (Р3), «Проверить снова» moves ``folder_access_ts``
+    # unconditionally, a signal mid-drain leaves untouched books alone, and the
+    # phase deadline ends a run that wedges where the probe cannot see. Reproduces
+    # the wedge without TCC (a FIFO with no writer) and carries three negative
+    # controls that prove each guard is what keeps the suite green.
+    ("agent.selfcheck_access", "§access self-check:"),
     # «Собрать заново» (reconvert). Book-targeted command like cancel — grouped here.
     # Runs its own real build → reconvert → REAL rebuild end-to-end; green ⇔ a done
     # book is re-armed to pending-confirm (fresh token + CLEARED idempotency ledger)
@@ -114,23 +162,156 @@ SUITES: list[tuple[str, str]] = [
 _COUNTS = re.compile(r":\s*(\d+)\s*/\s*(\d+)\s+checks passed")
 
 
-def _run_one(mod: str, marker: str, repo_root: Path) -> dict:
-    """Run a single suite once (flat) and return a result record.
+# ── Isolation (.patches/005) ─────────────────────────────────────────────────
+#: Every redirection the runner arms for a child. Each MUST end up pointing inside
+#: the run's sandbox; anything else aborts the run instead of quietly using the
+#: real path. ``TMPDIR`` is in the list on purpose — it is what pulls each suite's
+#: own ``mkdtemp`` tree into the sandbox so it can be cleaned up.
+_REQUIRED_PATH_OVERRIDES = (
+    "MP3TOM4B_SUPPORT_DIR",
+    "MP3TOM4B_WATCH_DIR",
+    "MP3TOM4B_LAUNCHAGENTS_DIR",
+    "TMPDIR",
+)
+#: Not a path — a launchd label. It only has to exist and to differ from the
+#: product's, so that a bootstrap escaping ``NO_LAUNCHCTL`` cannot replace the
+#: user's job (that is incident #1 in .patches/005).
+_REQUIRED_LABEL = "MP3TOM4B_LABEL"
+PROD_LABEL = "com.arrivarus.mp3tom4b.agent"
 
-    The child gets a CLEAN environment w.r.t. our data-tree overrides so it
-    derives its own scratch dirs; everything else (PATH for ffmpeg, etc.) is
-    inherited.
+# The production artifacts a self-check must never create, move or modify.
+PROD_SUPPORT = Path.home() / "Library" / "Application Support" / "mp3-to-m4b"
+PROD_LOG = Path.home() / "Library" / "Logs" / "mp3-to-m4b.log"
+PROD_LAUNCHAGENTS = Path.home() / "Library" / "LaunchAgents"
+PROD_WATCH = Path.home() / "Desktop" / "mp3-to-m4b"
+
+
+def _stamp(path: Path) -> tuple:
+    """(exists, size, mtime_ns) for one path — never reads content."""
+    try:
+        st = path.stat()
+        return (True, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return (False, 0, 0)
+
+
+def _dir_stamp(path: Path) -> tuple:
+    """A directory's own stamp plus its top-level entries (stat only, no reads).
+
+    Top level is enough for the failure modes we have actually seen — a stray tree
+    appearing, a plist landing, a book folder being created or removed — and it
+    keeps the guard cheap enough to run before AND after every suite even when the
+    user's library is large.
     """
+    entries: list[tuple] = []
+    try:
+        for child in sorted(path.iterdir(), key=lambda p: p.name):
+            entries.append((child.name,) + _stamp(child))
+    except OSError:
+        pass
+    return (_stamp(path), tuple(entries))
+
+
+def _loaded_jobs() -> tuple:
+    try:
+        proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    except OSError:
+        return ()
+    return tuple(sorted(
+        ln.split("\t")[-1].strip() for ln in (proc.stdout or "").splitlines()
+        if "mp3tom4b" in ln
+    ))
+
+
+def _prod_snapshot() -> dict:
+    """Everything a suite is forbidden to touch, in one comparable record."""
+    plists = []
+    try:
+        for p in sorted(PROD_LAUNCHAGENTS.glob("*mp3*")):
+            plists.append((p.name,) + _stamp(p))
+    except OSError:
+        pass
+    return {
+        "support": _dir_stamp(PROD_SUPPORT),
+        "watch": _dir_stamp(PROD_WATCH),
+        "log": _stamp(PROD_LOG),
+        "plists": tuple(plists),
+        "jobs": _loaded_jobs(),
+    }
+
+
+def _prod_diff(before: dict, after: dict) -> list[str]:
+    """Human-readable list of what changed in the live system (empty = clean)."""
+    labels = {
+        "support": f"the real App Support tree ({PROD_SUPPORT})",
+        "watch": f"the real watch folder ({PROD_WATCH})",
+        "log": f"the real agent log ({PROD_LOG})",
+        "plists": f"a LaunchAgent plist in {PROD_LAUNCHAGENTS}",
+        "jobs": "the loaded launchd jobs",
+    }
+    return [f"{labels[key]} changed: {before[key]} → {after[key]}"
+            for key in labels if before.get(key) != after.get(key)]
+
+
+def _child_env(sandbox: Path, short: str) -> dict:
+    """The fully-redirected environment one suite runs in.
+
+    Raises instead of returning a half-armed environment: a suite that runs
+    without isolation looks green while writing to the user's system, which is the
+    exact failure this function exists to make impossible.
+    """
+    home = sandbox / short
+    for sub in ("support", "watch", "LaunchAgents", "tmp"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+
     env = dict(os.environ)
-    for k in ("MP3TOM4B_SUPPORT_DIR", "MP3TOM4B_WATCH_DIR", "MP3TOM4B_COVER_WEB",
-              "MP3TOM4B_NUDGE_CMD"):
-        env.pop(k, None)
-    # The build-focused suites create their fixture mp3s instantly (already stable),
-    # so the E10 copy-stability debounce (scan.STABILITY_DEBOUNCE_S) would only add
-    # dead wait per freshly-armed book. Disable it for children → the flat run stays
-    # fast. The reliability suite OWNS the debounce test (E10) and sets its own
-    # non-zero window for just that case, overriding this, so coverage is intact.
+    env.update({
+        "MP3TOM4B_SUPPORT_DIR": str(home / "support"),
+        "MP3TOM4B_WATCH_DIR": str(home / "watch"),
+        "MP3TOM4B_LAUNCHAGENTS_DIR": str(home / "LaunchAgents"),
+        # A label that cannot collide with the product's, so even a bootstrap that
+        # escapes NO_LAUNCHCTL cannot replace the user's job.
+        "MP3TOM4B_LABEL": f"com.arrivarus.mp3tom4b.selfcheck-{os.getpid()}-{short}",
+        "TMPDIR": str(home / "tmp"),
+    })
+    # Suite-local conveniences (not isolation): offline cover chain, no copy-
+    # stability wait for fixtures that are already stable. The reliability suite
+    # owns the debounce test and overrides this for that one case.
+    env.pop("MP3TOM4B_NUDGE_CMD", None)
+    env["MP3TOM4B_COVER_WEB"] = "0"
     env["MP3TOM4B_STABILITY_DEBOUNCE_S"] = "0"
+
+    missing = [k for k in _REQUIRED_PATH_OVERRIDES + (_REQUIRED_LABEL,)
+               if not env.get(k)]
+    if missing:
+        raise RuntimeError(
+            f"isolation not armed for {short}: {', '.join(missing)} unset — "
+            "refusing to run a suite against the live system (.patches/005)"
+        )
+    root = str(sandbox.resolve())
+    outside = [k for k in _REQUIRED_PATH_OVERRIDES
+               if not str(Path(env[k]).resolve()).startswith(root)]
+    if outside:
+        raise RuntimeError(
+            f"isolation not armed for {short}: {', '.join(outside)} points outside "
+            f"the sandbox {root} — refusing to run (.patches/005)"
+        )
+    if env[_REQUIRED_LABEL] == PROD_LABEL:
+        raise RuntimeError(
+            f"isolation not armed for {short}: MP3TOM4B_LABEL is the PRODUCTION "
+            f"label {PROD_LABEL} — refusing to run (.patches/005)"
+        )
+    return env
+
+
+def _run_one(mod: str, marker: str, repo_root: Path, sandbox: Path) -> dict:
+    """Run a single suite once (flat), fully isolated, and return a result record.
+
+    Everything the suite could write through is redirected into ``sandbox`` by
+    :func:`_child_env`; everything else (PATH for ffmpeg, etc.) is inherited.
+    """
+    short = mod.split(".")[-1].replace("selfcheck_", "")
+    env = _child_env(sandbox, short)
 
     t0 = time.monotonic()
     proc = subprocess.run(
@@ -159,36 +340,95 @@ def _run_one(mod: str, marker: str, repo_root: Path) -> dict:
     }
 
 
+def _sweep(sandbox: Path, keep: list[str]) -> None:
+    """Delete the sandbox, keeping only the named suites' trees (failed ones).
+
+    A green run leaves nothing behind — that is what stops the "272 abandoned
+    temp dirs / 5 GB" drift. A red one keeps exactly the trees needed to diagnose
+    it, and prints where they are.
+    """
+    try:
+        if not keep:
+            shutil.rmtree(sandbox, ignore_errors=True)
+            return
+        for child in sandbox.iterdir():
+            if child.name not in keep:
+                shutil.rmtree(child, ignore_errors=True)
+    except OSError:
+        pass
+
+
 def run() -> int:
     repo_root = Path(__file__).resolve().parent.parent
+    sandbox = Path(tempfile.mkdtemp(prefix="mp3tom4b-selfcheck-all-"))
+
+    # An interrupted run must not leave its tree behind either (the old behaviour
+    # is what accumulated gigabytes of abandoned fixtures). SIGTERM gets the same
+    # treatment as Ctrl-C; SIGKILL cannot be caught, and nothing can be done there.
+    def _bail(signum, frame):  # noqa: ANN001 - stdlib handler shape
+        print(f"\n  interrupted ({signal.Signals(signum).name}) — "
+              f"cleaning up {sandbox}", flush=True)
+        shutil.rmtree(sandbox, ignore_errors=True)
+        os._exit(130)
+
+    for signame in ("SIGTERM", "SIGHUP"):
+        signum = getattr(signal, signame, None)
+        if signum is not None:
+            try:
+                signal.signal(signum, _bail)
+            except (OSError, ValueError, RuntimeError):
+                pass
 
     print("§all self-check — FLAT runner (each suite once, no nesting)")
     print(f"  python:   {sys.executable}")
     print(f"  repo:     {repo_root}")
+    print(f"  sandbox:  {sandbox}  (every suite runs redirected INTO this)")
     print(f"  suites:   {len(SUITES)} → "
           + " → ".join(m.split('.')[-1].replace('selfcheck_', '') for m, _ in SUITES))
     print()
 
     results: list[dict] = []
     t_all = time.monotonic()
-    for mod, marker in SUITES:
-        short = mod.split(".")[-1].replace("selfcheck_", "")
-        print(f"▶ {short} …", flush=True)
-        res = _run_one(mod, marker, repo_root)
-        results.append(res)
-        mark = "PASS" if res["ok"] else "FAIL"
-        xy = (f"{res['passed']}/{res['total']}"
-              if res["passed"] is not None else "?/?")
-        print(f"  [{mark}] {short:<11} {xy:>7}  exit={res['rc']}  "
-              f"{res['elapsed']:6.1f}s")
-        if not res["ok"]:
-            # Surface the failing suite's own summary line + a stderr tail so a
-            # red run is diagnosable straight from this runner's output.
-            print(f"        summary: {res['summary']}")
-            tail = (res["stderr"] or "").strip().splitlines()[-5:]
-            for ln in tail:
-                print(f"        stderr| {ln}")
-        print()
+    baseline = _prod_snapshot()
+    try:
+        for mod, marker in SUITES:
+            short = mod.split(".")[-1].replace("selfcheck_", "")
+            print(f"▶ {short} …", flush=True)
+            before = _prod_snapshot()
+            try:
+                res = _run_one(mod, marker, repo_root, sandbox)
+            except RuntimeError as exc:
+                # Isolation could not be armed. That is a RED suite, loudly — never
+                # a quiet fallback to the real paths (.patches/005 rule 3).
+                res = {"mod": mod, "rc": None, "passed": None, "total": None,
+                       "summary": f"ISOLATION NOT ARMED — {exc}", "elapsed": 0.0,
+                       "ok": False, "stdout": "", "stderr": str(exc)}
+            # blast_radius, per suite: a suite that touched the live system is RED
+            # even if all of its own checks passed (.patches/005).
+            damage = _prod_diff(before, _prod_snapshot())
+            res["damage"] = damage
+            if damage:
+                res["ok"] = False
+            results.append(res)
+            mark = "PASS" if res["ok"] else "FAIL"
+            xy = (f"{res['passed']}/{res['total']}"
+                  if res["passed"] is not None else "?/?")
+            print(f"  [{mark}] {short:<11} {xy:>7}  exit={res['rc']}  "
+                  f"{res['elapsed']:6.1f}s")
+            for line in damage:
+                print(f"        BLAST RADIUS — {short} touched the live system: {line}")
+            if not res["ok"]:
+                # Surface the failing suite's own summary line + a stderr tail so a
+                # red run is diagnosable straight from this runner's output.
+                print(f"        summary: {res['summary']}")
+                tail = (res["stderr"] or "").strip().splitlines()[-5:]
+                for ln in tail:
+                    print(f"        stderr| {ln}")
+            print()
+    except KeyboardInterrupt:
+        print(f"\n  interrupted — cleaning up {sandbox}", flush=True)
+        shutil.rmtree(sandbox, ignore_errors=True)
+        return 130
 
     total_elapsed = time.monotonic() - t_all
 
@@ -207,8 +447,20 @@ def run() -> int:
     if failed:
         print("  FAILED suites: " + "; ".join(failed))
 
-    # Exit 0 ⇔ EVERY suite is green. Flat, honest, no nested re-runs.
-    return 0 if all(r["ok"] for r in results) else 1
+    # blast_radius over the WHOLE run, in case something drifted between suites.
+    overall = _prod_diff(baseline, _prod_snapshot())
+    if overall:
+        for line in overall:
+            print(f"  BLAST RADIUS (whole run): {line}")
+    else:
+        print("  blast_radius: the live system is byte-identical to before the run")
+
+    _sweep(sandbox, keep=failed)
+    if failed:
+        print(f"  fixtures of the failed suites kept at {sandbox}")
+
+    # Exit 0 ⇔ EVERY suite is green AND nothing reached the live system.
+    return 0 if (all(r["ok"] for r in results) and not overall) else 1
 
 
 if __name__ == "__main__":

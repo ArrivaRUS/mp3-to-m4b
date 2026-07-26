@@ -356,6 +356,18 @@ def _build_one_part(
     Written to a hidden temp sibling and ``os.replace``-d onto ``final_path`` on
     success; ANY failure sweeps the temp + the FFMETADATA scratch so no
     half-written part survives. Raises :class:`build_m4b.BuildError` on failure.
+
+    The ffmpeg call goes through :func:`build_m4b._run_ffmpeg` (M3) rather than a
+    blocking ``subprocess.run``: splitting also spawns a real ffmpeg that writes
+    INTO the watched folder, so it needs the same guarantees as the encode — a
+    TERM/INT/HUP kills and reaps the child before we exit (no orphan on
+    ``launchctl bootout``), and a frozen ffmpeg trips the progress deadline instead
+    of holding the single launchd job for an hour. ``-progress pipe:1 -nostats`` is
+    added purely as that liveness signal (no progress bar for parts — a stream-copy
+    is near-instant). The failure reasons are unchanged (``split_part_failed`` /
+    ``split_timeout``), and split stays deliberately NOT cancellable: a cancel
+    command is owned by the build phase, and a :class:`build_m4b.BuildCancelled`
+    escaping here would bypass the dispatcher's split error handling.
     """
     out_dir = final_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -375,6 +387,8 @@ def _build_one_part(
 
     argv = [
         _ffmpeg_bin(), "-hide_banner", "-loglevel", "error", "-y",
+        # Liveness for the M3 progress deadline (no bar — see the docstring).
+        "-progress", "pipe:1", "-nostats",
         # -ss/-to BEFORE -i would be input-seek (faster) but can land mid-packet
         # for stream-copy; placing them as OUTPUT options (after the inputs) keeps
         # the cut frame-accurate on a copy. The cover/metadata inputs follow.
@@ -396,24 +410,18 @@ def _build_one_part(
     ]
 
     try:
-        try:
-            proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=SPLIT_TIMEOUT_S
-            )
-        except FileNotFoundError:
-            raise build_m4b.BuildError("ffmpeg_missing", "ffmpeg not found on PATH")
-        except subprocess.TimeoutExpired:
-            raise build_m4b.BuildError(
-                "split_timeout", f"part exceeded {SPLIT_TIMEOUT_S}s"
-            )
-        except OSError as exc:
-            raise build_m4b.BuildError("ffmpeg_oserror", repr(exc))
-
-        if proc.returncode != 0:
-            tail = (proc.stderr or "").strip().splitlines()[-3:]
-            raise build_m4b.BuildError(
-                "split_part_failed", " | ".join(tail) or f"exit {proc.returncode}"
-            )
+        # Interruptible + wedge-guarded (M3). ``_run_ffmpeg`` already maps a missing
+        # binary → ``ffmpeg_missing`` and an OS error → ``ffmpeg_oserror``, kills and
+        # reaps its child on a signal/stall, and raises ``BuildInterrupted``
+        # (reason ``interrupted``) — which the dispatcher's split error handler
+        # catches like any other BuildError.
+        build_m4b._run_ffmpeg(
+            argv,
+            reason_on_fail="split_part_failed",
+            timeout_s=SPLIT_TIMEOUT_S,
+            reason_on_timeout="split_timeout",
+            output_path=tmp_out,
+        )
         if not tmp_out.exists() or tmp_out.stat().st_size == 0:
             raise build_m4b.BuildError("split_empty_part", "ffmpeg produced no part")
 

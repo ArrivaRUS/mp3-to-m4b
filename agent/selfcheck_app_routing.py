@@ -38,13 +38,20 @@ MARKER = "§app-routing self-check:"
 
 REPO = Path(__file__).resolve().parent.parent
 
-# The Foundation-only app sources the check needs (StateModel pulls the status
-# markers in via loadState). No AppKit/SwiftUI here — this stays a value-level unit.
+# The app sources the check needs (StateModel pulls the status markers in via
+# loadState). Mostly Foundation-only value code; `Tokens.swift` +
+# `FolderAccessCard.swift` import SwiftUI, which compiles and links fine in a
+# command-line binary as long as nothing instantiates an NSApplication — and it is
+# worth the two extra seconds: it means the M6 assertions run against the EXACT
+# strings and rules the shipped card renders, not a parallel copy of them that can
+# drift away from what the user sees.
 SOURCES = [
     REPO / "app" / "StateModel.swift",
     REPO / "app" / "WindowGeometry.swift",
     REPO / "app" / "EngineClient.swift",
     REPO / "app" / "EngineClient+Status.swift",
+    REPO / "app" / "Tokens.swift",
+    REPO / "app" / "FolderAccessCard.swift",
     REPO / "app" / "selfcheck_routing.swift",
 ]
 
