@@ -152,6 +152,9 @@ def _confirm_build_cmd(manifest: dict) -> dict:
         "book_id": bid,
         "source_rev": rev,
         "confirm_token": manifest["confirm_token"],
+        # D17: the app echoes the build_token it saw, proving the command was
+        # minted from a COMPLETE manifest and not from the early-nudge skeleton.
+        "build_token": manifest.get("build_token"),
         "idempotency_key": f"{bid}:{rev[:16]}",
         "params": dict(manifest.get("params", {})),
         "ts": time.time(),
@@ -266,6 +269,9 @@ def run() -> int:
         "status": "pending-confirm",
         "source_rev": "rev-err",
         "confirm_token": "tok-err",
+        # D17: complete-looking manifest (the fixture is about a corrupt SOURCE).
+        "phase": scan.MANIFEST_PHASE_READY,
+        "build_token": "btok-err",
         "title": "Книга",
         "author": "Битая",
         "chapters": [

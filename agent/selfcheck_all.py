@@ -142,6 +142,16 @@ SUITES: list[tuple[str, str]] = [
     # out→in re-arms), and the v1→v2 migration (legacy revs/keys upgraded
     # silently — 0 raises at login / after an agent update).
     ("agent.selfcheck_nudge", "§nudge self-check:"),
+    # D17 «ранний нудж»: окно за ~0.8 с вместо ~12 с. Публикация книги разрезана на
+    # фазы (skeleton → chapters → ready), и эта сьюта охраняет девять инвариантов
+    # синтез-плана (arch/early-nudge-synthesis.md §3) на ПРОДАКШН-пути — от TOCTOU
+    # («команда, рождённая по скелету, отвергается и после финализации того же
+    # source_rev») до «сетевой сбой не рисует ложную карточку доступа к папке», с
+    # НЕГАТИВНЫМ контролем на последнее: тот же тик с веб-ногой, возвращённой внутрь
+    # _finish_manifest, обязан упасть в exit 75 + folder_access=blocked. Сразу после
+    # nudge: та же публикация, тот же леджер, только с другой стороны — «один нудж
+    # на публикацию» здесь держится равенством ключа у скелета и у ready.
+    ("agent.selfcheck_early", "§early self-check:"),
     # The P1 split engine (plan_parts + split + the dispatcher integration). Runs
     # its own real multi-chapter build→split end-to-end (no nesting); green ⇔ every
     # part is valid (no duplicate chapters, stream-copy, cover, «Часть N из M») and

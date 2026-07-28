@@ -755,6 +755,89 @@ struct BookParams: Codable, Equatable {
     }
 }
 
+// MARK: - Manifest phase (D17 — «ранний нудж»)
+
+/// How far the agent has read a book, as a value.
+///
+/// The agent publishes the book TWICE per arrival (agent/scan.py): a `skeleton` at
+/// ~0.8 s — everything the `stat` walk already paid for (chapter names from FILE
+/// NAMES, author/title from the folder, file count, size) — and then the finished
+/// manifest after ffprobe + the cover chain. The window therefore opens on a BOOK,
+/// not on a spinner, and the phase is what lets it say so honestly.
+///
+/// `chapters` is the middle write: real ID3 names and durations are in, the cover
+/// is not. `ready` is the final atomic write — and the ONLY one that carries a
+/// `build_token`.
+///
+/// UNKNOWN / ABSENT → `.done`. Absent is the pre-D17 compat rule (a manifest
+/// written by yesterday's agent is complete by definition — invariant I8), and an
+/// unrecognized value is folded into the same bucket ON PURPOSE: the phase drives
+/// nothing but WORDING here, while everything that matters (may we build? are we
+/// still waiting?) is decided by `build_token`. So a newer agent inventing a phase
+/// this build has never heard of degrades to «no extra explanation», never to a
+/// wrong gate and never to a note that waits forever.
+enum ManifestPhase: String, Equatable {
+    case skeleton
+    case chapters
+    case ready
+    case done
+
+    init(raw: String?) {
+        self = ManifestPhase(rawValue: raw ?? "") ?? .done
+    }
+}
+
+/// WHAT THE HUMAN IS TOLD while the rest of the book is still arriving.
+///
+/// Derived from ONE fact — the presence of `build_token` — plus the phase for
+/// wording only. That is deliberate: the note and the «Собрать» button then read
+/// the same bit, so the window can never say «готово» over a dead button, nor
+/// «ещё читаю» over a live one.
+///
+/// `.ready` also covers the offline case, and that is the honest answer rather
+/// than a gap: web covers left the critical path entirely (D17 §1), so a book
+/// reaches `ready` with no network at all. When the note disappears, there is
+/// nothing left to wait for — full stop.
+enum ConfirmPreparation: Equatable {
+    /// `build_token` present: the manifest is complete, nothing is pending.
+    case ready
+    /// Skeleton: names come from file names, durations are unknown.
+    case readingTags
+    /// Chapters are real; the cover chain has not landed yet.
+    case resolvingCover
+    /// Not ready, phase unrecognized (a newer agent) — say the true, generic thing.
+    case preparing
+
+    static func forManifest(_ m: BookManifest) -> ConfirmPreparation {
+        guard !m.isBuildReady else { return .ready }
+        switch m.phaseValue {
+        case .skeleton: return .readingTags
+        case .chapters: return .resolvingCover
+        case .ready, .done: return .preparing
+        }
+    }
+
+    /// The one-line note under the header, or nil when there is nothing to say.
+    /// Wording rule: name what is happening and that it is SHORT — never «ошибка»,
+    /// never a spinner with no noun. The book is already on screen; this only
+    /// explains why two fields are still moving.
+    var note: String? {
+        switch self {
+        case .ready:          return nil
+        case .readingTags:    return "Читаю теги — названия глав и длительность появятся через пару секунд"
+        case .resolvingCover: return "Подбираю обложку — ещё пара секунд"
+        case .preparing:      return "Дочитываю книгу — ещё пара секунд"
+        }
+    }
+
+    /// Why «Собрать» is inert right now (hover text — a dimmed control must always
+    /// be able to explain itself; lesson 005).
+    var buildHint: String? {
+        guard self != .ready else { return nil }
+        return "Книга ещё читается. «Собрать» включится, когда агент дочитает её — обычно пара секунд."
+    }
+}
+
 /// The full per-book manifest. The app reads it to render the confirm window; the
 /// agent owns/writes it. Extra keys (`ts`, `processed_keys`) are ignored.
 ///
@@ -771,6 +854,15 @@ struct BookManifest: Decodable, Equatable {
     let status: String
     let sourceRev: String
     let confirmToken: String
+    /// How far the agent has read this book (D17): `skeleton` → `chapters` →
+    /// `ready` → `done`. ABSENT = `done` — pre-D17 manifests are complete by
+    /// definition, so there is no migration. See `ManifestPhase`.
+    let phase: String
+    /// The agent's proof that a COMPLETE manifest existed when this was read
+    /// (D17). It is created ONLY in the final atomic write (`agent/scan.py
+    /// _finish_manifest`) and does not exist at all in the earlier phases — see
+    /// `isBuildReady` for why the gate reads THIS and never the phase.
+    let buildToken: String
     let title: String
     let author: String
     let chapters: [ChapterEntry]
@@ -791,6 +883,11 @@ struct BookManifest: Decodable, Equatable {
     /// Id of the default-selected option (cover.py `cover_selected`): embedded when
     /// present, else the first generated. The picker seeds its selection from this.
     let coverSelected: String?
+    /// Is the WEB cover search still running (M-B: `cover_web` = `pending`/`done`)?
+    /// Web enrichment happens AFTER the drain, off the critical path, so a book can
+    /// sit at `ready` — buildable, «Собрать» lit — while more cover tiles are still
+    /// on their way. See `isCoverWebPending`.
+    let coverWeb: String
     let params: BookParams
     /// Coarse build progress the agent records (dispatcher.py): 0.0 at start, 1.0
     /// at done. NOTE: the agent does NOT emit per-chapter progress — a build is one
@@ -809,6 +906,8 @@ struct BookManifest: Decodable, Equatable {
         case status
         case sourceRev = "source_rev"
         case confirmToken = "confirm_token"
+        case phase
+        case buildToken = "build_token"
         case title
         case author
         case chapters
@@ -818,6 +917,7 @@ struct BookManifest: Decodable, Equatable {
         case coverPreview = "cover_preview"
         case coverOptions = "cover_options"
         case coverSelected = "cover_selected"
+        case coverWeb = "cover_web"
         case params
         case progress
         case error
@@ -845,6 +945,48 @@ struct BookManifest: Decodable, Equatable {
         totalDurationMS > 0 || chapters.contains { $0.durationMS != nil }
     }
 
+    /// The phase as a value (absent / unrecognized → `.done`, see `ManifestPhase`).
+    var phaseValue: ManifestPhase { ManifestPhase(raw: phase) }
+
+    /// MAY THIS BOOK BE BUILT — and the ONLY question «Собрать» is allowed to ask.
+    ///
+    /// It reads the PRESENCE of `build_token`, deliberately NOT `phase == ready`,
+    /// and the difference is the whole point (D17, Архитектор #2). A phase check
+    /// asks «is the book complete RIGHT NOW»; the build gate must ask «did the
+    /// SENDER ever see a complete book». Those come apart exactly once, and it is
+    /// the case that loses a build: the app writes a command off a SKELETON → the
+    /// command waits in queue/commands/ until the drain → meanwhile the agent
+    /// finishes the same revision and writes the full manifest with the SAME
+    /// source_rev and confirm_token → a validator that looks at the phase now sees
+    /// `ready` and ACCEPTS a command that was born on an empty chapter list.
+    ///
+    /// A skeleton has no `build_token` physically, so a command minted from one
+    /// carries none (or an empty one) and stays invalid FOREVER — including after
+    /// finalization. The app therefore echoes this token verbatim in
+    /// `confirm-build` (EngineClient); the agent refuses anything else
+    /// (`manifest_not_ready` / `build_token_mismatch`).
+    ///
+    /// Monotone within a revision by construction: the agent mints the token once,
+    /// in the final atomic write, and every later write of the SAME `source_rev`
+    /// (resume, params/cover patch, re-scan short-circuit) carries it forward. So
+    /// «Собрать» makes exactly ONE disabled → enabled transition per publication —
+    /// it cannot blink. A NEW `source_rev` is a different book revision: it starts
+    /// at a skeleton again and the button honestly goes back to waiting.
+    var isBuildReady: Bool { !buildToken.isEmpty }
+
+    /// The web cover search has not finished (M-B `cover_web == "pending"`).
+    ///
+    /// ⚠️ THIS MUST NEVER REACH A BUILD DECISION. `isBuildReady` above does not
+    /// look at it, and neither does `ConfirmPreparation` — both read `build_token`
+    /// only. Taking web enrichment OFF the build's critical path is the whole point
+    /// of D17 (measured: live network vs. dead network = 0.022 s difference at the
+    /// gate); wiring this flag into the gate would hand that back. It is allowed to
+    /// drive exactly ONE thing: a line of text saying tiles may still appear.
+    ///
+    /// ABSENT ⇒ done. An older manifest never ran a staged web pass, and a book
+    /// that is not going to look for anything must not claim it is looking.
+    var isCoverWebPending: Bool { coverWeb == "pending" }
+
     init(bookID: String, srcDir: String, status: String, sourceRev: String,
          confirmToken: String, title: String, author: String,
          chapters: [ChapterEntry], totalDurationMS: Int,
@@ -852,12 +994,17 @@ struct BookManifest: Decodable, Equatable {
          coverPreview: String?, coverOptions: [CoverOption] = [],
          coverSelected: String? = nil, params: BookParams,
          progress: Double = 0, error: BuildError? = nil,
-         result: BookResult? = nil) {
+         result: BookResult? = nil,
+         phase: String = ManifestPhase.done.rawValue,
+         buildToken: String = "",
+         coverWeb: String = "done") {
         self.bookID = bookID
         self.srcDir = srcDir
         self.status = status
         self.sourceRev = sourceRev
         self.confirmToken = confirmToken
+        self.phase = phase
+        self.buildToken = buildToken
         self.title = title
         self.author = author
         self.chapters = chapters
@@ -867,6 +1014,7 @@ struct BookManifest: Decodable, Equatable {
         self.coverPreview = coverPreview
         self.coverOptions = coverOptions
         self.coverSelected = coverSelected
+        self.coverWeb = coverWeb
         self.params = params
         self.progress = progress
         self.error = error
@@ -880,6 +1028,14 @@ struct BookManifest: Decodable, Equatable {
         status       = (try? c.decode(String.self, forKey: .status)) ?? ""
         sourceRev    = (try? c.decode(String.self, forKey: .sourceRev)) ?? ""
         confirmToken = (try? c.decode(String.self, forKey: .confirmToken)) ?? ""
+        // Absent / null / empty `phase` ⇒ `done` — a pre-D17 manifest was written
+        // complete or not at all, so «no phase» is the same fact as «finished».
+        // That one default is the entire backward-compat story (invariant I8).
+        let rawPhase = (try? c.decodeIfPresent(String.self, forKey: .phase)) ?? nil
+        phase        = (rawPhase?.isEmpty == false) ? rawPhase! : ManifestPhase.done.rawValue
+        // Absent ⇒ "" ⇒ NOT buildable. Fail-closed on purpose: a manifest we could
+        // not read the token from must never light «Собрать» up.
+        buildToken   = ((try? c.decodeIfPresent(String.self, forKey: .buildToken)) ?? nil) ?? ""
         title        = (try? c.decode(String.self, forKey: .title)) ?? ""
         author       = (try? c.decode(String.self, forKey: .author)) ?? ""
         chapters     = (try? c.decode([ChapterEntry].self, forKey: .chapters)) ?? []
@@ -892,10 +1048,291 @@ struct BookManifest: Decodable, Equatable {
         let rawOptions = (try? c.decode([CoverOption].self, forKey: .coverOptions)) ?? []
         coverOptions = rawOptions.filter { !$0.optID.isEmpty }
         coverSelected = try? c.decodeIfPresent(String.self, forKey: .coverSelected)
+        // Absent / null / anything unrecognized ⇒ "done": only an explicit
+        // `pending` makes the window claim a search is running.
+        coverWeb = ((try? c.decodeIfPresent(String.self, forKey: .coverWeb)) ?? nil) ?? "done"
         params       = (try? c.decode(BookParams.self, forKey: .params)) ?? .defaults
         progress     = (try? c.decodeIfPresent(Double.self, forKey: .progress)) ?? 0
         error        = try? c.decodeIfPresent(BuildError.self, forKey: .error)
         result       = try? c.decodeIfPresent(BookResult.self, forKey: .result)
+    }
+}
+
+// MARK: - Confirm-window draft (the human's fields) + the MERGE rule
+
+/// The confirm footer's "Применить параметры ко всем (N)" (US-3.7 / spec §3):
+/// the build params the user approved once, plus the ids of the books that were
+/// awaiting confirmation at that moment. Purely APP-SIDE — the protocol has no
+/// `apply-to-all` command, so this only PRE-FILLS the confirm window of those
+/// books; each one still rides to the agent in its own `confirm-build` after a
+/// human "ок" (invariant I2). The COVER is deliberately not part of the preset —
+/// it stays per-book (US-3.7 AC: «обложку всё равно подтверждаю по каждой»).
+///
+/// Lives in the model layer (not next to the view) so `ConfirmMerge` — which
+/// consumes it — stays a pure, unit-checkable value rule.
+struct ParamsPreset: Equatable {
+    let params: BookParams
+    /// Snapshot of the `pending-confirm` ids at the moment of the click. A book
+    /// recognized LATER was not "ожидающей" then, so it keeps its own defaults
+    /// instead of silently inheriting a stale preset.
+    let bookIDs: Set<String>
+
+    func applies(to bookID: String) -> Bool { bookIDs.contains(bookID) }
+}
+
+/// Which fields the HUMAN has touched in this window. Everything not in the set is
+/// «pristine» = still the agent's value, and therefore still free to be updated
+/// from a newer manifest.
+struct TouchedFields: OptionSet, Equatable {
+    let rawValue: Int
+    init(rawValue: Int) { self.rawValue = rawValue }
+
+    static let title  = TouchedFields(rawValue: 1 << 0)
+    static let author = TouchedFields(rawValue: 1 << 1)
+    /// One flag for the whole build-params group (bitrate / channels / samplerate /
+    /// split / threshold / mode): they are seeded from ONE source (preset или
+    /// manifest) and the human edits them as one decision.
+    static let params = TouchedFields(rawValue: 1 << 2)
+    static let cover  = TouchedFields(rawValue: 1 << 3)
+}
+
+/// Everything the confirm window OWNS about a book: the editable fields, which of
+/// them the human has touched, and the manifest revision they were seeded from.
+///
+/// One `@State` of this type replaces the eight separate ones the window used to
+/// carry. That is not tidiness — it is the fix. SwiftUI keeps `@State` alive across
+/// a body update, so with the D17 two-phase publication the SAME view instance is
+/// handed a NEWER manifest for the same `book_id`, and there is no mechanism that
+/// re-seeds the old fields: the skeleton's file-name title would survive the real
+/// ID3 title forever (both architects flagged this independently as the app's main
+/// hazard). Merging in one place, by one rule, is what makes that impossible.
+struct ConfirmDraft: Equatable {
+    /// The book this draft belongs to. A DIFFERENT book is a different
+    /// presentation, not an update — that is the only full reset (see `merge`).
+    let bookID: String
+    /// The revision the pristine fields were last seeded from. It MOVES with the
+    /// manifest (the same book with new files is still the same book, and the
+    /// human's typing survives it) — it is carried so the draft can always say
+    /// which revision its untouched values came from.
+    var sourceRev: String
+
+    var title: String
+    var author: String
+    var params: BookParams
+    /// Id of the selected cover option (manifest option, or a client-only `custom`
+    /// one the user picked with «Заменить»). nil = nothing selectable yet.
+    var coverSelectedID: String?
+
+    var touched: TouchedFields
+}
+
+/// The merge rule: OLD DRAFT × NEW MANIFEST → NEW DRAFT.
+///
+/// A pure function of its arguments — no `@State`, no view, no file access — so it
+/// can be exhaustively unit-checked (the whole pristine/dirty matrix) rather than
+/// eyeballed in a running window. This is the only place in the app allowed to
+/// decide whose value wins; the view assigns its result wholesale
+/// (`draft = ConfirmMerge.merge(...)`) and never patches fields one by one.
+///
+/// THE MATRIX (per field):
+///
+/// | поле      | pristine (человек не трогал)                        | dirty (трогал)                       |
+/// |-----------|-----------------------------------------------------|--------------------------------------|
+/// | title     | manifest.title, пусто → `fallbackTitle` (строка очереди) | правка человека                  |
+/// | author    | manifest.author                                     | правка человека                      |
+/// | params    | preset (если покрывает книгу) иначе manifest.params, порог зажат в 250…700 | правка человека |
+/// | cover     | manifest.coverSelected ?? первый вариант             | выбор человека, ЕСЛИ id ещё существует |
+///
+/// Three rules that are not in the table because they are about identity, not
+/// fields:
+///
+///  1. **Только смена `book_id` выбрасывает черновик целиком** (`seed`). A
+///     different book is a different presentation; the same book is the same book.
+///
+///     A changed `source_rev` — the human added a file to the folder while the
+///     window was open — deliberately does NOT reset anything: it runs through the
+///     ordinary matrix, so the title he is halfway through typing survives and only
+///     the untouched fields are re-seeded from the new manifest (решение человека,
+///     2026-07-28). Text a person typed must not disappear because of a background
+///     event; «формально это другая ревизия» does not buy back the vanished input,
+///     and if the title really no longer fits, he can see that and fix it himself.
+///     `sourceRev` is carried forward so the draft always records which revision
+///     its pristine values came from.
+///  2. **Выбор обложки не имеет права зависнуть.** A touched cover id survives —
+///     unless it no longer exists among the manifest's options plus the client-only
+///     ones. That happens for real: the skeleton has NO options, so anything picked
+///     before `ready`… cannot exist; and a NEW REVISION regenerates the whole
+///     option list (which is exactly why rule 1 cannot simply keep everything).
+///     A dangling selection would silently send a `cover_id` the agent cannot
+///     resolve, so the pick falls back to the agent's default AND the `.cover` flag
+///     is CLEARED — otherwise the field would stay frozen at a value nobody chose.
+///  3. **То же для параметров: значение вне диапазона не зависает.** The threshold
+///     is clamped into `thresholdRangeMB` on EVERY merge, not only at seeding — a
+///     touched value can now outlive the manifest that produced it, so «человек
+///     тронул» must not become a way to preserve a number the slider cannot show
+///     and the human never chose. (The preset itself cannot go stale here: it is
+///     keyed on `book_id`, which by rule 1 has not changed.)
+enum ConfirmMerge {
+
+    /// Slider bounds for `split_threshold_mb` (spec §6 / D6 default 300). Seeding
+    /// clamps into them so the draft always holds a value the control can render —
+    /// and, because the draft is what gets sent, a value the agent can act on.
+    static let thresholdRangeMB: ClosedRange<Int> = 250...700
+
+    /// Build params as they should look for a book nobody has edited yet: the
+    /// session preset when it covers THIS book (US-3.7), otherwise the manifest's
+    /// own params.
+    static func seedParams(manifest: BookManifest, preset: ParamsPreset?) -> BookParams {
+        var p = preset.flatMap { $0.applies(to: manifest.bookID) ? $0.params : nil }
+            ?? manifest.params
+        p.splitThresholdMB = min(thresholdRangeMB.upperBound,
+                                 max(thresholdRangeMB.lowerBound, p.splitThresholdMB))
+        return p
+    }
+
+    /// The cover the agent would pick: its own default, else the first option.
+    /// nil while the book has no options at all (the skeleton phase).
+    static func seedCoverID(manifest: BookManifest) -> String? {
+        manifest.coverSelected ?? manifest.coverOptions.first?.optID
+    }
+
+    /// A brand-new draft for `manifest` — nothing touched, every field the agent's.
+    ///
+    /// `fallbackTitle` is the showcase row's title, used only when the manifest has
+    /// none, so the field is never blank-by-bug.
+    static func seed(manifest: BookManifest,
+                     fallbackTitle: String = "",
+                     preset: ParamsPreset? = nil) -> ConfirmDraft {
+        ConfirmDraft(
+            bookID: manifest.bookID,
+            sourceRev: manifest.sourceRev,
+            title: manifest.title.isEmpty ? fallbackTitle : manifest.title,
+            author: manifest.author,
+            params: seedParams(manifest: manifest, preset: preset),
+            coverSelectedID: seedCoverID(manifest: manifest),
+            touched: [])
+    }
+
+    /// Fold `manifest` into `draft` per the matrix above.
+    ///
+    /// - Parameters:
+    ///   - draft: what the window holds right now.
+    ///   - manifest: the manifest as it is on disk NOW (possibly a later phase).
+    ///   - fallbackTitle: showcase title, used only when the manifest has none.
+    ///   - preset: the «ко всем» session preset, if any.
+    ///   - extraCoverIDs: ids of client-only options (a «Заменить» file) — they are
+    ///     not in the manifest, so without them a custom pick would read as dangling.
+    static func merge(_ draft: ConfirmDraft,
+                      with manifest: BookManifest,
+                      fallbackTitle: String = "",
+                      preset: ParamsPreset? = nil,
+                      extraCoverIDs: Set<String> = []) -> ConfirmDraft {
+        // Identity rule 1: only a DIFFERENT BOOK is a new presentation. A new
+        // revision of the same book goes through the ordinary matrix below.
+        guard draft.bookID == manifest.bookID else {
+            return seed(manifest: manifest, fallbackTitle: fallbackTitle, preset: preset)
+        }
+
+        var out = draft
+        // The pristine fields now come from THIS revision — record it.
+        out.sourceRev = manifest.sourceRev
+        if !draft.touched.contains(.title) {
+            out.title = manifest.title.isEmpty ? fallbackTitle : manifest.title
+        }
+        if !draft.touched.contains(.author) {
+            out.author = manifest.author
+        }
+        if !draft.touched.contains(.params) {
+            out.params = seedParams(manifest: manifest, preset: preset)
+        }
+        // Identity rule 3: clamp on EVERY merge, touched or not.
+        out.params.splitThresholdMB = min(thresholdRangeMB.upperBound,
+                                          max(thresholdRangeMB.lowerBound,
+                                              out.params.splitThresholdMB))
+
+        // Identity rule 2: the cover pick must never dangle.
+        let known = Set(manifest.coverOptions.map { $0.optID }).union(extraCoverIDs)
+        if draft.touched.contains(.cover),
+           let picked = draft.coverSelectedID, known.contains(picked) {
+            out.coverSelectedID = picked          // человек выбрал, вариант жив
+        } else {
+            out.coverSelectedID = seedCoverID(manifest: manifest)
+            out.touched.remove(.cover)            // выбор испарился — поле снова живое
+        }
+        return out
+    }
+}
+
+// MARK: - Window-raise edges (I2 — ОДИН подъём окна на публикацию)
+
+/// The identity of a «publication» — the thing that is allowed to raise the window
+/// exactly once.
+///
+/// These strings are a DELIBERATE, byte-for-byte mirror of the agent's own ledger
+/// keys (`agent/scan.py` `_book_edge_key` / `_group_edge_key` /`_edge_keys`, file
+/// `state/notified.json`). That is the entire mechanism: the app and the agent
+/// decide «is this new?» by computing the SAME function over the SAME files, so
+/// the two raise channels — the agent's `open -b` nudge and the app's own
+/// rising-edge watcher — cannot disagree about what counts as one appearance.
+///
+/// Why identity and not just `book_id` (the old baseline): D17 publishes a book
+/// TWICE (skeleton, then ready), and a book can also re-enter `pending-confirm`
+/// without being new (a cancelled build lands back there with its token intact).
+/// `book_id` alone cannot tell those apart from a real arrival — it happened to
+/// agree with the agent so far because both writes project the same row, which is
+/// luck, not structure. `confirm_token` is minted ONCE per publication, on the
+/// skeleton, and carried through every later phase of that revision, so keying on
+/// it makes «one raise per publication» hold BY CONSTRUCTION: the phase flip is
+/// literally the same key, and a reconvert (fresh token) is legitimately a new one.
+enum NudgeEdge {
+
+    /// `book:<book_id>:<source_rev[:16]>:<confirm_token[:16]>` — mirrors
+    /// `agent/scan.py::_book_edge_key` exactly, including the 16-char truncation.
+    static func bookKey(bookID: String, sourceRev: String, confirmToken: String) -> String {
+        "book:\(bookID):\(sourceRev.prefix(16)):\(confirmToken.prefix(16))"
+    }
+
+    /// `group:<group_id>:<rev[:16]>:<token[:16]>` — mirrors `_group_edge_key`.
+    /// The showcase carries rev+token for a group, so no manifest read is needed.
+    static func groupKey(groupID: String, rev: String, token: String) -> String {
+        "group:\(groupID):\(rev.prefix(16)):\(token.prefix(16))"
+    }
+
+    static func key(for group: PendingGroup) -> String {
+        groupKey(groupID: group.groupID, rev: group.rev, token: group.token)
+    }
+
+    /// Every edge currently on screen, exactly as the agent would enumerate them:
+    /// one per `pending-confirm` showcase row (rev/token read from its manifest —
+    /// they are not in state.json, same as agent-side) plus one per pending group.
+    ///
+    /// A book whose manifest cannot be read degrades to empty rev/token segments
+    /// rather than vanishing: it still functions as an appearance edge for that
+    /// book, which is what the agent does too — and losing the edge entirely would
+    /// mean raising the window again on the next refresh, forever.
+    static func keys(state: ShowcaseState,
+                     manifest: (String) -> BookManifest?) -> Set<String> {
+        var keys = Set<String>()
+        for row in state.pendingConfirm where !row.bookID.isEmpty {
+            let m = manifest(row.bookID)
+            keys.insert(bookKey(bookID: row.bookID,
+                                sourceRev: m?.sourceRev ?? "",
+                                confirmToken: m?.confirmToken ?? ""))
+        }
+        for g in state.pendingGroups where !g.groupID.isEmpty {
+            keys.insert(key(for: g))
+        }
+        return keys
+    }
+
+    /// Does `keys` contain a BOOK edge (as opposed to a grouping one)? The window
+    /// changes screen only for a book; a grouping prompt overlays whatever is shown.
+    static func containsBook(_ keys: Set<String>) -> Bool {
+        keys.contains { $0.hasPrefix("book:") }
+    }
+
+    static func containsGroup(_ keys: Set<String>) -> Bool {
+        keys.contains { $0.hasPrefix("group:") }
     }
 }
 

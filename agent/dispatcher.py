@@ -5,8 +5,9 @@ atomically; launchd wakes the agent because ``queue/commands/`` is a
 ``WatchPaths`` entry. Each command carries ``action``
 (``confirm-build`` | ``grouping-choice`` | ``cover-choice`` | ``cancel`` |
 ``skip`` | ``recheck-access`` | ``apply-to-all``), ``book_id``, ``source_rev``,
-``confirm_token`` and ``idempotency_key``. The book-less actions
-(``grouping-choice``, ``recheck-access``) are dispatched before the book lookup.
+``confirm_token``, ``build_token`` (D17) and ``idempotency_key``. The book-less
+actions (``grouping-choice``, ``recheck-access``) are dispatched before the book
+lookup.
 
 This module wires the happy path plus the M0.6 protocol protections:
   - malformed / unreadable command JSON → quarantined in ``queue/commands/bad/``
@@ -20,6 +21,14 @@ This module wires the happy path plus the M0.6 protocol protections:
         stale command is dropped);
       * a known ``idempotency_key`` (double click / retry) → ACCEPT-as-skip
         (``build_skipped_idempotent``, no second build);
+      * a command that did not see a COMPLETE manifest — no ``build_token``, a
+        mismatched one, or an empty chapter list → REJECT_NOT_READY
+        (``confirm_rejected_not_ready``, book stays ``pending-confirm``). This is
+        the D17 early-nudge guard: the agent publishes a skeleton manifest first
+        so the window can open in ~0.8 s, and this gate is what stops a confirm
+        minted from that skeleton from ever producing a truncated .m4b — even
+        when the manifest is finished by the time the command is drained. See
+        :func:`_not_ready_reason`;
   - ONLY ``confirm-build`` may invoke the build (structural guarantee I2);
   - **real engine** (M1): flip the manifest ``pending-confirm`` → ``converting``
     → ``done``, stamp a ``build`` marker (pid) + the planned ``output_path`` on
@@ -165,9 +174,13 @@ REARMABLE_STATUSES = (STATUS_DONE, STATUS_SKIPPED)
 #                   fresh token); only the stale command is dropped.
 #   REJECT          any other invalid command (bad/missing token, no manifest,
 #                   wrong status, malformed) → command_rejected, command dropped.
+#   REJECT_NOT_READY the manifest is not (or was not) a complete, buildable book →
+#                    confirm_rejected_not_ready, book STAYS pending-confirm, only
+#                    the command dies. See :func:`_not_ready_reason`.
 VERDICT_ACCEPT = "accept"
 VERDICT_REJECT_STALE = "reject_stale"
 VERDICT_REJECT = "reject"
+VERDICT_REJECT_NOT_READY = "reject_not_ready"
 
 # Live-progress throttle (Task 2). The engine streams a progress snapshot many
 # times a second; we persist to state.json only every ~1.5s OR when the percent
@@ -215,6 +228,53 @@ def _already_processed(command: dict, manifest: dict) -> bool:
     return isinstance(keys, list) and key in keys
 
 
+def _not_ready_reason(command: dict, manifest: dict) -> str | None:
+    """Why this command may not build ``manifest``, or ``None`` if it may (D17).
+
+    The early nudge (D17) publishes a book's manifest as a SKELETON — chapter
+    names from filenames, no ffprobe, no cover — so the window can open in ~0.8 s
+    instead of ~12 s. Everything below exists so that a window opened on a skeleton
+    can never produce an .m4b built from one.
+
+    **Why a ``build_token`` and not just "check the phase".** Reading the phase
+    answers "is the manifest complete NOW", and now is the wrong moment. The real
+    sequence is: the app writes a confirm command while the manifest is a skeleton
+    → the command sits in ``queue/commands/`` until the next drain → meanwhile the
+    agent finishes the manifest, at the SAME ``source_rev`` and with the SAME
+    ``confirm_token`` (both are minted at the skeleton, deliberately, so the book
+    nudges exactly once) → the drain finally reads it, sees ``phase == "ready"``,
+    and happily builds a book from a command that was born looking at a chapter
+    list nobody had probed yet. Every field the command echoes still matches; the
+    phase moved underneath it. Classic TOCTOU.
+
+    ``build_token`` closes it because it does not exist at skeleton time AT ALL: it
+    is created in the same atomic write that makes the manifest complete. A command
+    minted from a skeleton therefore carries no token — or a null one — and nothing
+    that happens afterwards can retrofit one into it. The check is not "is the book
+    ready", it is "did the sender see a ready book", which is the question that
+    actually matters.
+
+    Fail-closed on purpose. A missing token, a mismatched token or a structurally
+    empty chapter list are all refusals, never a shrug: a refusal is visible in the
+    journal (``confirm_rejected_not_ready``) and costs one more click, while a
+    permissive default costs a silently truncated audiobook.
+
+    Legacy manifests (pre-D17, no phase and no token) are upgraded in place by the
+    scan — :func:`agent.scan._ensure_build_token` — so they reach this gate with a
+    token like everything else, rather than needing an exception here.
+    """
+    token = manifest.get("build_token")
+    if not (isinstance(token, str) and token):
+        return f"manifest_not_ready:{manifest.get('phase')!r}"
+    if command.get("build_token") != token:
+        # Either a command born on the skeleton (no token) or a forged one.
+        return "build_token_mismatch"
+    chapters = manifest.get("chapters")
+    if not (isinstance(chapters, list) and chapters):
+        return "chapters_empty"
+    return None
+
+
 def validate_command(command: dict, manifest: dict | None) -> tuple[str, str]:
     """Return ``(verdict, reason)`` for a parsed command against its manifest.
 
@@ -235,7 +295,12 @@ def validate_command(command: dict, manifest: dict | None) -> tuple[str, str]:
          rather than a generic token reject;
       4. **confirm_token** — for a command that DOES match the current rev, the
          token must match (anti-forgery / anti-replay on the live revision);
-      5. status must be ``pending-confirm`` to build.
+      5. status must be ``pending-confirm`` to build;
+      6. **build_token** — the command must prove it was minted from a COMPLETE
+         manifest, not from the skeleton the early nudge publishes first
+         (:func:`_not_ready_reason`). Last because it is the narrowest question:
+         everything above establishes "this command is about this live book", and
+         only then is "…and it saw the whole book" worth asking.
     """
     if not isinstance(command, dict):
         return VERDICT_REJECT, "command_not_object"
@@ -261,6 +326,10 @@ def validate_command(command: dict, manifest: dict | None) -> tuple[str, str]:
 
     if manifest.get("status") != STATUS_PENDING:
         return VERDICT_REJECT, f"status_not_pending:{manifest.get('status')!r}"
+
+    not_ready = _not_ready_reason(command, manifest)
+    if not_ready is not None:
+        return VERDICT_REJECT_NOT_READY, not_ready
     return VERDICT_ACCEPT, "ok"
 
 
@@ -1066,6 +1135,23 @@ def handle_command(command_path: Path) -> bool:
             book_id=book_id,
             command_rev=command.get("source_rev"),
             manifest_rev=(manifest or {}).get("source_rev"),
+        )
+        _delete_command(command_path)
+        return False
+
+    if verdict == VERDICT_REJECT_NOT_READY:
+        # The command was minted from an incomplete manifest (the early-nudge
+        # skeleton) — or from nothing at all. Refuse LOUDLY: the book stays
+        # pending-confirm with a live token, so the human simply confirms again
+        # once the window shows a filled-in book. Its own event kind, not the
+        # generic command_rejected, because this is the one rejection that means
+        # "the protocol worked" rather than "something is wrong".
+        state.append_event(
+            "confirm_rejected_not_ready",
+            file=command_path.name,
+            book_id=book_id,
+            reason=reason,
+            phase=(manifest or {}).get("phase"),
         )
         _delete_command(command_path)
         return False

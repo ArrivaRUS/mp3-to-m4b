@@ -188,6 +188,9 @@ def _confirm_build_cmd(manifest: dict, *, params_extra: dict | None = None) -> d
         "book_id": bid,
         "source_rev": rev,
         "confirm_token": manifest["confirm_token"],
+        # D17: the app echoes the build_token it saw, proving the command was
+        # minted from a COMPLETE manifest and not from the early-nudge skeleton.
+        "build_token": manifest.get("build_token"),
         "idempotency_key": f"{bid}:{rev[:16]}",
         "params": params,
         "ts": time.time(),

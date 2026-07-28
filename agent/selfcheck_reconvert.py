@@ -148,6 +148,9 @@ def _confirm_build_cmd(manifest: dict) -> dict:
         "book_id": bid,
         "source_rev": rev,
         "confirm_token": manifest["confirm_token"],
+        # D17: the app echoes the build_token it saw, proving the command was
+        # minted from a COMPLETE manifest and not from the early-nudge skeleton.
+        "build_token": manifest.get("build_token"),
         "idempotency_key": f"{bid}:{rev[:16]}",  # deterministic, = the app's key
         "params": dict(manifest.get("params", {})),
         "ts": time.time(),
@@ -216,6 +219,9 @@ def run() -> int:
     manifest_path = config.books_dir() / f"{book_id}.json"
     source_rev0 = man0["source_rev"]
     token0 = man0["confirm_token"]
+    # D17: доказательство полноты манифеста. Перечеканивается на каждой подготовке,
+    # поэтому годится как отпечаток «та же это подготовка или уже другая».
+    build_token0 = scan.manifest_build_token(man0)
 
     # First build → done. Use the DETERMINISTIC key so the ledger records exactly
     # the key a re-click would reuse (that is the dedup we must later prove reset).
@@ -247,6 +253,9 @@ def run() -> int:
     n_started_before = len(_events_of(state, "build_started"))
     n_done_before = len(_events_of(state, "build_done"))
     n_dedup_before = len(_events_of(state, "build_skipped_idempotent"))
+    # D17: скелеты, опубликованные ДО этой точки (обычный ранний нудж при
+    # первом скане), к пути reconvert отношения не имеют — считаем дельту.
+    n_skel_before = len(_events_of(state, "manifest_skeleton"))
 
     _drop_command(config.commands_dir(), _reconvert_cmd(book_id))
     dispatcher.drain_commands()
@@ -295,6 +304,32 @@ def run() -> int:
     check("reconvert: showcase row moved to pending-confirm (left ГОТОВО)",
           isinstance(row, dict) and row.get("status") == "pending-confirm",
           f"row={row}")
+
+    # --- D17: «Собрать заново» отдаёт СРАЗУ полный манифест -------------------
+    # Двухфазная публикация существует ради одного случая — только что дропнутой
+    # книги, у окна которой человек сидит прямо сейчас. Reconvert не такой: книга
+    # уже разобрана, окна никто не ждёт, и промежуточная фаза здесь была бы чистым
+    # вредом — этот путь (`_write_manifest`, staged=False) не проходит через
+    # resume, поэтому крах между двумя записями оставил бы книгу на `chapters` без
+    # единого тика, который её достроит. Одна запись, окна нет.
+    n_skeletons = len(_events_of(state, "manifest_skeleton")) - n_skel_before
+    check("D17: reconvert публикует ГОТОВЫЙ манифест — фаза ready + build_token",
+          scan.manifest_phase(man_rearmed) == "ready"
+          and len(scan.manifest_build_token(man_rearmed)) == 32,
+          f"phase={scan.manifest_phase(man_rearmed)} "
+          f"token={bool(scan.manifest_build_token(man_rearmed))}")
+    check("D17: reconvert НЕ публикует промежуточный скелет "
+          "(этот путь не резюмируется — некому было бы достроить)",
+          n_skeletons == 0, f"manifest_skeleton={n_skeletons}")
+    check("D17: build_token перечеканен вместе с confirm_token (новая подготовка)",
+          scan.manifest_build_token(man_rearmed) != build_token0,
+          f"same={scan.manifest_build_token(man_rearmed) == build_token0}")
+    stale_cmd = _confirm_build_cmd(man_rearmed)
+    stale_cmd["build_token"] = build_token0          # эхо СТАРОГО токена
+    stale_verdict = dispatcher.validate_command(stale_cmd, man_rearmed)
+    check("D17: команда с ПРОШЛЫМ build_token отвергается (не собираем по устаревшему)",
+          stale_verdict[0] == dispatcher.VERDICT_REJECT_NOT_READY
+          and stale_verdict[1] == "build_token_mismatch", str(stale_verdict))
 
     # === PROVE the rebuild REALLY runs (not deduped) ==========================
     # Re-read the freshly re-armed manifest → the confirm-build uses the SAME

@@ -82,6 +82,7 @@ SWIFT_SRCS=(
   "$REPO_DIR/app/Tokens.swift"
   "$REPO_DIR/app/StateModel.swift"
   "$REPO_DIR/app/WindowGeometry.swift"
+  "$REPO_DIR/app/WindowPresentation.swift"
   "$REPO_DIR/app/EngineClient.swift"
   "$REPO_DIR/app/EngineClient+Status.swift"
   "$REPO_DIR/app/QueueView.swift"

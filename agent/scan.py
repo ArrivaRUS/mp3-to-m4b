@@ -29,6 +29,34 @@ Key contracts (arch/synthesis.md §B):
     rewritten (its ``confirm_token`` is preserved); a changed ``source_rev``
     rewrites the manifest and re-arms ``status=pending-confirm``.
 
+★ EARLY NUDGE (D17). A manifest is no longer born complete, because the window
+has to be on screen in ~0.8 s and one ffprobe pass over a 56-file book takes
+longer than that on its own. So a scan publishes TWICE: a ``phase=skeleton``
+manifest built from the ``stat`` walk we already paid for (chapter names from
+filenames, author/title from the folder, count, bytes) goes out first and raises
+the app, and the probe + cover chain fill it in to ``phase=ready`` while the
+human is already looking at the book. Three rules hold it together:
+
+  · ``confirm_token`` is minted ONCE, on the skeleton, and re-used by every later
+    phase. The notified-ledger key embeds it, so both publications are the same
+    edge and the book nudges exactly once (I2);
+  · ``build_token`` is created ONLY in the final atomic write. It does not exist
+    while the manifest is incomplete, which is what makes a confirm command born
+    on a skeleton un-buildable even after the manifest is finished (I1 — see
+    :func:`agent.dispatcher._not_ready_reason` for the TOCTOU this closes);
+  · the unchanged-``source_rev`` short-circuit is phase-aware. A skeleton carries
+    its FINAL rev, so a rev-only short-circuit would hand it back forever and the
+    window would stay half-empty; ``skeleton``/``chapters`` therefore mean RESUME
+    (I4), which doubles as recovery from a crash between phases.
+
+A manifest with NO ``phase`` field was written before D17, is complete by
+construction, and reads as ``done`` (:func:`manifest_phase`) — no migration.
+
+Publication order is fixed and one-directional: **manifest → state.json →
+ledger → nudge**. State must never announce a book whose manifest is not yet on
+disk, and the nudge is last so nothing the app is woken up to look at is still
+in flight when it looks.
+
 The scanner NEVER triggers a build — that lives only in the ``confirm-build``
 handler (structural guarantee I2).
 
@@ -51,7 +79,10 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 from . import config, cover, metadata, probe, shutdown, state
 
@@ -92,6 +123,61 @@ STABILITY_DEBOUNCE_S = 0.5
 _STABILITY_ENV = "MP3TOM4B_STABILITY_DEBOUNCE_S"
 
 MANIFEST_STATUS_PENDING = "pending-confirm"
+
+# ── Manifest PHASE (D17 «ранний нудж») ───────────────────────────────────────
+# A manifest is no longer born complete. The window has to open in ~0.8 s, which
+# is less than one ffprobe pass over a 56-file book, so the agent publishes a
+# SKELETON first and fills it in while the human is already looking at it. The
+# phase field says which of those states the file on disk is in:
+#
+#   skeleton → everything that a plain ``stat`` pass already paid for: chapter
+#              names from FILE NAMES, author/title from the folder name, file
+#              count, byte size. No ffprobe has run. NOT buildable.
+#   chapters → ffprobe done: real chapter names/durations from ID3, total length,
+#              source sample rate. Cover chain not resolved yet. NOT buildable.
+#   ready    → the final atomic write: cover options resolved and ``build_token``
+#              minted. Buildable.
+#   done     → terminal. Also the COMPAT DEFAULT: a manifest with NO phase field
+#              was written by a pre-D17 agent, is complete by construction, and
+#              must keep working untouched — hence :func:`manifest_phase`.
+#
+# A boolean «готово» was considered and rejected: it cannot tell "still reading"
+# from "there is nothing left to wait for", which is exactly the distinction the
+# app needs to decide between a spinner and an enabled button.
+MANIFEST_PHASE_SKELETON = "skeleton"
+MANIFEST_PHASE_CHAPTERS = "chapters"
+MANIFEST_PHASE_READY = "ready"
+MANIFEST_PHASE_DONE = "done"
+#: Phases whose manifest the agent still owes work on. These — and ONLY these —
+#: make the unchanged-``source_rev`` short-circuit in :func:`_begin_manifest` do
+#: work instead of returning early (I4: a skeleton must never freeze).
+INCOMPLETE_PHASES = (MANIFEST_PHASE_SKELETON, MANIFEST_PHASE_CHAPTERS)
+
+# ── Cover WEB leg — a state of its own, deliberately NOT a phase (D17/M-B) ────
+# ``phase`` answers "may this book be built"; the web lookup must never be part of
+# that answer, or «Собрать» is back to waiting for the network. So the web leg
+# carries its own field, read by nothing that gates the build:
+#
+#   pending → ready manifest, local covers in place, web lookup still owed;
+#   done    → the lookup ran (found something, or gave up after
+#             ``COVER_WEB_MAX_TRIES``). Nothing further is owed.
+#
+# A MISSING field means "nothing owed" — pre-M-B manifests already have their web
+# candidates inline, exactly the same compat rule ``phase`` uses.
+COVER_WEB_PENDING = "pending"
+COVER_WEB_DONE = "done"
+#: How many passes may try a book whose search came back empty. Zero results is
+#: ambiguous — no network vs. an obscure book nobody has a cover for — so we retry
+#: a couple of ticks (the laptop that woke up before the wifi did is the case worth
+#: covering) and then stop, rather than re-asking two search engines forever.
+COVER_WEB_MAX_TRIES = 3
+
+# Test seam (M-D): halt the fill-in right after the named phase, leaving the
+# manifest on disk exactly as a crashed process would have. SAFE BY DEFAULT — the
+# variable is unset in production and only the two literal phase names are
+# honoured; anything else means "no halt".
+_HALT_AFTER_PHASE_ENV = "MP3TOM4B_HALT_AFTER_PHASE"
+
 # Status of a book whose build is in flight (dispatcher writes this). Used to gate
 # carrying the live ``progress`` field onto a showcase row (Task 2): progress is
 # preserved across a refresh ONLY while the book is still converting.
@@ -224,6 +310,72 @@ def _cover_web_enabled() -> bool:
     (deterministic tests / no-network runs) — generation still guarantees a cover.
     """
     return os.environ.get("MP3TOM4B_COVER_WEB", "1") not in ("0", "false", "no", "")
+
+
+# ── Cover-web ENRICHMENT budget for one pass (D17/M-B) ───────────────────────
+# What this budget is NOT, any more. It was born (M-A) as a stopgap on the
+# CRITICAL path: the web lookup sat inside the scan, the phase watchdog
+# (``agent.__main__.PHASE_DEADLINE_S`` = 150 s) covers «probe + scan + publish»,
+# and when it fires it publishes ``folder_access = blocked`` — the card that tells
+# the human macOS is holding the folder hostage. A handful of offline books, at
+# ``cover.WEB_TIMEOUT_S`` per request, could sum past 150 s and put a FALSE
+# folder-permission card in front of a human whose folder is fine. We spent half a
+# year on real TCC problems; a false one is expensive in a way a missing web cover
+# never is.
+#
+# M-B removed that danger STRUCTURALLY rather than by clock: the web leg no longer
+# runs inside the scan at all, so it is not under the watchdog and cannot influence
+# ``folder_access`` — see :func:`enrich_covers_web` (invariant I6). What remains is
+# a different, smaller cost that still deserves a bound: launchd will not start a
+# second instance of our label, so every second the enrichment pass keeps this
+# process alive is a second the NEXT tick — a newly dropped book, a queued
+# «Собрать» — has to wait. Hence a whole-pass ceiling: when it is spent, the
+# remaining books simply stay ``cover_web = pending`` and a later tick picks them
+# up (generation already guaranteed them a cover — PRD G4).
+#
+# 45 s: comfortably more than the ~12 s a fully dead network costs for one book
+# (two sources × one timed-out request each), so a single offline book never
+# starves the rest; and small enough that a queued command is never held back by
+# a noticeable amount. The pass ALSO yields early when a command is waiting.
+COVER_WEB_BUDGET_S = 45.0
+_COVER_WEB_BUDGET_ENV = "MP3TOM4B_COVER_WEB_BUDGET_S"
+#: Seconds charged to the budget so far in THIS process's enrichment pass.
+_cover_web_spent_s = 0.0
+
+
+def _cover_web_budget_s() -> float:
+    """Whole-pass web budget in seconds (``MP3TOM4B_COVER_WEB_BUDGET_S`` overrides)."""
+    raw = os.environ.get(_COVER_WEB_BUDGET_ENV)
+    if raw is None:
+        return COVER_WEB_BUDGET_S
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return COVER_WEB_BUDGET_S
+    return val if val >= 0 else COVER_WEB_BUDGET_S
+
+
+def _reset_cover_web_budget() -> None:
+    """Start a fresh budget (called once per enrichment pass)."""
+    global _cover_web_spent_s
+    _cover_web_spent_s = 0.0
+
+
+def _cover_web_allowed() -> bool:
+    """Whether the pass may still start ANOTHER book's web lookup."""
+    return _cover_web_enabled() and _cover_web_spent_s < _cover_web_budget_s()
+
+
+def _charge_cover_web(seconds: float) -> None:
+    """Charge one book's web lookup to the pass budget.
+
+    Honest now: the enrichment pass does nothing but the network, so this is the
+    time actually spent waiting on it (it used to also include the concurrent
+    Pillow render). Checked BETWEEN books, never mid-book — one book's lookup is
+    already bounded by :data:`cover.WEB_TIMEOUT_S` per request.
+    """
+    global _cover_web_spent_s
+    _cover_web_spent_s += max(0.0, seconds)
 
 
 def watch_dir() -> Path:
@@ -811,29 +963,86 @@ def _size_mtime_snapshot(mp3s: list[Path]) -> dict[str, tuple[int, int]]:
     return snap
 
 
-def _files_are_stable(mp3s: list[Path]) -> bool:
-    """True iff every mp3's size+mtime is unchanged across a short debounce (E10).
+def _stability_snapshot(mp3s: list[Path], folder: Path | None) -> dict | None:
+    """One debounce observation: WHICH mp3s exist right now + their size/mtime.
 
-    Snapshots all files, waits :func:`_stability_debounce_s`, snapshots again and
-    compares. Any difference (a growing copy, a touched mtime, a vanished file)
-    means the set is still settling → ``False`` (the caller skips arming the book
-    this pass). An empty set is trivially stable. A zero/near-zero debounce makes
-    this a cheap single comparison (used by tests / opt-out). The source mp3s are
-    only ``stat``-ed — never read or written (I1).
+    With ``folder`` the directory is RE-LISTED (:func:`_list_mp3s`) instead of
+    trusting the file list handed in — see :func:`_files_are_stable` for why that
+    difference is the whole point. Returns ``None`` when the folder cannot be
+    listed at all (deleted / unreadable mid-copy); a ``None`` never compares equal
+    to anything, so the caller reads it as "not stable" rather than as an empty —
+    and therefore trivially "unchanged" — set.
     """
-    if not mp3s:
+    if folder is not None:
+        try:
+            mp3s = _list_mp3s(folder)
+        except OSError:
+            return None
+    return _size_mtime_snapshot(mp3s)
+
+
+def _files_are_stable(mp3s: list[Path], folder: Path | None = None) -> bool:
+    """True iff the mp3 SET **and** every file's size+mtime survive a short beat (E10).
+
+    Snapshots, waits :func:`_stability_debounce_s`, snapshots again and compares.
+    Any difference — a growing copy, a touched mtime, a vanished file, **or a file
+    that was not there when we started** — means the set is still settling →
+    ``False`` (the caller skips arming the book this pass). An empty set is
+    trivially stable. A zero/near-zero debounce makes this a cheap single
+    comparison (used by tests / opt-out). The source mp3s are only ``stat``-ed —
+    never read or written (I1).
+
+    ``folder`` closes a hole that predates the early nudge: the original version
+    compared the ALREADY-COMPOSED ``mp3s`` list against itself, so it could only
+    ever see files that existed when the caller listed the directory. A copy in
+    flight adds files, and every file already on disk is by then complete and
+    still — so 20 files out of a 56-file book that is still arriving looked
+    perfectly "stable" and the book was armed at a third of its length. Re-listing
+    the directory on BOTH observations makes an arriving file a difference in the
+    snapshot itself, which is the only thing that can catch it. The debounce
+    semantics are otherwise untouched (E10: same wait, same place, still before
+    anything is armed or published).
+    """
+    if folder is None and not mp3s:
         return True
-    before = _size_mtime_snapshot(mp3s)
+    before = _stability_snapshot(mp3s, folder)
     wait = _stability_debounce_s()
     if wait > 0:
         time.sleep(wait)
-    after = _size_mtime_snapshot(mp3s)
+    after = _stability_snapshot(mp3s, folder)
+    if before is None or after is None:
+        return False
     return before == after
 
 
+#: How many ffprobe children the probe pass may keep in flight at once.
+#: A probe is ~27 ms of PROCESS SPAWN and ~0 ms of work (measured: identical cost
+#: for a 1.4 MB and a 20 MB mp3, and for a bare ``ffprobe -version``), so the pass
+#: is latency-bound, not CPU-bound — 56 files cost 1.45 s serially and 0.22 s
+#: across 8 workers on this machine. Capped well below the core count on purpose:
+#: the agent runs while the human is working, and the curve is already flat past
+#: 8 (16 workers bought another 0.08 s for twice the concurrent load).
+_PROBE_WORKERS = min(8, max(2, os.cpu_count() or 4))
+
+
 def _probe_book(mp3s: list[Path]) -> list[dict]:
-    """Probe every mp3 once (durations, tags, cover flag). Order = input order."""
-    return [probe.probe_file(p) for p in mp3s]
+    """Probe every mp3 once (durations, tags, cover flag). Order = input order.
+
+    Concurrent, but observationally identical to the serial comprehension it
+    replaces: :func:`agent.probe.probe_file` is pure — it spawns its OWN ffprobe,
+    touches no shared state, writes nothing, and never raises (a broken file comes
+    back as an ``ok=False`` marker, by that function's contract) — and
+    ``Executor.map`` yields results in ARGUMENT order, never completion order. So
+    this returns the same dicts in the same order; only sooner. The pool is sized
+    to the work so a one-file book does not build a thread pool at all.
+    """
+    if len(mp3s) < 2:
+        return [probe.probe_file(p) for p in mp3s]
+    with ThreadPoolExecutor(
+        max_workers=min(_PROBE_WORKERS, len(mp3s)),
+        thread_name_prefix="mp3tom4b-probe",
+    ) as pool:
+        return list(pool.map(probe.probe_file, mp3s))
 
 
 def _build_chapters(ordered_probes: list[dict]) -> list[dict]:
@@ -982,14 +1191,20 @@ def _build_pending_group(
     }
 
 
-def _resolve_cover(bid: str, ordered_probes: list[dict], mp3s_by_name: dict) -> dict:
+def _resolve_cover(bid: str, ordered_probes: list[dict], mp3s_by_name: dict,
+                   *, generation: str | None = None) -> dict:
     """Detect an embedded cover and extract a preview into ``covers/``.
 
     Returns ``{"cover_state": ..., "cover_preview": <path|None>}``. The cover is
     taken from the FIRST file that carries one (research §4). On a successful
     extract ``cover_state="embedded"`` and ``cover_preview`` points at the file;
     if no file has a cover (or extraction fails) ``cover_state="none"`` and the
-    web/generate chain (M1) will take over. Never raises.
+    generate chain (M1) will take over. Never raises.
+
+    ``generation`` scopes the file name to THIS preparation of the book (see
+    :func:`agent.cover.cover_generation`) — the same rule the generated and web
+    files follow, so re-arming a book never rewrites the bytes under a path an
+    older manifest still names.
     """
     for pr in ordered_probes:
         if not pr.get("has_embedded_cover"):
@@ -997,7 +1212,8 @@ def _resolve_cover(bid: str, ordered_probes: list[dict], mp3s_by_name: dict) -> 
         src = mp3s_by_name.get(pr.get("file"))
         if src is None:
             continue
-        dest = config.covers_dir() / f"{bid}-embedded.jpg"
+        stem = cover.cover_file_stem(bid, generation)
+        dest = config.covers_dir() / f"{stem}-embedded.jpg"
         if probe.extract_cover(src, dest):
             return {"cover_state": "embedded", "cover_preview": str(dest)}
         # Cover advertised but extraction failed → fall through to next candidate.
@@ -1025,99 +1241,138 @@ def title_for_manifest(manifest: dict) -> str:
     return str(manifest.get("book_id", "book"))
 
 
-def _write_manifest(
+def manifest_phase(manifest: dict) -> str:
+    """The manifest's fill-in phase. A MISSING field means ``done`` (D17 compat).
+
+    Pre-D17 manifests carry no ``phase`` at all and are complete by construction —
+    reading their absence as ``done`` is what makes the whole protocol change
+    migration-free: an old manifest keeps its short-circuit, keeps its token, and
+    is never re-armed just because the agent learned a new field.
+    """
+    if not isinstance(manifest, dict):
+        return MANIFEST_PHASE_DONE
+    phase = manifest.get("phase")
+    return phase if isinstance(phase, str) and phase else MANIFEST_PHASE_DONE
+
+
+def manifest_build_token(manifest: dict) -> str:
+    """The manifest's ``build_token``, or ``""`` when it has none (not buildable).
+
+    ``build_token`` exists ONLY in the final atomic write (:func:`_finish_manifest`)
+    and is therefore the physical proof that the manifest is complete — see the
+    gate in :func:`agent.dispatcher.validate_command` for why "physical" beats
+    "check the phase field" here.
+    """
+    if not isinstance(manifest, dict):
+        return ""
+    token = manifest.get("build_token")
+    return token if isinstance(token, str) and token else ""
+
+
+class _ManifestHalt(RuntimeError):
+    """Test seam (M-D): stop filling this manifest in, as a crash would."""
+
+
+def _halt_after_phase() -> str:
+    """Phase after which the fill-in must stop, or ``""`` (the production default).
+
+    Only the two literal incomplete phases are honoured, so a typo — or a stray
+    variable in someone's shell — can never halt a real agent at ``ready``.
+    """
+    raw = os.environ.get(_HALT_AFTER_PHASE_ENV, "")
+    return raw if raw in INCOMPLETE_PHASES else ""
+
+
+def _stat_totals(mp3s: list[Path]) -> tuple[int, int]:
+    """``(file_count, total_bytes)`` for the skeleton — pure ``stat``, no probe."""
+    total = 0
+    for p in mp3s:
+        try:
+            total += p.stat().st_size
+        except OSError:
+            continue
+    return len(mp3s), total
+
+
+def _skeleton_chapters(mp3s: list[Path]) -> list[dict]:
+    """Chapter rows from FILE NAMES alone — the free half of :func:`_build_chapters`.
+
+    Same shape as the real thing (``index`` / ``file`` / ``name`` / ``duration_ms``)
+    so the app renders one list, not two: only ``duration_ms`` is ``None`` and the
+    names come from the filename rather than the ID3 title. ``mp3s`` arrives
+    natural-sorted from :func:`_list_mp3s`, which is also the fallback order
+    :func:`agent.metadata.order_chapters` uses when the files carry no track tags —
+    so for the common book the skeleton order IS the final order.
+    """
+    return [
+        {
+            "index": i,
+            "file": p.name,
+            "name": metadata.chapter_name_from_filename(p.name),
+            "duration_ms": None,
+        }
+        for i, p in enumerate(mp3s, start=1)
+    ]
+
+
+class _ManifestPlan(NamedTuple):
+    """Everything :func:`_finish_manifest` needs to turn a skeleton into ``ready``."""
+
+    manifest: dict          # the skeleton as it stands (on disk when ``staged``)
+    path: Path              # queue/books/<book_id>.json
+    bid: str
+    mp3s: list[Path]
+    derive: Callable[[list[dict]], tuple[str, str]]
+    staged: bool            # publish intermediate phases (early-nudge path only)
+
+
+def _manifest_skeleton(
     *,
     bid: str,
     src_dir: str,
     mp3s: list[Path],
-    base_dir: Path,
-    author: str,
-    title: str,
-    debounce: bool = False,
-    force: bool = False,
-) -> dict | None:
-    """Build + atomically write ONE pending-confirm manifest from explicit inputs.
+    rev: str,
+    token: str,
+    derive: Callable[[list[dict]], tuple[str, str]],
+) -> dict:
+    """The phase-``skeleton`` manifest: everything the ``stat`` pass already bought.
 
-    The shared core behind both the subfolder scanner and the grouping
-    materializer. Idempotent: if a manifest already exists for ``bid`` with the SAME
-    ``source_rev`` it is returned untouched (``confirm_token`` preserved, no
-    re-probe / no re-fetch of covers). Otherwise it probes the files, resolves the
-    cover chain (embedded → web → generated, always ≥1 — PRD G4) and writes a fresh
-    ``pending-confirm`` manifest with a new ``confirm_token``.
+    Deliberately NOT empty. We already walked the directory and stat-ed every file
+    to compute ``source_rev``; chapter names, author/title, file count and byte
+    size fall out of that same walk for free. So the window that opens in ~0.8 s
+    opens on a book — its name, its 56 chapter titles — instead of on a spinner,
+    and the ffprobe pass that follows only replaces those names with better ones.
 
-    ``source_rev`` is the pure file-list fingerprint (relpath to ``base_dir`` +
-    size + mtime_ns); probe/cover data is display payload and never folded in (so
-    an unchanged set keeps its rev/token across scans — M0 idempotency).
-
-    ``force`` bypasses the unchanged-``source_rev`` short-circuit: the files are
-    ALWAYS re-probed and a fresh ``pending-confirm`` manifest rewritten even when the
-    inputs did not move. This is the «Собрать заново» (reconvert) path — a book built
-    by an OLD agent has a stale manifest missing today's fields (e.g.
-    ``source_samplerate``); re-arming it in place would preserve the gaps, so we
-    re-run the SAME build here to refill every field from a fresh probe. ``source_rev``
-    is still recomputed from the (unchanged) files, so it lands on the same value —
-    the M0 idempotency contract is intact; only the manifest payload is refreshed.
-
-    E10: when ``debounce`` is set (the subfolder scan path) and we are about to
-    write a NEW/changed manifest, we first verify the mp3s are not still being
-    copied (size/mtime stable across a short beat — :func:`_files_are_stable`). If
-    they are still settling we return ``None`` WITHOUT writing anything, so the
-    book is simply not armed this pass and the next scan re-arms it once stable.
-    The wait is paid ONLY here (a genuinely new/changed book), never on the
-    unchanged-rev fast path above — settled books are not slowed.
+    ``derive`` is called with an EMPTY probe list on purpose: every derivation
+    (subfolder, combined, separate) already falls back to the folder/file name when
+    the tags are missing, which is exactly the probe-free answer we want here. No
+    ffprobe is spawned. No ``build_token`` is minted — that is the point.
     """
-    rev = source_rev_for(mp3s, base_dir)
-    manifest_path = config.books_dir() / f"{bid}.json"
-    existing = state.read_json(manifest_path, default=None)
-    if not force and isinstance(existing, dict) and existing.get("book_id") == bid:
-        if existing.get("source_rev") == rev:
-            # Unchanged inputs → keep the manifest (and its confirm_token) as-is, and
-            # skip re-probing (byte-identical inputs → cached chapters/cover still valid).
-            return existing
-        # v1→v2 MIGRATION guard (must run BEFORE the re-arm branch below): if the
-        # stored rev equals the LEGACY digest of the CURRENT files, the sources are
-        # untouched — only the fingerprint FORMULA changed (agent update). Without
-        # this, the first scan after the update would re-arm EVERY existing book
-        # (a window storm). Upgrade the rev in place, preserving status /
-        # confirm_token / processed_keys / everything else, and swap the notified
-        # ledger key so a still-pending book does not re-nudge on migration.
-        if existing.get("source_rev") == source_rev_legacy_for(mp3s, base_dir):
-            old_key = _book_edge_key(existing)
-            existing["source_rev"] = rev
-            existing["source_rev_v"] = SOURCE_REV_VERSION
-            state.write_json_atomic(manifest_path, existing)
-            _notified_replace(old_key, _book_edge_key(existing))
-            state.append_event(
-                "source_rev_migrated", book_id=bid, rev_v=SOURCE_REV_VERSION
-            )
-            return existing
-
-    # New / changed inputs. E10: make sure they are not mid-copy before arming.
-    if debounce and not _files_are_stable(mp3s):
-        state.append_event("book_still_copying", book_id=bid, src_dir=src_dir)
-        return None
-
-    ordered = metadata.order_chapters(_probe_book(mp3s))
-    mp3s_by_name = {p.name: p for p in mp3s}
-    cover_info = _resolve_cover(bid, ordered, mp3s_by_name)
-
-    manifest = {
+    author, title = derive([])
+    file_count, total_bytes = _stat_totals(mp3s)
+    return {
         "book_id": bid,
         "src_dir": src_dir,
         "status": MANIFEST_STATUS_PENDING,
+        "phase": MANIFEST_PHASE_SKELETON,
         "source_rev": rev,
         "source_rev_v": SOURCE_REV_VERSION,
-        "confirm_token": secrets.token_hex(16),
+        # Minted ONCE, here, and carried by every later phase of this revision.
+        # The notified-ledger key embeds it, so re-using it is what makes the
+        # skeleton publication and the ready publication the SAME edge — i.e. what
+        # holds "one nudge per publication" (I2) structurally rather than by
+        # discipline. Mint a second token at ``ready`` and the human gets two
+        # windows for one book.
+        "confirm_token": token,
         "title": title,
         "author": author,
-        "chapters": _build_chapters(ordered),
-        "total_duration_ms": _total_duration_ms(ordered),
-        # "As in source" anchor: the max sample rate across the readable mp3s, so
-        # the build keeps the source SR by default (params.samplerate == None →
-        # build_m4b._samplerate falls back to this) instead of resampling.
-        "source_samplerate": _source_samplerate(ordered),
-        "cover_state": cover_info["cover_state"],
-        "cover_preview": cover_info["cover_preview"],
+        "chapters": _skeleton_chapters(mp3s),
+        "total_duration_ms": 0,
+        "source_samplerate": None,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "cover_state": "none",
+        "cover_preview": None,
         "params": dict(DEFAULT_PARAMS),
         # Idempotency ledger (M0.6): idempotency_keys already built for THIS book.
         # Keys are revision-scoped (the app derives them from book_id+source_rev),
@@ -1127,15 +1382,310 @@ def _write_manifest(
         "ts": time.time(),
     }
 
-    # Cover CHAIN (M1): build the ordered candidate list embedded→web→generated and
-    # pick a default, merged in BEFORE the single atomic write (agent stays the only
-    # writer). Guarantees every book has a cover (PRD G4) even fully offline.
-    manifest.update(
-        cover.resolve_cover_options(manifest, do_web=_cover_web_enabled())
+
+def _ensure_build_token(manifest: dict, manifest_path: Path) -> dict:
+    """Give a PRE-D17 pending manifest a ``phase``/``build_token``, in place.
+
+    The build gate is fail-closed on ``build_token``, and a manifest written by
+    yesterday's agent has none — so without this a book that was already waiting
+    for confirmation when the agent updated would become permanently unbuildable
+    (its rev is unchanged, so no scan would ever re-arm it either). We upgrade it
+    exactly the way the v1→v2 rev migration does: in place, preserving
+    ``source_rev`` / ``confirm_token`` / ``processed_keys``, so the ledger key does
+    not move and nothing re-nudges.
+
+    Only ``pending-confirm`` manifests are touched (a done/skipped/converting book
+    has no live confirm to serve), and NEVER one at an incomplete phase — handing a
+    skeleton a build_token would forge the very proof the gate exists to check.
+    """
+    if manifest.get("status") != MANIFEST_STATUS_PENDING:
+        return manifest
+    if manifest_build_token(manifest):
+        return manifest
+    if manifest_phase(manifest) in INCOMPLETE_PHASES:
+        return manifest
+    upgraded = dict(manifest)
+    upgraded["phase"] = MANIFEST_PHASE_READY
+    upgraded["build_token"] = secrets.token_hex(16)
+    state.write_json_atomic(manifest_path, upgraded)
+    state.append_event(
+        "manifest_phase_upgraded",
+        book_id=upgraded.get("book_id"),
+        phase=MANIFEST_PHASE_READY,
+    )
+    return upgraded
+
+
+def _upgrade_legacy_manifests(manifests: list[dict]) -> list[dict]:
+    """Sweep :func:`_ensure_build_token` over every projected manifest.
+
+    :func:`_begin_manifest` upgrades the books the folder walk actually visits,
+    which is subfolder books and nothing else. A grouping-materialized book
+    (combined / separate) has no subfolder of its own, so no later scan ever calls
+    :func:`_begin_manifest` for it — a pre-D17 one waiting at ``pending-confirm``
+    would otherwise sit there with no ``build_token``, be refused by the gate, and
+    never get a chance to acquire one. Cheap: the manifests are already in memory,
+    and a book is written at most once, ever. Never raises — a failed upgrade
+    leaves the original in place rather than breaking the publication.
+    """
+    out: list[dict] = []
+    for m in manifests:
+        bid = m.get("book_id")
+        if not (isinstance(bid, str) and bid):
+            out.append(m)
+            continue
+        try:
+            out.append(_ensure_build_token(m, config.books_dir() / f"{bid}.json"))
+        except OSError:
+            out.append(m)
+    return out
+
+
+def _begin_manifest(
+    *,
+    bid: str,
+    src_dir: str,
+    mp3s: list[Path],
+    base_dir: Path,
+    derive: Callable[[list[dict]], tuple[str, str]],
+    debounce_dir: Path | None = None,
+    force: bool = False,
+    staged: bool = False,
+) -> tuple[dict | None, _ManifestPlan | None]:
+    """Gate one book and produce its skeleton. The cheap half of a manifest write.
+
+    Returns ``(current, plan)``:
+      · ``(manifest, None)`` — nothing to do; that manifest is already current
+        (unchanged ``source_rev``, or a silent v1→v2 rev migration);
+      · ``(None, None)`` — the files are still being copied (E10) → the book is not
+        armed this pass and nothing at all was written;
+      · ``(skeleton, plan)`` — work to do; hand ``plan`` to :func:`_finish_manifest`.
+
+    ``source_rev`` is the pure file-list fingerprint (relpath to ``base_dir`` +
+    size + mtime_ns); probe/cover data is display payload and never folded in, so
+    an unchanged set keeps its rev/token across scans (M0 idempotency).
+
+    **The short-circuit is phase-aware, and that is load-bearing (I4).** A skeleton
+    is written with its FINAL ``source_rev`` — it has to be, or the app could not
+    address it — so the plain "same rev → return as-is" rule would hand the
+    skeleton back on every subsequent scan and it would never be filled in. The
+    window would open in 0.8 s and stay half-empty forever. So an unchanged rev
+    short-circuits only for a COMPLETE manifest; ``skeleton``/``chapters`` at
+    ``pending-confirm`` mean RESUME instead — pick the fill-in back up, re-using
+    the ``confirm_token`` that is already on disk so the resume does not nudge a
+    second time. Resume is therefore also the crash recovery: a process that dies
+    between phases leaves a resumable manifest, not a stuck one.
+
+    The status guard on that resume matters too: a skeleton the user has since
+    SKIPPED sits at ``status=skipped``, and finishing it would rewrite the status
+    back to ``pending-confirm`` — resurrecting a book the human took off the
+    pipeline. An incomplete phase alone is not enough; it must still be pending.
+
+    ``force`` bypasses the short-circuit entirely: the files are ALWAYS re-probed
+    and a fresh manifest written (with a fresh ``confirm_token``) even when the
+    inputs did not move. This is the «Собрать заново» (reconvert) path — a book
+    built by an OLD agent has a stale manifest missing today's fields, and re-arming
+    it in place would preserve the gaps. ``source_rev`` still lands on the same
+    value, so the M0 idempotency contract is intact; only the payload is refreshed.
+
+    E10: when ``debounce_dir`` is set (the subfolder scan path) and we are about to
+    write a NEW/changed manifest, we first verify the directory is not still being
+    copied into (:func:`_files_are_stable`). If it is still settling we return
+    ``(None, None)`` WITHOUT writing anything. The wait is paid ONLY here (a
+    genuinely new/changed book), never on the unchanged-rev fast path above — and
+    it stays BEFORE the skeleton, so the early nudge can never open a window on a
+    book that is still arriving (I3).
+    """
+    rev = source_rev_for(mp3s, base_dir)
+    manifest_path = config.books_dir() / f"{bid}.json"
+    existing = state.read_json(manifest_path, default=None)
+    resumed: dict | None = None
+
+    if not force and isinstance(existing, dict) and existing.get("book_id") == bid:
+        if existing.get("source_rev") == rev:
+            if (
+                manifest_phase(existing) in INCOMPLETE_PHASES
+                and existing.get("status") == MANIFEST_STATUS_PENDING
+            ):
+                resumed = existing          # fall through to the fill-in below
+            else:
+                # Unchanged inputs, complete manifest → keep it (and its
+                # confirm_token) as-is and skip re-probing; byte-identical inputs
+                # mean the cached chapters/cover are still valid.
+                return _ensure_build_token(existing, manifest_path), None
+        # v1→v2 MIGRATION guard (must run BEFORE the re-arm branch below): if the
+        # stored rev equals the LEGACY digest of the CURRENT files, the sources are
+        # untouched — only the fingerprint FORMULA changed (agent update). Without
+        # this, the first scan after the update would re-arm EVERY existing book
+        # (a window storm). Upgrade the rev in place, preserving status /
+        # confirm_token / processed_keys / everything else, and swap the notified
+        # ledger key so a still-pending book does not re-nudge on migration.
+        elif existing.get("source_rev") == source_rev_legacy_for(mp3s, base_dir):
+            old_key = _book_edge_key(existing)
+            existing["source_rev"] = rev
+            existing["source_rev_v"] = SOURCE_REV_VERSION
+            state.write_json_atomic(manifest_path, existing)
+            _notified_replace(old_key, _book_edge_key(existing))
+            state.append_event(
+                "source_rev_migrated", book_id=bid, rev_v=SOURCE_REV_VERSION
+            )
+            return _ensure_build_token(existing, manifest_path), None
+
+    if resumed is None:
+        # New / changed inputs. E10: make sure they are not mid-copy before arming.
+        if debounce_dir is not None and not _files_are_stable(mp3s, debounce_dir):
+            state.append_event("book_still_copying", book_id=bid, src_dir=src_dir)
+            return None, None
+        current = _manifest_skeleton(
+            bid=bid, src_dir=src_dir, mp3s=mp3s, rev=rev,
+            token=secrets.token_hex(16), derive=derive,
+        )
+        if staged:
+            # PUBLICATION ORDER, step 1 of 4: the manifest hits the disk BEFORE the
+            # caller writes state.json, the ledger and the nudge. State must never
+            # announce a book the app cannot then open.
+            state.write_json_atomic(manifest_path, current)
+            state.append_event(
+                "manifest_skeleton", book_id=bid, chapters=len(current["chapters"])
+            )
+    else:
+        # Resume: whatever is already on disk (skeleton OR chapters) is richer than
+        # a freshly-built skeleton would be, so keep it — and keep its token.
+        current = resumed
+        state.append_event(
+            "manifest_resumed", book_id=bid, phase=manifest_phase(current)
+        )
+
+    return current, _ManifestPlan(
+        manifest=current, path=manifest_path, bid=bid, mp3s=mp3s,
+        derive=derive, staged=staged,
     )
 
-    state.write_json_atomic(manifest_path, manifest)
+
+def _finish_manifest(plan: _ManifestPlan) -> dict:
+    """Fill a skeleton in to phase ``ready``. The expensive half of a manifest write.
+
+    THE PROBE HAPPENS HERE, ONCE. ``author``/``title`` are derived from ID3 tags,
+    so a caller cannot compute them without probing — which is why every caller
+    used to probe the whole book itself and then hand the strings in, leaving
+    :func:`_probe_book` to run a SECOND time. That cost 2×N ffprobe spawns for a new
+    book (112 for a 56-chapter one) and, worse, N spawns for an UNCHANGED book on
+    every launchd tick. The ``derive`` callback keeps the probe below the gates:
+    unchanged books cost zero ffprobe, new books exactly N.
+
+    Two writes on the staged (early-nudge) path, one on every other path:
+      1. ``chapters`` — real names/durations/sample rate, published as soon as the
+         probe returns so the window the human is already looking at fills in;
+      2. ``ready`` — the FINAL atomic write: cover options resolved and, only here,
+         ``build_token`` minted. Nothing between those two writes can make a
+         half-filled manifest look buildable, because the proof of completeness is
+         created in the same ``os.replace`` as the completeness itself.
+
+    The intermediate write is skipped when not ``staged``: those callers
+    (grouping-materialize, reconvert) replace a manifest that may already be
+    complete, and they are not reachable by the subfolder scan's resume path — so a
+    crash between the two writes would leave them stranded at ``chapters`` with
+    nobody to finish them. One write, no window.
+    """
+    manifest = dict(plan.manifest)
+    halt = _halt_after_phase()
+    if halt == MANIFEST_PHASE_SKELETON:
+        raise _ManifestHalt(MANIFEST_PHASE_SKELETON)
+
+    ordered = metadata.order_chapters(_probe_book(plan.mp3s))
+    author, title = plan.derive(ordered)
+    manifest.update({
+        "phase": MANIFEST_PHASE_CHAPTERS,
+        "title": title,
+        "author": author,
+        "chapters": _build_chapters(ordered),
+        "total_duration_ms": _total_duration_ms(ordered),
+        # "As in source" anchor: the max sample rate across the readable mp3s, so
+        # the build keeps the source SR by default (params.samplerate == None →
+        # build_m4b._samplerate falls back to this) instead of resampling.
+        "source_samplerate": _source_samplerate(ordered),
+        "ts": time.time(),
+    })
+    if plan.staged:
+        state.write_json_atomic(plan.path, manifest)
+    if halt == MANIFEST_PHASE_CHAPTERS:
+        raise _ManifestHalt(MANIFEST_PHASE_CHAPTERS)
+
+    generation = cover.cover_generation(manifest)
+    cover_info = _resolve_cover(plan.bid, ordered, {p.name: p for p in plan.mp3s},
+                                generation=generation)
+    manifest["cover_state"] = cover_info["cover_state"]
+    manifest["cover_preview"] = cover_info["cover_preview"]
+
+    # Cover CHAIN, LOCAL HALF (M1 · re-cut by D17/M-B): embedded → generated plus a
+    # default, merged in BEFORE the final atomic write (agent stays the only
+    # writer). Guarantees every book has a cover (PRD G4) fully offline, and costs
+    # only local work — a file read and a Pillow render. The WEB half is not here
+    # any more: it runs after the drain (:func:`enrich_covers_web`) and appends to
+    # the end of this list. That is what makes «Собрать» independent of the
+    # network — the whole point of M-B.
+    manifest.update(cover.resolve_cover_options(manifest))
+    # The book still owes the human a web lookup; the enrichment pass claims it.
+    manifest["cover_web"] = COVER_WEB_PENDING
+    manifest["cover_web_tries"] = 0
+
+    manifest["phase"] = MANIFEST_PHASE_READY
+    manifest["build_token"] = secrets.token_hex(16)
+    manifest["ts"] = time.time()
+    state.write_json_atomic(plan.path, manifest)
+    # Publish first, delete second: the manifest naming this generation's files is
+    # on disk, so dropping the PREVIOUS generation's images cannot strand a reader.
+    cover.sweep_stale_cover_files(plan.bid, generation)
     return manifest
+
+
+def _write_manifest(
+    *,
+    bid: str,
+    src_dir: str,
+    mp3s: list[Path],
+    base_dir: Path,
+    derive: Callable[[list[dict]], tuple[str, str]],
+    debounce_dir: Path | None = None,
+    force: bool = False,
+) -> dict | None:
+    """Build + atomically write ONE complete manifest, start to finish, no publish.
+
+    The single-shot composition of :func:`_begin_manifest` + :func:`_finish_manifest`
+    for every caller that is NOT the early-nudge scan path (grouping-materialize,
+    reconvert): same gates, same probe, same final ``ready`` manifest — just without
+    the intermediate publications, since nobody is waiting at a window for these.
+    Returns ``None`` when the book is still copying (E10).
+    """
+    current, plan = _begin_manifest(
+        bid=bid, src_dir=src_dir, mp3s=mp3s, base_dir=base_dir, derive=derive,
+        debounce_dir=debounce_dir, force=force, staged=False,
+    )
+    if plan is None:
+        return current
+    return _finish_manifest(plan)
+
+
+def _book_manifest_args(folder: Path, *, force: bool = False) -> dict:
+    """The :func:`_begin_manifest` keyword arguments for ONE subfolder book.
+
+    Shared by the single-shot :func:`write_manifest_for_book` and the two-pass
+    early-nudge loop in :func:`scan_watch_folder` so the two paths can never drift
+    on identity (``book_id``), fingerprint base or author/title derivation.
+    ``debounce_dir`` is the book's own folder: the E10 stability check re-lists it
+    rather than trusting the file list we just built (see :func:`_files_are_stable`).
+    A reconvert skips the debounce — it targets an already-built, settled book.
+    """
+    folder = Path(folder)
+    return {
+        "bid": book_id_for(folder),
+        "src_dir": os.path.abspath(str(folder)),
+        "mp3s": _list_mp3s(folder),
+        "base_dir": folder,
+        "derive": lambda ordered: metadata.derive_author_title(folder, ordered),
+        "debounce_dir": None if force else folder,
+        "force": force,
+    }
 
 
 def write_manifest_for_book(folder: Path, *, force: bool = False) -> dict | None:
@@ -1155,21 +1705,13 @@ def write_manifest_for_book(folder: Path, *, force: bool = False) -> dict | None
     a NEW/changed book is NOT armed this pass — returns ``None`` so the caller
     skips it; the next scan re-arms it once the files settle. An already-recognized
     (unchanged-rev) book is returned as-is without paying the debounce.
+
+    This is the SINGLE-SHOT entry point (reconvert / rescan / direct callers). The
+    scan's own loop goes through :func:`_begin_manifest` directly so it can publish
+    the skeleton and nudge the app before paying for the probe — see
+    :func:`scan_watch_folder`.
     """
-    folder = Path(folder)
-    mp3s = _list_mp3s(folder)
-    ordered = metadata.order_chapters(_probe_book(mp3s)) if mp3s else []
-    author, title = metadata.derive_author_title(folder, ordered)
-    return _write_manifest(
-        bid=book_id_for(folder),
-        src_dir=os.path.abspath(str(folder)),
-        mp3s=mp3s,
-        base_dir=folder,
-        author=author,
-        title=title,
-        debounce=not force,
-        force=force,
-    )
+    return _write_manifest(**_book_manifest_args(folder, force=force))
 
 
 def combined_book_id_for(loose: list[Path]) -> str:
@@ -1201,15 +1743,12 @@ def materialize_combined(watch: Path, loose: list[Path], *, force: bool = False)
     path for a combined book (:func:`_write_manifest`).
     """
     watch = Path(watch)
-    ordered = metadata.order_chapters(_probe_book(loose))
-    author, title = metadata.derive_author_title(watch, ordered)
     return _write_manifest(
         bid=combined_book_id_for(loose),
         src_dir=os.path.abspath(str(watch)),
         mp3s=loose,
         base_dir=watch,
-        author=author,
-        title=title,
+        derive=lambda ordered: metadata.derive_author_title(watch, ordered),
         force=force,
     )
 
@@ -1230,24 +1769,32 @@ def materialize_separate(watch: Path, loose: list[Path], *, force: bool = False)
     manifests: list[dict] = []
     for f in loose:
         f = Path(f)
-        probes = _probe_book([f])
-        author, title = metadata.derive_author_title(watch, probes)
-        # A single loose file has no album to title the book — prefer its own
-        # ID3 title, else the cleaned filename, over the watch-folder fallback.
-        if not (probes and probes[0].get("tags", {}).get("album")):
-            title = metadata.chapter_name(probes[0]) if probes else f.stem
         manifests.append(
             _write_manifest(
                 bid=book_id_for(f),
                 src_dir=os.path.abspath(str(f)),
                 mp3s=[f],
                 base_dir=f.parent,
-                author=author,
-                title=title,
+                derive=lambda probes, f=f: _separate_author_title(watch, f, probes),
                 force=force,
             )
         )
     return manifests
+
+
+def _separate_author_title(watch: Path, f: Path, probes: list[dict]) -> tuple[str, str]:
+    """Author/title for ONE separate-choice book (its single file's own tags).
+
+    Extracted verbatim from :func:`materialize_separate` so the probe can live
+    inside :func:`_write_manifest` (see its docstring): the rule is unchanged —
+    resolve as usual, then, because a single loose file has no album to title the
+    book, prefer its own ID3 title (else the cleaned filename) over the
+    watch-folder fallback.
+    """
+    author, title = metadata.derive_author_title(watch, probes)
+    if not (probes and probes[0].get("tags", {}).get("album")):
+        title = metadata.chapter_name(probes[0]) if probes else f.stem
+    return author, title
 
 
 def rescan_book_manifest(manifest: dict, *, force: bool = True) -> dict | None:
@@ -1315,19 +1862,36 @@ def scan_watch_folder(
     watch: Path,
     previous_group: dict | None = None,
     resolved: list | None = None,
+    publish_early: Callable[[list[dict], dict | None], None] | None = None,
 ) -> tuple[list[dict], dict | None]:
     """Discover books AND any loose-mp3 group under ``watch``.
 
     Returns ``(manifests, pending_group)``:
       - ``manifests`` — current manifest dicts for each subfolder-book (a book = a
-        direct subfolder containing ≥1 mp3, M0.2), ordered by folder name. Unchanged
-        from before — subfolder books keep working exactly as they did.
+        direct subfolder containing ≥1 mp3, M0.2), ordered by folder name.
       - ``pending_group`` — a :func:`_build_pending_group` dict when ≥1 mp3 lives
         loose in the watch ROOT (D1 / flows S4) AND that set has not already been
         resolved (``resolved`` ledger), else ``None``. ``previous_group`` (from the
         prior state.json) is passed through so an unchanged set keeps its ``token``.
 
     Returns ``([], None)`` if the watch dir does not exist yet.
+
+    TWO PASSES, and the order is the whole feature (D17). Pass 1 is everything a
+    ``stat`` walk already pays for: fingerprint, gates, copy-stability debounce and
+    a SKELETON manifest per new book. Then — with ``publish_early`` — the caller
+    publishes and nudges: the window is on screen at ~0.8 s. Pass 2 is the part
+    that costs real time (ffprobe over every chapter, then the LOCAL cover chain)
+    and it runs with the human already looking at the book.
+
+    Both passes are strictly local. The web lookup for covers is not here at all —
+    it is a third pass that runs after the drain (:func:`enrich_covers_web`), which
+    is what makes the time to ``ready`` — and therefore to an active «Собрать» —
+    the same on a dead network as on a live one.
+
+    Pass 1 writes ALL the skeletons before the single early publication, rather
+    than publishing each book as it is armed. Dropping five books at once is a
+    rapid-fire case: five publications would mean five ledger reconciliations and
+    five nudges racing each other for the foreground. One publication, one nudge.
     """
     watch = Path(watch)
     if not watch.is_dir():
@@ -1339,14 +1903,18 @@ def scan_watch_folder(
     )
 
     manifests: list[dict] = []
+    plans: list[tuple[int, _ManifestPlan]] = []
     for folder in subfolders:
-        if not _list_mp3s(folder):
+        args = _book_manifest_args(folder)
+        if not args["mp3s"]:
             continue  # no mp3s → not a book (yet)
-        m = write_manifest_for_book(folder)
-        if m is None:
+        current, plan = _begin_manifest(**args, staged=True)
+        if current is None:
             # E10: files still being copied → not armed this pass; next scan retries.
             continue
-        manifests.append(m)
+        manifests.append(current)
+        if plan is not None:
+            plans.append((len(manifests) - 1, plan))
 
     loose = _list_loose_mp3s(watch)
     pending_group: dict | None = None
@@ -1364,7 +1932,7 @@ def scan_watch_folder(
             and previous_group.get("group_id") == group_id_for(loose)
             and previous_group.get("rev") == group_rev_for(loose, watch)
         )
-        if unchanged or _files_are_stable(loose):
+        if unchanged or _files_are_stable(loose, watch):
             pending_group = _build_pending_group(
                 watch, loose, previous=previous_group, resolved=resolved
             )
@@ -1377,6 +1945,29 @@ def scan_watch_folder(
                 count=len(loose),
             )
             pending_group = previous_group if isinstance(previous_group, dict) else None
+
+    # --- EARLY PUBLICATION (skeletons only) -----------------------------------
+    # Fires only when this pass actually armed something new: a scan that found
+    # nothing to fill in publishes exactly once, at the end, exactly as before.
+    if plans and publish_early is not None:
+        try:
+            publish_early(list(manifests), pending_group)
+        except Exception as exc:  # defensive: the fill-in must survive a bad publish
+            state.append_event("early_publish_failed", error=repr(exc)[:200])
+
+    # --- PASS 2: probe → chapters → cover → ready ------------------------------
+    for index, plan in plans:
+        try:
+            manifests[index] = _finish_manifest(plan)
+        except _ManifestHalt as halt:
+            # Test seam only (MP3TOM4B_HALT_AFTER_PHASE). Stop the whole pass the
+            # way a crash would, leaving this manifest at the halted phase for the
+            # next scan's resume to pick up.
+            state.append_event(
+                "manifest_halted", book_id=plan.bid, after_phase=str(halt)
+            )
+            break
+
     return manifests, pending_group
 
 
@@ -2053,13 +2644,39 @@ def run_scan(watch: Path | None = None) -> dict:
     previous_group = _previous_pending_group(prev)
     ledger = _previous_grouping_ledger(prev)
     prior_progress = _previous_book_progress(prev)
+
+    def _publish_early(early: list[dict], group: dict | None) -> None:
+        """Publish the skeletons and raise the app — the ~0.8 s window (D17).
+
+        Deliberately NOT a copy of the final publication: the presence reconcile is
+        skipped here. It re-arms books (a done book moved out and back in) and
+        writes manifests, and running it twice per scan would double that work for
+        a case that is not latency-critical anyway — a re-drop is a deliberate
+        gesture, not the "I just dropped a book" moment this path exists for. Any
+        edge it does produce is published (and nudged, once) by the final pass.
+
+        The nudge is the LAST step of the publication, after the manifests are on
+        disk, after state.json, after the ledger — so nothing the app is woken up
+        to look at can still be in flight when it looks.
+        """
+        _publish_showcase_and_maybe_open(
+            build_state(
+                _collect_showcase_manifests(early), target, pending_group=group,
+                grouping_processed=ledger, prior_progress=prior_progress,
+                access=access_fields,
+            )
+        )
+
     try:
         manifests, pending_group = scan_watch_folder(
-            target, previous_group=previous_group, resolved=ledger
+            target, previous_group=previous_group, resolved=ledger,
+            publish_early=_publish_early,
         )
         # Project subfolder books PLUS grouping-materialized books (combined/
         # separate), which live in queue/books/ but have no subfolder to find.
-        showcase_manifests = _collect_showcase_manifests(manifests)
+        showcase_manifests = _upgrade_legacy_manifests(
+            _collect_showcase_manifests(manifests)
+        )
     except OSError as exc:
         # The grant (or the folder) went away BETWEEN the probe and the walk. Rare
         # but real: a probe answers about the past, and TCC state can change under
@@ -2147,3 +2764,190 @@ def refresh_showcase(watch: Path | None = None) -> dict:
     )
     state.write_state(showcase)
     return showcase
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COVER WEB ENRICHMENT — the pass that runs AFTER the scan and the drain (M-B)
+#
+# The process order is now  scan(local) → drain → enrich, and the order is the
+# feature. Nothing the human waits for lives in this pass: the window is up, the
+# book is readable, «Собрать» is active and the build, if he asked for one, has
+# already run. All this adds is more tiles at the END of a cover strip he is
+# already looking at.
+#
+# Four properties, each of which is the reason for a specific line below:
+#
+#   · APPEND-ONLY (the human's own call). New candidates are appended; no existing
+#     option changes id, path, label or position, and ``cover_selected`` is not
+#     touched. Tiles do not move under the cursor while the search runs.
+#   · GENERATION-SCOPED (Архитектор #2). Every file this pass writes carries the
+#     generation of the preparation that started it, and the manifest is RE-READ
+#     and re-checked right before the append — so a book re-armed mid-search is
+#     left alone instead of being handed a previous edition's cover.
+#   · A NETWORK TIMEOUT IS NOT A FOLDER PROBLEM (I6). This pass runs outside the
+#     phase watchdog (``agent.__main__`` disarms it before the drain) and never
+#     touches the watch folder or ``folder_access``: it reads manifests in
+#     Application Support and writes images to ``covers/``. A dead network can no
+#     longer produce the «нет доступа к папке» card — not because the timing works
+#     out, but because the two are no longer on the same clock.
+#   · IT YIELDS. Bounded by the pass budget, stopped by a shutdown signal, and
+#     abandoned the moment a command is waiting — the human clicking «Собрать»
+#     outranks a cover search every time.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def cover_web_state(manifest: dict) -> str:
+    """The manifest's web-leg state; ``""`` when it owes nothing (compat default)."""
+    if not isinstance(manifest, dict):
+        return ""
+    value = manifest.get("cover_web")
+    return value if isinstance(value, str) else ""
+
+
+def _cover_web_tries(manifest: dict) -> int:
+    """How many enrichment passes have already tried this book (0 if unknown)."""
+    try:
+        return max(0, int(manifest.get("cover_web_tries") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _needs_web_enrichment(manifest: dict) -> bool:
+    """Whether THIS manifest, as it is on disk right now, still owes a web lookup.
+
+    Four conditions, and the last three are what keep the pass from touching a
+    book it has no business in: the leg must be owed (``pending``, tries left), the
+    manifest must be COMPLETE (``ready`` — a skeleton has no title to search for
+    and no options to append to), and the book must still be waiting for the human
+    (``pending-confirm`` — a converting/done/skipped book is nobody's cover strip).
+    """
+    return (
+        cover_web_state(manifest) == COVER_WEB_PENDING
+        and _cover_web_tries(manifest) < COVER_WEB_MAX_TRIES
+        and manifest_phase(manifest) == MANIFEST_PHASE_READY
+        and manifest.get("status") == MANIFEST_STATUS_PENDING
+    )
+
+
+def _commands_waiting() -> bool:
+    """True if the app has queued a command we are making wait (best-effort)."""
+    try:
+        return any(p.is_file() for p in config.commands_dir().glob("*.json"))
+    except OSError:
+        return False
+
+
+def _enrich_book_covers(path: Path, manifest: dict) -> int:
+    """Run the web lookup for ONE book and APPEND what it found. Returns #appended.
+
+    The search takes seconds, so the manifest that was read before it is not the
+    manifest we may write after it. We therefore RE-READ the file and re-check
+    both the eligibility and the GENERATION before appending: a book re-armed (or
+    confirmed, or skipped) while we were on the network is left exactly as it is,
+    and the images we downloaded are simply orphaned under their own generation's
+    names — which is the whole reason those names exist.
+
+    Everything an already-visible tile depends on is copied through untouched: the
+    existing options keep their order, ids and paths, and ``cover_selected`` is not
+    written at all. The only fields this function changes are ``cover_options``
+    (extended at the end), the two web-leg bookkeeping fields and ``ts``.
+    """
+    bid = str(manifest.get("book_id") or "")
+    generation = cover.cover_generation(manifest)
+    before = manifest.get("cover_options")
+    before = before if isinstance(before, list) else []
+    # Continue the numbering past any web option a previous attempt already saved,
+    # so ids stay unique and nothing already published has to be renamed.
+    start = sum(1 for o in before if isinstance(o, dict) and o.get("kind") == "web")
+    found = cover.web_options_for(manifest, start_index=start)
+
+    fresh = state.read_json(path, default=None)
+    if (not isinstance(fresh, dict)
+            or not _needs_web_enrichment(fresh)
+            or cover.cover_generation(fresh) != generation):
+        state.append_event(
+            "cover_web_discarded", book_id=bid, found=len(found),
+            reason="manifest moved on while the search was running",
+        )
+        if isinstance(fresh, dict) and found:
+            # The images we just downloaded belong to a preparation nobody points
+            # at. The re-arm's own sweep ran BEFORE we wrote them, so collect them
+            # here rather than leaving them until the next one.
+            cover.sweep_stale_cover_files(bid, cover.cover_generation(fresh))
+        return 0
+
+    options = [o for o in (fresh.get("cover_options") or []) if isinstance(o, dict)]
+    known = {o.get("id") for o in options}
+    appended = [o for o in found if o["id"] not in known]
+
+    tries = _cover_web_tries(fresh) + 1
+    fresh["cover_options"] = options + appended          # APPEND-ONLY, by construction
+    fresh["cover_web_tries"] = tries
+    if appended or tries >= COVER_WEB_MAX_TRIES:
+        fresh["cover_web"] = COVER_WEB_DONE
+    fresh["ts"] = time.time()
+    state.write_json_atomic(path, fresh)
+    state.append_event(
+        "cover_web_enriched", book_id=bid, appended=len(appended), tries=tries,
+        options=len(fresh["cover_options"]), state=cover_web_state(fresh),
+    )
+    return len(appended)
+
+
+def enrich_covers_web() -> int:
+    """Append web-found covers to every book that still owes a lookup. Returns #books.
+
+    The last pass of a tick, and the only one allowed to be slow. Walks the
+    manifests that are ``ready`` + ``pending-confirm`` + ``cover_web=pending``,
+    searches for each in turn and appends what it finds, refreshing the showcase
+    after every book so tiles appear as they arrive rather than all at the end.
+
+    Never raises and never reports a folder problem: the watch folder is not read
+    here at all. Returns the number of books that actually gained a candidate.
+    """
+    if not _cover_web_enabled():
+        return 0
+    _reset_cover_web_budget()
+    try:
+        paths = sorted(config.books_dir().glob("*.json"))
+    except OSError:
+        return 0
+
+    enriched = 0
+    for path in paths:
+        if shutdown.requested():
+            state.append_event("cover_web_stopped", reason=shutdown.name() or "signal")
+            break
+        if _commands_waiting():
+            # A queued command is the human waiting on a real answer; a cover
+            # search is not. Leave the rest ``pending`` for the next tick.
+            state.append_event("cover_web_yielded", reason="commands queued")
+            break
+        if not _cover_web_allowed():
+            state.append_event(
+                "cover_web_budget_exhausted",
+                spent_s=round(_cover_web_spent_s, 3),
+                budget_s=_cover_web_budget_s(),
+            )
+            break
+        manifest = state.read_json(path, default=None)
+        if not isinstance(manifest, dict) or not _needs_web_enrichment(manifest):
+            continue
+        started = time.monotonic()
+        try:
+            appended = _enrich_book_covers(path, manifest)
+        except Exception as exc:  # noqa: BLE001 — one bad book never stops the pass
+            appended = 0
+            state.append_event(
+                "cover_web_failed", book_id=str(manifest.get("book_id") or ""),
+                error=repr(exc)[:200],
+            )
+        finally:
+            _charge_cover_web(time.monotonic() - started)
+        if appended:
+            enriched += 1
+            try:
+                refresh_showcase()
+            except Exception as exc:  # noqa: BLE001 — the manifest is already right
+                state.append_event("cover_web_publish_failed", error=repr(exc)[:200])
+    return enriched

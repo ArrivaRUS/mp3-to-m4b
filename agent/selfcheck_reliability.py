@@ -41,6 +41,10 @@ fixes a stable numbering and follows the text):
     E14 unmount / source vanished → graceful (no crash)
     E15 split threshold < chapter → oversize part (P1 split; e2e in selfcheck_split)
     E16 crash during build → recover_interrupted + temp cleanup
+    E17 a file that arrives AFTER the list was composed → not armed (M-E; the
+        sibling of E10 that the old debounce could not see at all)
+    E18 the agent dies BETWEEN publication phases (D17) → the next tick resumes
+        and finishes the book, keeping its confirm_token (no second window)
 """
 
 from __future__ import annotations
@@ -174,6 +178,9 @@ def _confirm_build_cmd(manifest: dict, *, idem: str | None = None) -> dict:
         "book_id": bid,
         "source_rev": rev,
         "confirm_token": manifest["confirm_token"],
+        # D17: the app echoes the build_token it saw, proving the command was
+        # minted from a COMPLETE manifest and not from the early-nudge skeleton.
+        "build_token": manifest.get("build_token"),
         "idempotency_key": idem if idem is not None else f"{bid}:{rev[:16]}",
         "params": dict(manifest.get("params", {})),
         "ts": time.time(),
@@ -866,6 +873,117 @@ def run() -> int:  # noqa: C901 - one linear audit, kept flat on purpose
     except Exception as exc:
         record("E16", "Краш при сборке → recover_interrupted + чистка temp", FAIL,
                f"raised {exc!r}")
+
+    # ======================================================================
+    # E17 — a file that arrives AFTER the caller composed its list. Sibling of
+    # E10 and a DIFFERENT failure: E10's file is already known and merely still
+    # growing; here the copy is adding files the scan has not seen at all. The
+    # original debounce compared the ALREADY-COMPOSED list against itself, so it
+    # could only ever notice files that existed when the directory was listed —
+    # 20 files of a 56-file book that is still arriving looked perfectly stable
+    # and the book was armed at a third of its length. With the early nudge that
+    # is not a delayed build any more, it is a WINDOW opening on a third of a
+    # book. The fix re-lists the directory on both observations (M-E).
+    #
+    # Deterministic on purpose: the file is delivered from inside the debounce's
+    # own sleep, so it lands strictly BETWEEN the two observations rather than
+    # racing them.
+    # ======================================================================
+    real_sleep = time.sleep
+    try:
+        os.environ[scan._STABILITY_ENV] = "0.05"
+        late = watch / "Недокоп - Доехал позже"
+        _make_mp3(late / "01.mp3", seconds=1.0, freq=300, tags={"title": "Раз"})
+        _make_mp3(late / "02.mp3", seconds=1.0, freq=400, tags={"title": "Два"})
+        donor = late / "02.mp3"
+        delivered: list[str] = []
+
+        def _sleep_and_deliver(seconds):
+            if not delivered:
+                delivered.append("03")
+                shutil.copy2(donor, late / "03.mp3")
+            real_sleep(seconds)
+
+        stale_list = scan._list_mp3s(late)
+        scan.time.sleep = _sleep_and_deliver
+        old_way = (scan._size_mtime_snapshot(stale_list)
+                   == scan._size_mtime_snapshot(stale_list))
+        delivered.clear()
+        (late / "03.mp3").unlink(missing_ok=True)
+        new_way = scan._files_are_stable(stale_list, late)
+        delivered.clear()
+        (late / "03.mp3").unlink(missing_ok=True)
+        scan.run_scan()
+        armed_mid_copy = _manifest_for(config, state, "Недокоп - Доехал позже")
+        scan.time.sleep = real_sleep
+        os.environ[scan._STABILITY_ENV] = "0"
+        scan.run_scan()
+        settled = _manifest_for(config, state, "Недокоп - Доехал позже")
+        os.environ.pop(scan._STABILITY_ENV, None)
+        full = (settled is not None and len(settled.get("chapters") or []) == 3
+                and settled.get("status") == "pending-confirm")
+        if old_way and new_way is False and armed_mid_copy is None and full:
+            record("E17", "Файл доехал ПОСЛЕ составления списка → книга не армируется",
+                   PASS,
+                   "старое сравнение (список сам с собой) звало книгу стабильной; "
+                   "новое перечитывает каталог → книга не армирована на середине "
+                   "копирования, после стабилизации армирована ЦЕЛИКОМ (3 главы)")
+        else:
+            record("E17", "Файл доехал ПОСЛЕ составления списка → книга не армируется",
+                   FAIL,
+                   f"old_way={old_way} new_way={new_way} "
+                   f"armed_mid_copy={armed_mid_copy is not None} full={full}")
+    except Exception as exc:
+        scan.time.sleep = real_sleep
+        os.environ.pop(scan._STABILITY_ENV, None)
+        record("E17", "Файл доехал ПОСЛЕ составления списка → книга не армируется",
+               FAIL, f"raised {exc!r}")
+
+    # ======================================================================
+    # E18 — the agent dies BETWEEN the phases of a two-phase publication (D17).
+    # The window is already up on the skeleton, so a manifest stuck at an
+    # incomplete phase is not a delayed book — it is a book the human is looking
+    # at that will never fill in and can never be built (the build gate is
+    # fail-closed on `build_token`, which only the final write mints). The scan's
+    # short-circuit therefore has to be phase-aware: an unchanged `source_rev`
+    # means "resume", not "nothing to do". Reproduced through the
+    # MP3TOM4B_HALT_AFTER_PHASE seam, which stops the fill-in the way a crash
+    # would — for BOTH incomplete phases.
+    # ======================================================================
+    try:
+        outcomes = {}
+        for phase in ("skeleton", "chapters"):
+            folder = watch / f"Обрыв - {phase}"
+            _make_mp3(folder / "01.mp3", seconds=1.0, freq=300, tags={"title": "Раз"})
+            _make_mp3(folder / "02.mp3", seconds=1.0, freq=400, tags={"title": "Два"})
+            os.environ["MP3TOM4B_HALT_AFTER_PHASE"] = phase
+            scan.run_scan()
+            os.environ.pop("MP3TOM4B_HALT_AFTER_PHASE", None)
+            halted = _manifest_for(config, state, f"Обрыв - {phase}")
+            scan.run_scan()                      # следующий тик launchd
+            healed = _manifest_for(config, state, f"Обрыв - {phase}")
+            outcomes[phase] = (
+                halted is not None and scan.manifest_phase(halted) == phase
+                and not scan.manifest_build_token(halted)
+                and healed is not None and scan.manifest_phase(healed) == "ready"
+                and bool(scan.manifest_build_token(healed))
+                and healed.get("confirm_token") == halted.get("confirm_token")
+                and healed.get("source_rev") == halted.get("source_rev")
+                and len(healed.get("chapters") or []) == 2
+            )
+        if all(outcomes.values()):
+            record("E18", "Агент умер между фазами → следующий тик достраивает книгу",
+                   PASS,
+                   "обе незавершённые фазы (skeleton, chapters) подхвачены следующим "
+                   "сканом: фаза ready, build_token выдан, confirm_token и source_rev "
+                   "сохранены (второго подъёма окна нет)")
+        else:
+            record("E18", "Агент умер между фазами → следующий тик достраивает книгу",
+                   FAIL, f"outcomes={outcomes}")
+    except Exception as exc:
+        os.environ.pop("MP3TOM4B_HALT_AFTER_PHASE", None)
+        record("E18", "Агент умер между фазами → следующий тик достраивает книгу",
+               FAIL, f"raised {exc!r}")
 
     # === summary ============================================================
     n_pass = sum(1 for _, _, v, _ in _RESULTS if v == PASS)

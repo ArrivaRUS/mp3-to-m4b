@@ -14,7 +14,12 @@
 // matches && confirm_token valid — structural invariant I2):
 //
 //     { cmd_id, action:"confirm-build", book_id, source_rev, confirm_token,
-//       idempotency_key, params:{bitrate,channels,samplerate,split}, ts }
+//       build_token, idempotency_key, params:{bitrate,channels,samplerate,split}, ts }
+//
+// `build_token` (D17) is the newest field and the strictest one: it exists only in
+// a COMPLETE manifest, so echoing it proves the command was minted from a book the
+// app had actually finished reading. Without it the agent answers
+// `confirm_rejected_not_ready` and builds nothing.
 //
 // Field names mirror agent/dispatcher.py's documented contract and agent/scan.py's
 // manifest/params keys EXACTLY — a drift here would be silently dropped to
@@ -47,6 +52,14 @@ struct EngineClient {
         let bookID: String
         let sourceRev: String
         let confirmToken: String
+        /// D17 — the agent's proof that this command was minted from a COMPLETE
+        /// manifest. Echoed VERBATIM from `BookManifest.buildToken`; the agent
+        /// compares it with the token on disk and rejects anything else
+        /// (`manifest_not_ready` when the manifest has none — i.e. a command born
+        /// on a skeleton — or `build_token_mismatch`). It exists as a separate
+        /// token, and not as a phase check agent-side, precisely because a command
+        /// can outlive the phase it was written in: see `BookManifest.isBuildReady`.
+        let buildToken: String
         let idempotencyKey: String
         let params: Params
         let ts: Double
@@ -126,6 +139,7 @@ struct EngineClient {
             case bookID = "book_id"
             case sourceRev = "source_rev"
             case confirmToken = "confirm_token"
+            case buildToken = "build_token"
             case idempotencyKey = "idempotency_key"
             case params
             case ts
@@ -334,6 +348,12 @@ struct EngineClient {
             bookID: manifest.bookID,
             sourceRev: manifest.sourceRev,
             confirmToken: manifest.confirmToken,
+            // Echoed as-is, including "" for a manifest that has none. An empty
+            // token can only come from an incomplete manifest, and the agent
+            // refuses it — which is the point: the gate is fail-closed, and the
+            // button that produces this command is itself gated on
+            // `manifest.isBuildReady`, so a "" here means something upstream lied.
+            buildToken: manifest.buildToken,
             idempotencyKey: Self.idempotencyKey(
                 bookID: manifest.bookID, sourceRev: manifest.sourceRev),
             params: .init(from: params ?? manifest.params,

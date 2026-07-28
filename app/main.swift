@@ -56,22 +56,9 @@ enum Screen {
     }
 }
 
-/// The confirm footer's "Применить параметры ко всем (N)" (US-3.7 / spec §3):
-/// the build params the user approved once, plus the ids of the books that were
-/// awaiting confirmation at that moment. Purely APP-SIDE — the protocol has no
-/// `apply-to-all` command, so this only PRE-FILLS the confirm window of those
-/// books; each one still rides to the agent in its own `confirm-build` after a
-/// human "ок" (invariant I2). The COVER is deliberately not part of the preset —
-/// it stays per-book (US-3.7 AC: «обложку всё равно подтверждаю по каждой»).
-struct ParamsPreset: Equatable {
-    let params: BookParams
-    /// Snapshot of the `pending-confirm` ids at the moment of the click. A book
-    /// recognized LATER was not "ожидающей" then, so it keeps its own defaults
-    /// instead of silently inheriting a stale preset.
-    let bookIDs: Set<String>
-
-    func applies(to bookID: String) -> Bool { bookIDs.contains(bookID) }
-}
+// `ParamsPreset` (the "Применить ко всем" session preset) moved to
+// app/StateModel.swift: it is an input of the pure `ConfirmMerge` rule, and that
+// rule has to be unit-checkable without the view layer.
 
 /// A pending "the system is about to ask you for access" notice.
 ///
@@ -2404,31 +2391,21 @@ private struct ConfirmView: View {
     /// window. Undo: «Вернуть» in the queue's ПРОПУЩЕНО section, or a re-drop.
     let onSkip: () -> Bool
 
-    // Editable book fields, seeded from the manifest. (The title field also drives
-    // the disabled-state validation: an empty title blocks "Собрать", spec §3.)
-    @State private var title: String
-    @State private var author: String
+    // EVERY editable field of this window, in ONE piece of state (D17).
+    //
+    // Why one and not the eight it used to be: with the two-phase publication the
+    // agent hands this SAME view instance a newer manifest for the same book_id
+    // (skeleton → chapters → ready), and SwiftUI does not re-seed `@State` on its
+    // own — `.id(manifest.bookID)` only resets it when the BOOK changes. So the
+    // fields have to be merged, and merging eight independent `@State`s from a
+    // dozen call-sites is exactly the drift both architects predicted. Instead the
+    // whole draft is replaced wholesale by ONE pure rule, `ConfirmMerge.merge`
+    // (app/StateModel.swift), which is unit-checkable on its own.
+    @State private var draft: ConfirmDraft
 
-    // Editable build params, seeded from the manifest defaults (D2). User edits
-    // flow into the confirm-build command verbatim.
-    @State private var bitrate: Int
-    @State private var channels: String   // "stereo" | "mono"
-    /// nil = "as in source" (no resample); a concrete value (44100/48000) = the
-    /// user's explicit override. Seeds from the manifest's `samplerate` (nil default).
-    @State private var samplerate: Int?
-    @State private var split: Bool
-    /// Part-size threshold in MB (slider 250…700, default 300 — spec §6 / D6).
-    @State private var splitThresholdMB: Double
-    /// Build mode (D15): "fast" (default) | "seamless". The КАЧЕСТВО segment writes
-    /// it; it rides to the engine in confirm-build's params (build_m4b branches on it).
-    @State private var buildMode: String
-
-    // Cover pick — LOCAL window state (spec/protocol: the choice rides in
-    // confirm-build's params, not a separate command). `coverSelectedID` is the id
-    // of the chosen option (seeded from manifest.coverSelected). A user "Заменить"
-    // appends a synthetic `custom` option to `extraCoverOptions` (the original file
-    // path) and selects it; the agent copies that file under covers/ on build.
-    @State private var coverSelectedID: String?
+    // Cover pick: the CHOICE lives in `draft.coverSelectedID`; this holds the
+    // client-only options a user added via "Заменить" (the original file path). The
+    // agent copies that file under covers/ on build — the app never writes there.
     @State private var extraCoverOptions: [CoverOption] = []
 
     /// App-side idempotency: once a command is dropped for this book, lock the
@@ -2464,40 +2441,51 @@ private struct ConfirmView: View {
         self.onOpenQueue = onOpenQueue
         self.onCancel = onCancel
         self.onSkip = onSkip
-        // Prefer the manifest's resolved title/author; fall back to the showcase
-        // title (which the agent also fills) so the field is never blank-by-bug.
-        _title = State(initialValue: manifest.title.isEmpty ? book.title : manifest.title)
-        _author = State(initialValue: manifest.author)
-        // Build params come from the "ко всем" preset when it covers this book,
-        // otherwise from the manifest defaults (D2). Title/author/cover are NEVER
-        // preset — they are per-book by definition (US-3.7 AC).
-        let seed = paramsPreset.flatMap { $0.applies(to: manifest.bookID) ? $0.params : nil }
-            ?? manifest.params
-        _bitrate = State(initialValue: seed.bitrate)
-        _channels = State(initialValue: seed.channels)
-        _samplerate = State(initialValue: seed.samplerate)
-        _split = State(initialValue: seed.split)
-        // Seed the threshold from the manifest, clamped into the slider's 250…700 МБ
-        // range so a stray param can't push the knob off-track (default 300, D6).
-        _splitThresholdMB = State(initialValue:
-            Double(min(700, max(250, seed.splitThresholdMB))))
-        _buildMode = State(initialValue: seed.buildMode)
-        // Seed the cover pick from the agent's default (cover_selected); fall back to
-        // the first option so something is always selected when options exist.
-        _coverSelectedID = State(initialValue:
-            manifest.coverSelected ?? manifest.coverOptions.first?.optID)
+        // The initial draft is the SAME rule the live merge uses (`seed` is
+        // `merge`'s "no prior draft" case), so a field can never be seeded one way
+        // at open and updated another way a second later. Title falls back to the
+        // showcase row so it is never blank-by-bug; params come from the "ко всем"
+        // preset when it covers this book, otherwise from the manifest (D2).
+        // Title/author/cover are NEVER preset — per-book by definition (US-3.7 AC).
+        _draft = State(initialValue: ConfirmMerge.seed(manifest: manifest,
+                                                       fallbackTitle: book.title,
+                                                       preset: paramsPreset))
     }
+
+    // MARK: Draft ⇄ controls
+
+    // The draft is written ONLY through these bindings and through the one merge
+    // assignment in `body`. Each setter marks its field as touched — and only on a
+    // REAL change: SwiftUI re-writes a TextField binding on focus events with an
+    // identical value, and treating that as an edit would freeze the field against
+    // the very ID3 data the human is waiting for.
+    private func edit<T: Equatable>(_ path: WritableKeyPath<ConfirmDraft, T>,
+                                    _ flag: TouchedFields) -> Binding<T> {
+        Binding(
+            get: { draft[keyPath: path] },
+            set: { new in
+                guard draft[keyPath: path] != new else { return }
+                draft[keyPath: path] = new
+                draft.touched.insert(flag)
+            })
+    }
+
+    private var title: String { draft.title }
+    private var author: String { draft.author }
+    private var bitrate: Int { draft.params.bitrate }
+    private var channels: String { draft.params.channels }
+    private var samplerate: Int? { draft.params.samplerate }
+    private var split: Bool { draft.params.split }
+    private var buildMode: String { draft.params.buildMode }
+    private var splitThresholdMB: Int { draft.params.splitThresholdMB }
+    private var coverSelectedID: String? { draft.coverSelectedID }
 
     /// Bitrate presets (kbps) offered in the quality box (spec §3, D2 default 192).
     private static let bitratePresets = [64, 96, 128, 192, 256]
 
     /// The edited params as they'll be sent to the agent (keys 1:1 with the manifest).
-    private var editedParams: BookParams {
-        BookParams(bitrate: bitrate, channels: channels,
-                   samplerate: samplerate, split: split,
-                   splitThresholdMB: Int(splitThresholdMB.rounded()),
-                   buildMode: buildMode)
-    }
+    /// The draft IS the edited state — there is nothing to reassemble.
+    private var editedParams: BookParams { draft.params }
 
     // MARK: Cover-pick derivation
 
@@ -2575,7 +2563,24 @@ private struct ConfirmView: View {
             // OUTSIDE any scroll, so «Собрать» is ALWAYS visible.
             footer
         }
+        // THE MERGE — the single point where a newer manifest reaches the fields
+        // (D17). One assignment through one pure rule: no per-field patching here,
+        // and no other place in this view writes the draft except the user's own
+        // bindings. Fires on every manifest change for this book_id, which is what
+        // the phase progression (skeleton → chapters → ready) produces; the rule
+        // itself decides what the человек has earned the right to keep.
+        .onChange(of: manifest) { newManifest in
+            draft = ConfirmMerge.merge(draft, with: newManifest,
+                                       fallbackTitle: book.title,
+                                       preset: paramsPreset,
+                                       extraCoverIDs: Set(extraCoverOptions.map { $0.optID }))
+        }
     }
+
+    /// What the window is allowed to claim about how complete this book is — one
+    /// value feeding the note, the cover placeholder AND the «Собрать» gate, so
+    /// they cannot contradict each other.
+    private var preparation: ConfirmPreparation { .forManifest(manifest) }
 
     /// Screen-derived height budget for the MIDDLE area (the band between the fixed
     /// header and the pinned footer) — i.e. the most the two-column body may be tall
@@ -2614,6 +2619,12 @@ private struct ConfirmView: View {
     private var headerSub: String {
         switch mode {
         case .confirm:
+            // While the agent is still reading the book, the sub-line SAYS SO in
+            // place of the standing instruction. It occupies the same single line,
+            // so nothing moves when it is replaced — and it is the only place the
+            // "ещё едет" fact is worded, which is why it can't drift from the
+            // button's state (both read `preparation`).
+            if let note = preparation.note { return note }
             return "Проверьте качество и обложку — сборка стартует только по «Собрать»"
         case .converting, .error:
             // Identify the book by its resolved title (мокап: «Война и мир»).
@@ -2867,9 +2878,10 @@ private struct ConfirmView: View {
     // Padding 18 18 18 20 (top right bottom left).
     private var leftColumn: some View {
         VStack(alignment: .leading, spacing: 0) {
-            field(label: "Автор / чтец", text: $author, weight: .medium)
+            field(label: "Автор / чтец", text: edit(\.author, .author), weight: .medium)
                 .padding(.bottom, 14)
-            field(label: "Название", text: $title, weight: .semibold, invalid: titleIsEmpty)
+            field(label: "Название", text: edit(\.title, .title),
+                  weight: .semibold, invalid: titleIsEmpty)
             if titleIsEmpty {
                 Text("Укажите название — оно станет именем .m4b")
                     .font(.system(size: Tokens.F.chDur))
@@ -2940,6 +2952,18 @@ private struct ConfirmView: View {
     // any overflow (56 chapters scroll; a short book leaves the card taller than its
     // rows, which is the intended "chapters on the full window height" look). A
     // `minHeight` floor keeps the card usable if the right column is ever very short.
+    // The list is rendered from the FIRST frame, in every phase (D17, решение
+    // человека): at `skeleton` the names come from FILE NAMES and the durations are
+    // null (ChapterRow prints "—", never a fabricated 0:00) — a book with 56 real
+    // rows, not a spinner.
+    //
+    // ⚠️ `id: \.element.id` is `ChapterEntry.index`, and that is LOAD-BEARING for
+    // the phase flip, not an incidental choice. When ID3 replaces the file-name
+    // titles, the row IDENTITIES (1…N) are unchanged, so SwiftUI re-renders the
+    // labels in place: a possible one-off re-sort reads as text changing, not as
+    // rows flying around, and neither the scroll position nor the row under the
+    // cursor moves. Key this by `file` or `name` instead and the same update
+    // becomes a full remove/insert animation — the «дёрганье» D17 exists to avoid.
     private var chapterList: some View {
         ScrollView(.vertical, showsIndicators: true) {
             VStack(spacing: 0) {
@@ -3015,13 +3039,21 @@ private struct ConfirmView: View {
         CoverPreview(option: selectedCoverOption,
                      fallbackState: manifest.coverState,
                      fallbackPreview: manifest.coverPreview,
-                     title: title, author: author)
+                     title: title, author: author,
+                     isPreparing: preparation != .ready)
 
-        // Thumbnail strip — only when there is a real choice (≥2 options).
+        // Thumbnail strip — only when there is a real choice (≥2 options). While
+        // the book is still being read there are none yet, so the row's height is
+        // RESERVED: the strip appearing at `ready` must not shove «Заменить», the
+        // quality box and the estimate down (and, through the window refit, resize
+        // the whole window under the user's cursor).
         if options.count > 1 {
-            CoverThumbStrip(options: options, selectedID: $coverSelectedID)
+            CoverThumbStrip(options: options, selectedID: coverBinding)
+        } else if preparation != .ready {
+            Color.clear.frame(height: Tokens.M.confirmCoverThumb + 4)
         }
 
+        coverWebNote
         replaceButton
     }
 
@@ -3064,7 +3096,42 @@ private struct ConfirmView: View {
         let opt = CoverOption(optID: "custom-0", kind: "custom",
                               path: url.path, label: url.lastPathComponent)
         extraCoverOptions = [opt]            // keep a single custom slot
-        coverSelectedID = opt.optID
+        // Through the same touched-marking binding as a thumbnail click: picking a
+        // file IS the человек choosing a cover, so a later manifest (the web/
+        // generated options landing at `ready`) must not overwrite it.
+        coverBinding.wrappedValue = opt.optID
+    }
+
+    /// The cover selection binding — marks `.cover` touched, so the merge rule
+    /// stops re-seeding it from `cover_selected`.
+    private var coverBinding: Binding<String?> { edit(\.coverSelectedID, .cover) }
+
+    /// «Ищем обложку в интернете — можно не ждать» while `cover_web == "pending"`.
+    ///
+    /// The second half of that sentence is the load-bearing half. Web enrichment
+    /// runs AFTER the drain, so this line lives next to a LIT «Собрать» button —
+    /// and a user who reads «ищем…» and waits would hand back exactly the seconds
+    /// M-B took the web off the critical path to save. So it says outright that
+    /// waiting is optional. No progress bar and no count: the search is
+    /// non-deterministic, and a bar over it would be a fabricated promise.
+    ///
+    /// ⚠️ It is a LABEL, nothing else. It must never reach `buildDisabled` /
+    /// `preparation` — see `BookManifest.isCoverWebPending`.
+    ///
+    /// The row keeps its height when the text goes away (a non-breaking space, not
+    /// a removed view). `cover_web` flips to `done` seconds-to-minutes later, long
+    /// after the human has settled into the window — collapsing a line then would
+    /// jerk the whole right column (quality box, split slider, estimate) upward
+    /// under his cursor, which is the same class of jolt D17 exists to avoid.
+    private var coverWebNote: some View {
+        Text(manifest.isCoverWebPending
+             ? "Ищем обложку в интернете — можно не ждать"
+             : "\u{00A0}")
+            .font(.system(size: Tokens.F.qSuffix))
+            .foregroundColor(Tokens.C.textQuaternary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // Compact quality box (D10): bitrate preset row + (channels seg · samplerate
@@ -3079,7 +3146,7 @@ private struct ConfirmView: View {
                 HStack(spacing: 5) {
                     ForEach(Self.bitratePresets, id: \.self) { preset in
                         PresetButton(label: "\(preset)", isOn: bitrate == preset) {
-                            bitrate = preset
+                            edit(\.params.bitrate, .params).wrappedValue = preset
                         }
                     }
                 }
@@ -3091,7 +3158,7 @@ private struct ConfirmView: View {
 
             HStack(spacing: 9) {
                 SegControl(options: [("Стерео", "stereo"), ("Моно", "mono")],
-                           selection: $channels)
+                           selection: edit(\.params.channels, .params))
             }
 
             Hairline(color: Tokens.C.borderHairline)
@@ -3123,7 +3190,7 @@ private struct ConfirmView: View {
             VStack(alignment: .leading, spacing: 6) {
                 SegControl(options: [("Быстрый", "fast"),
                                      ("Бесшовный", "seamless")],
-                           selection: $buildMode)
+                           selection: edit(\.params.buildMode, .params))
                 Text(buildModeHint)
                     .font(.system(size: Tokens.F.qSuffix))
                     .foregroundColor(Tokens.C.textQuaternary)
@@ -3148,11 +3215,24 @@ private struct ConfirmView: View {
     // The samplerate seg works in Hz strings; the "as in source" option maps to the
     // sentinel ⇄ nil, a concrete number ⇄ its Hz string. nil/unknown selects source.
     private var samplerateBinding: Binding<String> {
-        Binding(
-            get: { samplerate.map(String.init) ?? Self.srSourceSentinel },
+        let inner = edit(\.params.samplerate, .params)
+        return Binding(
+            get: { inner.wrappedValue.map(String.init) ?? Self.srSourceSentinel },
             set: { sel in
-                samplerate = (sel == Self.srSourceSentinel) ? nil : Int(sel)
+                inner.wrappedValue = (sel == Self.srSourceSentinel) ? nil : Int(sel)
             }
+        )
+    }
+
+    /// The threshold slider works in points (Double); the draft — and the wire —
+    /// carry whole МБ, which is also the granularity the agent plans parts at
+    /// (agent/split.py takes МБ). Rounding on write keeps ONE source of truth
+    /// instead of a Double shadow that only rounds when the command is sent.
+    private var splitThresholdBinding: Binding<Double> {
+        let inner = edit(\.params.splitThresholdMB, .params)
+        return Binding(
+            get: { Double(inner.wrappedValue) },
+            set: { inner.wrappedValue = Int($0.rounded()) }
         )
     }
 
@@ -3202,7 +3282,7 @@ private struct ConfirmView: View {
                         .foregroundColor(Tokens.C.textSecondary)
                 }
                 Spacer()
-                Toggle2(isOn: $split)
+                Toggle2(isOn: edit(\.params.split, .params))
             }
             if split {
                 splitThresholdSlider
@@ -3220,11 +3300,13 @@ private struct ConfirmView: View {
                     .font(.system(size: Tokens.F.small))
                     .foregroundColor(Tokens.C.textSecondary)
                 Spacer()
-                Text("\(Int(splitThresholdMB.rounded())) МБ")
+                Text("\(splitThresholdMB) МБ")
                     .font(.system(size: Tokens.F.small).monospacedDigit())
                     .foregroundColor(Tokens.C.textSoft)
             }
-            GradientSlider(value: $splitThresholdMB, range: 250...700)
+            GradientSlider(value: splitThresholdBinding,
+                           range: Double(ConfirmMerge.thresholdRangeMB.lowerBound)
+                               ... Double(ConfirmMerge.thresholdRangeMB.upperBound))
         }
     }
 
@@ -3487,11 +3569,30 @@ private struct ConfirmView: View {
         .accessibilityLabel("\(title). \(help)")
     }
 
+    /// «Собрать» is inert while the title is empty (spec §3) OR while the agent has
+    /// not finished the book (D17). The second half is not cosmetic: without a
+    /// `build_token` the command the button writes would be refused
+    /// (`confirm_rejected_not_ready`), so an enabled button here would be a control
+    /// that visibly does nothing — the exact class of bug lesson 005 is about.
+    ///
+    /// It makes exactly ONE disabled → enabled transition per publication, because
+    /// `isBuildReady` is monotone within a `source_rev` (see its doc comment) — no
+    /// blinking by construction, not by a debounce.
+    private var buildDisabled: Bool { titleIsEmpty || !manifest.isBuildReady }
+
+    /// Why the button is dimmed, in the user's terms. Never empty: a visibly inert
+    /// control must always be able to explain itself on hover.
+    private var buildDisabledHint: String {
+        if let hint = preparation.buildHint, !titleIsEmpty { return hint }
+        if titleIsEmpty { return "Укажите название — оно станет именем .m4b." }
+        return "Собрать книгу в один .m4b с главами."
+    }
+
     // Active "Собрать": writes the command with edited params, then locks the ack.
-    // Disabled (dimmed) when the title is empty — spec §3 disabled state.
+    // Disabled (dimmed) when the title is empty or the book is still being read.
     private var buildButton: some View {
         Button(action: {
-            guard !titleIsEmpty else { return }
+            guard !buildDisabled else { return }
             failed = false
             if onBuild(editedParams, sendCoverID, sendCoverCustomPath) {
                 sent = true
@@ -3505,14 +3606,16 @@ private struct ConfirmView: View {
                 Text(failed ? "Повторить" : "Собрать")
                     .font(.system(size: Tokens.F.input, weight: .bold))
             }
-            .foregroundColor(titleIsEmpty ? Tokens.C.textQuaternary : Tokens.C.textOnAccent)
+            .foregroundColor(buildDisabled ? Tokens.C.textQuaternary : Tokens.C.textOnAccent)
             .padding(.horizontal, 22)
             .padding(.vertical, 10)
             .background(buildButtonBackground)
         }
         .buttonStyle(.plain)
         .contentShape(Rectangle())
-        .disabled(titleIsEmpty)
+        .disabled(buildDisabled)
+        .help(buildDisabledHint)
+        .accessibilityLabel("Собрать. \(buildDisabledHint)")
     }
 
     // Disabled → flat dim fill (rgba(255,255,255,.08)) per spec §3; enabled → the
@@ -3520,7 +3623,7 @@ private struct ConfirmView: View {
     // macOS-11-safe — AnyShapeStyle is 12+.
     @ViewBuilder
     private var buildButtonBackground: some View {
-        if titleIsEmpty {
+        if buildDisabled {
             RoundedRectangle(cornerRadius: Tokens.R.control, style: .continuous)
                 .fill(Color.white(0.08))
         } else {
@@ -3580,8 +3683,15 @@ private struct ConfirmView: View {
 
     // Estimate big line: "≈ 1.18 ГБ". Mirrors agent/build_m4b.estimate_output_size:
     // audio = bitrate_bps/8 × seconds, + cover allowance (embedded) + mux overhead.
+    //
+    // Every term of that formula is multiplied by the DURATION, which the skeleton
+    // does not have (`duration_ms: null`). The old code still printed the sum — the
+    // mux overhead alone, "≈ 64 КБ", for a 25-hour book. A number that is wrong by
+    // four orders of magnitude is worse than no number, so an unprobed book gets an
+    // honest dash and the box keeps its size (nothing jumps when the real figure
+    // lands a second later).
     private var estimateBigLabel: String {
-        "≈ \(ByteSize.human(estimatedBytes))"
+        manifest.hasDurations ? "≈ \(ByteSize.human(estimatedBytes))" : "≈ —"
     }
 
     private var estimateSubLabel: String {
@@ -3603,7 +3713,7 @@ private struct ConfirmView: View {
     // the CURRENT bitrate and the slider's threshold (MB→bytes). Recomputes whenever
     // either changes, so the preview matches the build the agent will make.
     private var splitParts: [SplitPart] {
-        let thresholdBytes = Int(splitThresholdMB.rounded()) * 1024 * 1024
+        let thresholdBytes = splitThresholdMB * 1024 * 1024
         return SplitPlanner.plan(chapters: manifest.chapters,
                                  bitrateKbps: bitrate,
                                  thresholdBytes: thresholdBytes)
@@ -3615,7 +3725,13 @@ private struct ConfirmView: View {
     private var splitPreviewLabel: String {
         let parts = splitParts
         guard !parts.isEmpty else {
-            // No usable per-chapter durations — degrade to one whole-book "part".
+            // No usable per-chapter durations. Until they land the planner has
+            // nothing to plan with, and inventing "1 часть по ~64 КБ" out of the
+            // mux overhead would be the same four-orders-of-magnitude lie the
+            // estimate box used to tell.
+            guard manifest.hasDurations else { return "Посчитаем, когда дочитаем главы" }
+            // Durations known but the planner returned nothing — degrade to one
+            // whole-book "part" (the pre-existing behaviour).
             return "≈ 1 \(Plural.parts(1)) по ~\(ByteSize.human(estimatedBytes))"
         }
         let n = parts.count
@@ -3663,26 +3779,44 @@ private struct ConfirmView: View {
     private func coverCap(_ style: CoverBadgeStyle?) -> some View {
         HStack(spacing: 8) {
             cap("ОБЛОЖКА")
+            // The badge is TALLER than the caps text, so it — not the label — sets
+            // this row's height. Before D17 that was invisible: the window only ever
+            // opened on a finished book, so the badge was there from the first
+            // frame. Now the window opens at `skeleton`, with no cover and no badge,
+            // and the badge ARRIVING at `ready` would grow the row and push the
+            // whole right column down. So the slot is always occupied: an invisible
+            // twin of the real badge holds the height, and the real one drops into
+            // it without moving anything.
             if let style = style {
-                HStack(spacing: 5) {
-                    Circle().fill(style.dot).frame(width: 5, height: 5)
-                    Text(style.text)
-                        .font(.system(size: Tokens.F.badge, weight: .bold))
-                        .tracking(0.3)
-                        .foregroundColor(Tokens.C.textOnAccentHigh)
-                }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: Tokens.R.small, style: .continuous)
-                        .fill(style.bg)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: Tokens.R.small, style: .continuous)
-                        .stroke(style.border, lineWidth: 1)
-                )
+                badge(style)
+            } else {
+                badge(CoverBadgeStyle.forKind("embedded", text: "\u{00A0}"))
+                    .opacity(0)
+                    .accessibilityHidden(true)
             }
         }
+    }
+
+    /// The source pill itself (dot + caps text), factored out so the invisible
+    /// height-holder above is literally the same view and cannot drift from it.
+    private func badge(_ style: CoverBadgeStyle) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(style.dot).frame(width: 5, height: 5)
+            Text(style.text)
+                .font(.system(size: Tokens.F.badge, weight: .bold))
+                .tracking(0.3)
+                .foregroundColor(Tokens.C.textOnAccentHigh)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: Tokens.R.small, style: .continuous)
+                .fill(style.bg)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Tokens.R.small, style: .continuous)
+                .stroke(style.border, lineWidth: 1)
+        )
     }
 }
 
@@ -3919,6 +4053,12 @@ private struct CoverPreview: View {
     let fallbackPreview: String?
     let title: String
     let author: String
+    /// The agent has not finished the cover chain yet (D17 phases skeleton /
+    /// chapters). The empty square then means «ещё не смотрели», not «не нашли» —
+    /// and saying "Обложка не найдена" 0.8 s in would be a verdict we have not
+    /// reached. The FRAME is identical in both cases, so the real art replacing
+    /// this placeholder never moves the layout.
+    var isPreparing: Bool = false
 
     /// The image to show: the selected option's file, else the legacy embedded jpg.
     private var image: NSImage? {
@@ -3966,10 +4106,10 @@ private struct CoverPreview: View {
             Image(systemName: "photo")
                 .font(.system(size: 30, weight: .light))
                 .foregroundColor(Tokens.C.textSecondary.opacity(0.5))
-            Text("Обложка не найдена")
+            Text(isPreparing ? "Подбираем обложку" : "Обложка не найдена")
                 .font(.system(size: Tokens.F.caption))
                 .foregroundColor(Tokens.C.textMuted)
-            Text("Подберём из сети или сгенерируем")
+            Text(isPreparing ? "Ещё пара секунд" : "Подберём из сети или сгенерируем")
                 .font(.system(size: Tokens.F.small))
                 .foregroundColor(Tokens.C.textTertiary)
                 .multilineTextAlignment(.center)
@@ -4612,14 +4752,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watchDebounce: DispatchWorkItem?
     private var focusObservers: [NSObjectProtocol] = []
 
-    /// Rising-edge baseline: the set of pending-confirm book ids last seen. A new
-    /// id appearing flips us to "raise the window". Seeded at launch from the
-    /// initial read so an agent-launched "already pending" case doesn't trigger a
-    /// redundant raise on top of the launch-time NSApp.activate.
-    private var lastPendingIDs: Set<String> = []
-    /// Same rising-edge baseline for loose-mp3 grouping prompts (a new group id is
-    /// just as much a reason to surface the window as a new pending book).
-    private var lastGroupIDs: Set<String> = []
+    /// Rising-edge baseline: the PUBLICATION EDGES last seen (`NudgeEdge` keys —
+    /// book AND grouping alike). A key we have not seen flips us to "raise the
+    /// window". Seeded at launch from the initial read so an agent-launched
+    /// "already pending" case doesn't trigger a redundant raise on top of the
+    /// launch-time presentWindow().
+    ///
+    /// The keys are the AGENT'S OWN ledger keys, byte for byte (see `NudgeEdge`),
+    /// and that is what makes invariant I2 — «один подъём окна на публикацию» —
+    /// hold by construction rather than by luck. Since D17 a book is published
+    /// TWICE (skeleton at ~0.8 s, then the finished manifest), and the app has its
+    /// own raise channel independent of the agent's `open -b` nudge. Keying on
+    /// `book_id` alone made those two channels answer "is this new?" with DIFFERENT
+    /// functions; keying on `book_id + source_rev + confirm_token` makes them
+    /// answer with the SAME one. The phase flip is literally the same key — the
+    /// token is minted once, on the skeleton, and carried through every later phase
+    /// of that revision — so the second publication cannot raise the window. A
+    /// reconvert mints a fresh token and is a legitimately new edge on both sides.
+    private var lastNudgeEdges: Set<String> = []
+
+    /// The edges of a showcase. Reads one manifest per pending book, the same way
+    /// the agent builds its ledger (rev/token are not in state.json).
+    ///
+    /// Defaults to the model's showcase; the modal-flow path passes a freshly read
+    /// one instead, because it must NOT publish new state into a screen the user is
+    /// working through.
+    private func currentNudgeEdges(state: ShowcaseState? = nil) -> Set<String> {
+        NudgeEdge.keys(state: state ?? model.state) { [store] in
+            store.loadManifest(bookID: $0)
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Standard main menu FIRST (independent of the landing screen): without it
@@ -4628,8 +4790,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installMainMenu()
         // Initial read BEFORE building the view so the window opens at the right size.
         model.refresh()
-        lastPendingIDs = Set(model.state.pendingConfirm.map { $0.bookID })
-        lastGroupIDs = Set(model.state.pendingGroups.map { $0.groupID })
+        lastNudgeEdges = currentNudgeEdges()
         // Landing screen. Three cases, in order:
         //   1) FIRST LAUNCH (agent not installed) → Setup (spec §01): the only GUI
         //      path that installs the background agent.
@@ -4741,12 +4902,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.appearance = NSAppearance(named: .darkAqua)
         window.center()
-        window.makeKeyAndOrderFront(nil)
         self.window = window
 
-        NSApp.activate(ignoringOtherApps: true)
-
+        // Observers BEFORE the ladder, and that order is load-bearing. The occlusion
+        // observer installed here is the ladder's ONE positive proof that the human
+        // actually sees the window (occluded → visible), and a notification posted
+        // before its observer exists is delivered to nobody. Installed the other way
+        // round, the launch transition — precisely the one the ladder is about to
+        // pass judgement on — would never reach us, and the only thing left to
+        // notice an already-visible window would be the 1.0 s poll.
         installFocusObservers()
+
+        // The ONE show ladder, shared by every path that surfaces this window (see
+        // presentWindow). At launch it is not a formality: LaunchServices already
+        // tried to activate us BEFORE this window existed — «presents 0 windows …
+        // Denying the request» — so the only activation left that can work is the
+        // one we ask for right here, and macOS 26 is free to refuse that one too.
+        // The self-check inside presentWindow is what turns such a refusal into a
+        // visible window instead of a silent wait (.patches/006 measured 85 seconds
+        // of a live, fully occluded window before the user clicked us himself).
+        presentWindow()
+
         startStateWatcher()
         refitWindowHeight()
 
@@ -5340,7 +5516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.consentPrompt = ConsentPrompt(folder: folder, proceed: proceed)
         hosting?.layoutSubtreeIfNeeded()
         refitWindowHeight()
-        bringWindowForward()
+        presentWindow()
     }
 
     /// Extra env for the auto-update installer run. Empty in production (a real update
@@ -5362,11 +5538,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func handleInstalled() {
         model.refresh()
         refreshInstallTruth()
-        lastPendingIDs = Set(model.state.pendingConfirm.map { $0.bookID })
-        lastGroupIDs = Set(model.state.pendingGroups.map { $0.groupID })
+        lastNudgeEdges = currentNudgeEdges()
         navigate(to: normalLanding())
         startStateWatcher()
-        bringWindowForward()
+        presentWindow()
     }
 
     // MARK: Live refresh
@@ -5415,7 +5590,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in self?.refreshNow() }
         let becameActive = nc.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refreshNow() }
+        ) { [weak self] _ in
+            // We are in front — the show ladder has nothing left to prove, and a
+            // dock bounce a second later would be noise about a window the user is
+            // already looking at.
+            self?.endPresentationEscalation()
+            self?.refreshNow()
+        }
+        // The window came out from behind whatever was covering it — by our doing or
+        // the user's. This is the ONE positive proof that the human can see it (the
+        // app need not be active for that), so it disarms the ladder too.
+        let occlusionChanged = nc.addObserver(
+            forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            guard let self = self, let window = self.window,
+                  window.occlusionState.contains(.visible) else { return }
+            self.endPresentationEscalation()
+        }
         // A disclosure block opened/closed → the CONTENT changed height, so the
         // window must be re-measured. The hop to the next runloop turn is
         // load-bearing: the notification is posted from inside the SwiftUI state
@@ -5431,7 +5622,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.refitWindowHeight()
             }
         }
-        focusObservers = [becameKey, becameActive, heightChanged]
+        focusObservers = [becameKey, becameActive, heightChanged, occlusionChanged]
     }
 
     /// Re-read state + manifest, raise the window if a NEW pending book appeared
@@ -5442,6 +5633,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // left only via an explicit handoff (handleInstalled) or a chosen exit.
         // Just refit and bail.
         if model.screen.isModalFlow {
+            // Keep the rising-edge baseline current on this path too (same reason
+            // as the stall branch below): a book published WHILE a modal screen was
+            // up has already been nudged for by the agent, so counting it as new
+            // the moment the screen is left would be that publication's SECOND
+            // window raise — the exact thing I2 forbids. Read the showcase from
+            // DISK rather than refreshing the model: a modal screen must not be
+            // re-rendered from under the user just to move a baseline.
+            lastNudgeEdges = currentNudgeEdges(state: store.loadState())
             hosting?.layoutSubtreeIfNeeded()
             refitWindowHeight()
             return
@@ -5463,24 +5662,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Keep the rising-edge baselines current even on this path, or the first
             // refresh after leaving the screen would fire a raise for books that
             // appeared while it was up.
-            lastPendingIDs = Set(model.state.pendingConfirm.map { $0.bookID })
-            lastGroupIDs = Set(model.state.pendingGroups.map { $0.groupID })
+            lastNudgeEdges = currentNudgeEdges()
             navigate(to: .agentNotRunning)
             hosting?.layoutSubtreeIfNeeded()
             refitWindowHeight()
             return
         }
 
-        let nowPending = Set(model.state.pendingConfirm.map { $0.bookID })
-        let nowGroups = Set(model.state.pendingGroups.map { $0.groupID })
+        let nowEdges = currentNudgeEdges()
         let hasActive = !model.state.activeBooks.isEmpty
         // Re-arm the watcher if the dir only just appeared.
         if stateWatcher == nil { startStateWatcher() }
 
         // Surface on the rising edge of EITHER a new pending book or a new loose-mp3
         // grouping prompt (the user must decide grouping before those books exist).
-        let newPending = !nowPending.subtracting(lastPendingIDs).isEmpty
-        let newGroup = !nowGroups.subtracting(lastGroupIDs).isEmpty
+        // "New" = an edge key the agent's ledger would also call new (see
+        // `lastNudgeEdges`), so the D17 second publication of the SAME book — its
+        // skeleton finishing into a full manifest — carries the SAME key and raises
+        // nothing.
+        let fresh = nowEdges.subtracting(lastNudgeEdges)
+        let newPending = NudgeEdge.containsBook(fresh)
+        let newGroup = NudgeEdge.containsGroup(fresh)
         if newPending || newGroup {
             // A new book to confirm → bring its confirm window to the front (a new
             // grouping prompt raises the window too; the modal sheet overlays
@@ -5492,15 +5694,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 model.clearSelection()
                 navigate(to: normalLanding())
             }
-            bringWindowForward()
+            presentWindow()
         } else if !hasActive && model.screen == .confirm {
             // The active book cleared while we were on the confirm window (the build
             // finished / was skipped and nothing else is pending) → fall back to the
             // Status home (D8), not a stale/empty confirm view.
             navigate(to: .status)
         }
-        lastPendingIDs = nowPending
-        lastGroupIDs = nowGroups
+        lastNudgeEdges = nowEdges
 
         hosting?.layoutSubtreeIfNeeded()
         refitWindowHeight()
@@ -5522,12 +5723,248 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return model.manifest != nil ? .confirm : .status
     }
 
-    /// Bring the already-running window forward (rising edge of a new pending book).
-    private func bringWindowForward() {
+    // MARK: - Presenting the window (one ladder, every show path)
+
+    /// The rung we are currently standing on = the HIGHEST show action performed so
+    /// far in the current run. It only ever moves up within a run; it is reset to the
+    /// base rung by starting a NEW run, never by re-entering a running one
+    /// (presentWindow).
+    private var presentationStep: PresentationStep = .done
+    /// The pending self-check, and — by being non-nil — the single fact that says a
+    /// run is IN FLIGHT: a verdict on this rung is still due. The two rungs at rest
+    /// never arm one: `.done` (nothing to do) and `.attentionRequested` (the top —
+    /// there is nothing left to escalate to).
+    ///
+    /// Cancellable, and cancelled by anything that proves the window made it (app
+    /// activated / window un-occluded) — see installFocusObservers — so a window the
+    /// user can already see never gets a dock bounce a second later.
+    private var presentationCheck: DispatchWorkItem?
+    /// The id of the ONE dock-bounce request we allow ourselves, kept only so it can
+    /// be withdrawn the moment the window becomes visible.
+    private var presentationAttentionRequest: Int?
+
+    /// Show the window TO THE HUMAN. The single entry point for every show path:
+    /// launch, the rising edge of a new pending book / grouping prompt, the consent
+    /// card, the post-install handoff, and a re-`open -b` while we are already
+    /// running (applicationShouldHandleReopen).
+    ///
+    /// Ordering a window and asking for activation is not showing it. On macOS 26
+    /// (Tahoe) activation is COOPERATIVE: a process LaunchServices started on
+    /// someone else's behalf has zero activation credit, and WindowServer says so in
+    /// as many words — «Rejecting the request … activation count being 0 … window
+    /// count = 1». AppKit's own header agrees: "The framework also does not
+    /// guarantee that the app will be activated at all." So the calls below are
+    /// followed by a SELF-CHECK against `occlusionState`, and by the escalation
+    /// ladder in WindowPresentation when the window really is invisible
+    /// (.patches/006). The goal is a window the user can SEE — stealing the keyboard
+    /// without his action is not achievable on Tahoe, and not what we promise.
+    private func presentWindow() {
         guard let window = window else { return }
-        window.deminiaturize(nil)
+
+        // 1) The whole app is hidden (Cmd+H, or another app's «Скрыть остальные»).
+        //    A hidden app's windows are ordered into a layer nobody can see, so every
+        //    step below would be a no-op. `unhideWithoutActivation` and NOT `unhide`:
+        //    unhide bundles in an activation request we are not entitled to, and if
+        //    that request is refused the app can stay hidden — this one just puts the
+        //    windows back and leaves activation to the ladder.
+        if NSApp.isHidden { NSApp.unhideWithoutActivation() }
+
+        // 2) Minimized to the Dock: ordering a miniaturized window front leaves it in
+        //    the Dock, so the raise would "succeed" and show nothing.
+        if window.isMiniaturized { window.deminiaturize(nil) }
+
+        // 3) Back onto the screen. The window is not always where we left it: sleep,
+        //    an external display that went away, a resolution change — any of these
+        //    can leave the frame outside `visibleFrame`, and "visible" for a window
+        //    nobody can reach is exactly the lie this whole ladder is about. Both
+        //    axes at once here, unlike refitWindowHeight / applyWindowWidth (each
+        //    owns the single axis it just changed), because here the SCREEN moved out
+        //    from under the window, not us. Safe by construction: the clamp is a
+        //    no-op for a frame already inside the visible area, so a window the user
+        //    parked himself is never dragged around.
+        clampWindowOntoScreen(window)
+
+        // 4) Order it front, and 5) ask to come forward.
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
+
+        // 6) …and verify, because nothing above proves the human sees anything.
+        //
+        // Two different things bring us here, and they must NOT be handled the same
+        // way.
+        //
+        // RE-ENTRY (a self-check is armed → a run is climbing): another show request
+        // for the SAME surfacing event. One dropped book already produces at least
+        // two — the agent's `open -b` arrives as applicationShouldHandleReopen, then
+        // the watcher's rising edge ~0.15–0.5 s later. Re-entering must never move
+        // the ladder DOWN: the rung is the highest action already performed, and
+        // dropping back to `.ordered` would throw that progress away and restart the
+        // climb. The pure resolver is proven monotonic by its suite; the host is not
+        // allowed to quietly undo that property from a side path — a green test over
+        // a property the running system does not have is the exact class of bug this
+        // release is built to remove. So: repeat the action of the CURRENT rung
+        // (raising a window is idempotent, and re-doing `orderFrontRegardless` for a
+        // newly arrived book is right, not merely harmless) and leave the armed
+        // verdict alone, so escalation still lands when it was due — re-arming it
+        // here would let a stream of re-entries postpone the dock bounce forever.
+        //
+        // A NEW RUN (nothing armed): the first show, or a previous run that has come
+        // to rest — satisfied, or exhausted on the top rung with the human still
+        // away. Withdraw the bounce that run may have left outstanding BEFORE
+        // climbing again: `.informationalRequest` bounces for about a second and
+        // leaves no standing mark (unlike `.criticalRequest`), so an inherited
+        // request is not a signal the user can still see — it is only a token that
+        // would trip the one-bounce guard in performPresentationStep and leave the
+        // next unseen book with NO signal whatsoever.
+        if presentationCheck != nil {
+            performPresentationStep(presentationStep, on: window)
+        } else {
+            withdrawAttentionRequest()
+            enterPresentationStep(.ordered)
+        }
+    }
+
+    /// Ask to become the active app. `NSApp.activate()` is the modern cooperative
+    /// call and the only one Tahoe honors; the deprecated flagged form is kept for
+    /// macOS 11–13, where `ignoringOtherApps: true` still means something (the app's
+    /// deployment target is 11.0 — build/build-app.sh).
+    private func activateApp() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+
+    /// Move the frame back inside the screen's visible area — both axes, size
+    /// untouched. The rule and the edge priorities live in WindowGeometry (pure and
+    /// unit-checked); this is the only caller that clamps both axes at once.
+    private func clampWindowOntoScreen(_ window: NSWindow) {
+        // `window.screen` is nil for a frame that lies entirely off every screen —
+        // precisely the case being fixed — so fall back to the main screen.
+        guard let visible = (window.screen ?? NSScreen.main)?.visibleFrame else { return }
+        var frame = WindowGeometry.clampedHorizontally(window.frame, in: visible)
+        frame = WindowGeometry.clampedVertically(frame, in: visible)
+        guard frame != window.frame else { return }
+        window.setFrame(frame, display: true, animate: false)
+    }
+
+    /// Enter `step` — its action has just been performed — and arm the self-check
+    /// that decides whether it worked. A step with no recheck delay is terminal: the
+    /// timer is simply not armed, so nothing is left running behind us.
+    private func enterPresentationStep(_ step: PresentationStep) {
+        presentationCheck?.cancel()
+        presentationCheck = nil
+        presentationStep = step
+        guard let delay = WindowPresentation.recheckDelay(after: step) else { return }
+        let work = DispatchWorkItem { [weak self] in self?.checkWindowVisibility() }
+        presentationCheck = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// The self-check: read the two facts only this process can know — are we the
+    /// active app, and is any part of the window actually on screen — and let the
+    /// pure resolver decide. Main thread only (armed on the main queue).
+    private func checkWindowVisibility() {
+        presentationCheck = nil
+        guard let window = window else { presentationStep = .done; return }
+        // The user closed the window while this check was in the air. Stop dead:
+        // «показать» a window he has just dismissed is not help, it is a fight.
+        //
+        // `isVisible` and NOT `occlusionState`, because occlusion cannot tell the two
+        // apart: a CLOSED window reports no `.visible` exactly like a fully COVERED
+        // one, so the resolver would read "invisible", escalate, and
+        // `orderFrontRegardless()` would put the dismissed window back on screen.
+        // `isVisible` draws the line where we need it — false only when the window is
+        // off-screen (closed / ordered out / miniaturized), and still TRUE for a
+        // window that is merely buried under someone else's, which is the whole case
+        // the ladder exists to fix. Note this check is deliberately NOT the ladder's
+        // success criterion: it answers "is there still a window to show?", not "does
+        // the human see it" — a buried window passes here and is escalated below.
+        //
+        // Without it the app is saved only by applicationShouldTerminateAfterLastWindowClosed
+        // winning a race against this 1.0 s timer, and a rule that holds by a race is
+        // not a rule.
+        guard window.isVisible else { presentationStep = .done; return }
+        let outcome = WindowPresentation.next(
+            after: presentationStep,
+            isActive: NSApp.isActive,
+            isVisible: window.occlusionState.contains(.visible))
+        switch outcome {
+        case .satisfied:
+            endPresentationEscalation()
+        case .escalate(let step):
+            performPresentationStep(step, on: window)
+            enterPresentationStep(step)
+        }
+    }
+
+    /// Perform one rung. Every rung is an API allowed to raise a window WITHOUT
+    /// requesting activation — activation is the thing Tahoe refuses us.
+    private func performPresentationStep(_ step: PresentationStep, on window: NSWindow) {
+        switch step {
+        case .ordered:
+            // The RESOLVER never escalates into the base rung — it is the rung every
+            // run starts on, and no fact combination returns `.escalate(.ordered)`
+            // (the suite walks all 4 rungs × 4 combinations). The live caller is the
+            // monotonic re-entry in presentWindow: a second show request while the
+            // run is still on this rung repeats its action instead of restarting the
+            // climb.
+            window.makeKeyAndOrderFront(nil)
+        case .orderedRegardless:
+            // Sanctioned API: raise above OTHER applications' windows without asking
+            // to become active. Ordering is not activation, and only activation is
+            // denied — which is why this rung can work where step 4+5 did not.
+            window.orderFrontRegardless()
+        case .attentionRequested:
+            // `.informationalRequest` — ONE bounce; never `.criticalRequest`, which
+            // bounces until the user reacts. This window is a confirmation prompt,
+            // not an emergency, and an auto-surface that nags is how a helpful app
+            // becomes an uninstalled one.
+            //
+            // The guard makes it one bounce per RUN of the ladder — not one per
+            // process lifetime, and not "one until the user finally looks at us".
+            // Both of the other readings are the same bug: `.informationalRequest`
+            // bounces for about a second and leaves NO standing mark, so a request
+            // still outstanding an hour later signals nothing to anyone; if it also
+            // suppressed the next run's bounce, the second book to arrive unseen
+            // would get no signal at all. Hence presentWindow withdraws it when a new
+            // run starts, and endPresentationEscalation withdraws it the moment the
+            // user does look (didBecomeActive / occlusionState → visible). What is
+            // left for this guard is exactly one honest job: within ONE run, never
+            // bounce twice.
+            guard presentationAttentionRequest == nil else { break }
+            presentationAttentionRequest = NSApp.requestUserAttention(.informationalRequest)
+        case .done:
+            // Unreachable by construction, kept only to keep the switch exhaustive:
+            // the resolver returns `.escalate(.done)` solely FROM `.attentionRequested`
+            // and `.done`, and neither rung ever arms a self-check to run it
+            // (recheckDelay is nil for both), so no call can arrive carrying `.done`.
+            break
+        }
+    }
+
+    /// The window made it (or we are shutting down): stop the ladder and leave
+    /// NOTHING armed — no pending work item, no outstanding attention request that
+    /// would keep the icon marked after the user has already looked at us.
+    private func endPresentationEscalation() {
+        presentationCheck?.cancel()
+        presentationCheck = nil
+        presentationStep = .done
+        withdrawAttentionRequest()
+    }
+
+    /// Take back the dock bounce if one is still outstanding. Idempotent: the id is
+    /// dropped together with the withdrawal, so no path can cancel it twice, and
+    /// calling this with nothing outstanding is free.
+    ///
+    /// Two callers, two different reasons: the ladder ending (the user looked — the
+    /// mark has done its job) and a NEW run starting (the mark belongs to a finished
+    /// run and must not silence the new one's bounce — see performPresentationStep).
+    private func withdrawAttentionRequest() {
+        guard let request = presentationAttentionRequest else { return }
+        NSApp.cancelUserAttentionRequest(request)
+        presentationAttentionRequest = nil
     }
 
     /// Re-fit the window height to the content's fitting size (width stays fixed),
@@ -5810,8 +6247,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// The agent nudges with `/usr/bin/open -b <bundle-id>`. When the app is ALREADY
+    /// running that launches nothing — LaunchServices turns it into a reopen, and
+    /// without this delegate method the nudge gets only AppKit's default handling,
+    /// which on Tahoe is the same silent nothing as before: a new book arrives, the
+    /// agent nudges, and the window stays buried under whatever the user is doing.
+    /// Route it through the same ladder as every other show path.
+    ///
+    /// Returns true: AppKit may go on with its usual reopen bookkeeping. Our own work
+    /// is done by then, and presentWindow is idempotent, so there is nothing to
+    /// suppress by answering false.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        presentWindow()
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         stopStateWatcher()
+        // Disarm the show ladder BEFORE the observers go: a pending self-check holds
+        // a work item scheduled on the main queue, and an outstanding attention
+        // request would otherwise outlive the window it was asking about.
+        endPresentationEscalation()
         focusObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 

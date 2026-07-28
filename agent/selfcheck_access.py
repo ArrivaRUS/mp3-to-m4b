@@ -871,6 +871,8 @@ def scenario_drain_shutdown(box: Sandbox, scan, dispatcher, state, config, shutd
             cmd.write_text(json.dumps({
                 "action": "confirm-build", "book_id": man["book_id"],
                 "source_rev": man["source_rev"], "confirm_token": man["confirm_token"],
+                # D17: echo the build_token, like the app does.
+                "build_token": man.get("build_token"),
                 "idempotency_key": f"k-{man['book_id']}", "ts": time.time(),
             }, ensure_ascii=False), encoding="utf-8")
             queued.append(cmd)
@@ -928,6 +930,7 @@ def scenario_drain_shutdown_negative(box: Sandbox) -> None:
         "        json.dumps({'action': 'confirm-build', 'book_id': m['book_id'],\n"
         "                    'source_rev': m['source_rev'],\n"
         "                    'confirm_token': m['confirm_token'],\n"
+        "                    'build_token': m.get('build_token'),\n"
         "                    'idempotency_key': 'k-' + m['book_id'],\n"
         "                    'ts': time.time()}))\n"
         "shutdown.request()\n"

@@ -15,10 +15,15 @@ It validates ``test-plan.md §M1 "Цепочка обложки"`` for the engin
   variety     the variants differ visibly (distinct gradient permutations).
   web         with the network mocked to fail (urlopen raises), search_web returns
               [] and never raises — the graceful "по возможности" contract.
-  resolve     resolve_cover_options priority embedded → web → generated; default
-              is embedded when present, else the first generated; a book with no
-              embedded cover and no network → options == generated-only, default
-              the first generated (PRD G4: never coverless).
+  resolve     resolve_cover_options is LOCAL-ONLY (D17/M-B): priority embedded →
+              generated, default embedded when present else the first generated
+              (PRD G4: never coverless). No network is touched on this path at all
+              — it is what «Собрать» waits for.
+  enrich      the late web leg (scan.enrich_covers_web): what it finds is APPENDED
+              — the pre-web list is an exact PREFIX of the post-web one, the
+              selection does not move, the files carry the book's GENERATION, a
+              search left over from a previous preparation is discarded, and a
+              dead network costs nothing but a counted attempt.
 
 It runs ONLY its own checks (cross-suite regression is orchestrated once by
 ``agent.selfcheck_all`` — there is no nested re-run here). Pillow is required
@@ -185,7 +190,7 @@ def run() -> int:
         check("web: returns [] when nothing can be fetched",
               web_paths == [], f"got {web_paths!r}")
 
-    # === resolve: offline, no embedded → generated-only, default = gen-0 ====
+    # === resolve: local-only, no embedded → generated-only, default = gen-0 ==
     man_plain = {
         "book_id": "chk-resolve-plain",
         "author": "Чехов А.П.",
@@ -193,10 +198,10 @@ def run() -> int:
         "cover_state": "none",
         "cover_preview": None,
     }
-    res_plain = cover.resolve_cover_options(man_plain, do_web=False)
+    res_plain = cover.resolve_cover_options(man_plain)
     opts_plain = res_plain["cover_options"]
     kinds_plain = [o["kind"] for o in opts_plain]
-    check("resolve: offline + no embedded → options are generated-only",
+    check("resolve: no embedded → options are generated-only (no web on this path)",
           bool(opts_plain) and set(kinds_plain) == {"generated"},
           f"kinds={kinds_plain}")
     check("resolve: option dicts carry {id,kind,path,label}",
@@ -221,13 +226,13 @@ def run() -> int:
         "cover_state": "embedded",
         "cover_preview": str(emb_path),
     }
-    res_emb = cover.resolve_cover_options(man_emb, do_web=False)
+    res_emb = cover.resolve_cover_options(man_emb)
     opts_emb = res_emb["cover_options"]
     kinds_emb = [o["kind"] for o in opts_emb]
     check("resolve: embedded present → first option is 'embedded' (priority)",
           bool(opts_emb) and opts_emb[0]["kind"] == "embedded",
           f"kinds={kinds_emb}")
-    check("resolve: priority order is embedded → (web) → generated",
+    check("resolve: priority order is embedded → generated (web appended later)",
           kinds_emb == sorted(
               kinds_emb,
               key=lambda k: {"embedded": 0, "web": 1, "generated": 2}[k]),
@@ -246,6 +251,142 @@ def run() -> int:
           isinstance(sel_path, Path) and sel_path.is_file()
           and sel_path == emb_path,
           f"path={sel_path}")
+
+    # === enrich: the LATE web leg appends and never disturbs (D17 / M-B) =====
+    # The web lookup no longer runs inside the scan, so what has to be proven here
+    # is what the human sees: the strip he is already looking at is a PREFIX of the
+    # strip he gets when the search lands, and a search that belongs to a previous
+    # preparation of the book cannot write into the current one.
+    from agent import scan, state  # noqa: E402 — after the support-dir redirect
+
+    def _mk_book(bid: str, token: str) -> tuple[Path, dict]:
+        """A ready, pending-confirm manifest on disk with local covers only."""
+        man = {
+            "book_id": bid,
+            "src_dir": str(root / bid),
+            "status": scan.MANIFEST_STATUS_PENDING,
+            "phase": scan.MANIFEST_PHASE_READY,
+            "source_rev": "rev-fixed",
+            "confirm_token": token,
+            "build_token": "bt-" + token,
+            "author": "Чехов А.П.",
+            "title": "Каштанка",
+            "cover_state": "none",
+            "cover_preview": None,
+        }
+        man.update(cover.resolve_cover_options(man))
+        man["cover_web"] = scan.COVER_WEB_PENDING
+        man["cover_web_tries"] = 0
+        p = config.books_dir() / f"{bid}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        state.write_json_atomic(p, man)
+        return p, man
+
+    def _fake_search(author, title, out_dir, book_id, *, exclude=None,
+                     generation=None, start_index=0):
+        """Stand-in for the network: writes two square images the real way."""
+        out = []
+        for k in range(2):
+            dest = Path(out_dir) / (
+                f"{cover.cover_file_stem(book_id, generation)}-web-{start_index + k}.jpg"
+            )
+            Image.new("RGB", (400, 400), (10, 60 + 40 * k, 120)).save(dest, "JPEG")
+            out.append(dest)
+        return out
+
+    path_a, man_a = _mk_book("chk-enrich", "tok-gen-one")
+    gen_a = cover.cover_generation(man_a)
+    before_opts = [dict(o) for o in man_a["cover_options"]]
+    before_sel = man_a["cover_selected"]
+
+    real_search = cover.search_web
+    try:
+        cover.search_web = _fake_search  # type: ignore[assignment]
+        appended = scan._enrich_book_covers(path_a, man_a)
+    finally:
+        cover.search_web = real_search  # type: ignore[assignment]
+    after_a = state.read_json(path_a, default={})
+    after_opts = after_a.get("cover_options") or []
+
+    check("enrich: the web leg appended what it found",
+          appended == 2 and len(after_opts) == len(before_opts) + 2,
+          f"appended={appended} before={len(before_opts)} after={len(after_opts)}")
+    check("enrich: APPEND-ONLY — the pre-web list is an exact PREFIX of the new one",
+          after_opts[:len(before_opts)] == before_opts,
+          f"prefix={[o.get('id') for o in after_opts[:len(before_opts)]]} "
+          f"was={[o.get('id') for o in before_opts]}")
+    check("enrich: the new tiles are at the END and are the web ones",
+          all(o.get("kind") == "web" for o in after_opts[len(before_opts):]),
+          f"kinds={[o.get('kind') for o in after_opts]}")
+    check("enrich: the human's selection is not moved by a late arrival",
+          after_a.get("cover_selected") == before_sel,
+          f"selected={after_a.get('cover_selected')!r} was={before_sel!r}")
+    check("enrich: revision/build fields untouched (cover is display payload)",
+          all(after_a.get(k) == man_a.get(k) for k in
+              ("source_rev", "confirm_token", "build_token", "phase", "status")))
+    check("enrich: every web file is named for THIS generation",
+          all(Path(o["path"]).name.startswith(f"chk-enrich-{gen_a}-web-")
+              for o in after_opts[len(before_opts):]),
+          f"names={[Path(o['path']).name for o in after_opts[len(before_opts):]]}")
+    check("enrich: the leg is marked done, so a later pass will not redo it",
+          after_a.get("cover_web") == scan.COVER_WEB_DONE
+          and after_a.get("cover_web_tries") == 1,
+          f"cover_web={after_a.get('cover_web')!r} "
+          f"tries={after_a.get('cover_web_tries')!r}")
+
+    # A search that belongs to the PREVIOUS preparation must not land in the new
+    # one: re-arm the book (fresh confirm_token → fresh generation) while holding
+    # the stale manifest, then let the stale search finish.
+    stale_man = dict(man_a)
+    rearmed = dict(after_a)
+    rearmed["confirm_token"] = "tok-gen-two"
+    rearmed["cover_web"] = scan.COVER_WEB_PENDING
+    rearmed["cover_web_tries"] = 0
+    state.write_json_atomic(path_a, rearmed)
+    try:
+        cover.search_web = _fake_search  # type: ignore[assignment]
+        late = scan._enrich_book_covers(path_a, stale_man)
+    finally:
+        cover.search_web = real_search  # type: ignore[assignment]
+    after_rearm = state.read_json(path_a, default={})
+    check("enrich: a search from the PREVIOUS generation is discarded, not appended",
+          late == 0
+          and (after_rearm.get("cover_options") or []) == (rearmed.get("cover_options") or [])
+          and after_rearm.get("confirm_token") == "tok-gen-two",
+          f"late={late} options={len(after_rearm.get('cover_options') or [])}")
+
+    # A dead network: nothing is appended, nothing is disturbed, the try is
+    # counted (so the retry budget is finite) and NOTHING raises.
+    path_b, man_b = _mk_book("chk-enrich-offline", "tok-offline")
+    opts_b_before = [dict(o) for o in man_b["cover_options"]]
+    offline_raised = ""
+    try:
+        _urlreq.urlopen = _boom  # type: ignore[assignment]
+        dead = scan._enrich_book_covers(path_b, man_b)
+    except Exception as exc:  # noqa: BLE001 — the point: it must NOT raise
+        dead, offline_raised = -1, repr(exc)
+    finally:
+        _urlreq.urlopen = real_urlopen  # type: ignore[assignment]
+    after_b = state.read_json(path_b, default={})
+    check("enrich: a dead network appends nothing and never raises",
+          dead == 0 and not offline_raised
+          and (after_b.get("cover_options") or []) == opts_b_before,
+          offline_raised or f"appended={dead}")
+    check("enrich: a fruitless attempt is counted (the retry budget is finite)",
+          after_b.get("cover_web_tries") == 1
+          and after_b.get("cover_web") == scan.COVER_WEB_PENDING,
+          f"tries={after_b.get('cover_web_tries')!r} "
+          f"state={after_b.get('cover_web')!r}")
+    check("enrich: an offline book is still buildable — build_token intact (I1)",
+          after_b.get("build_token") == man_b["build_token"]
+          and after_b.get("phase") == scan.MANIFEST_PHASE_READY)
+
+    # The pass itself obeys the offline switch (the self-check env sets it): with
+    # MP3TOM4B_COVER_WEB=0 it must do nothing at all, not even read a manifest.
+    check("enrich: the pass is a no-op when the web is switched off",
+          scan.enrich_covers_web() == 0
+          and (state.read_json(path_b, default={}) or {}).get("cover_web_tries") == 1,
+          f"MP3TOM4B_COVER_WEB={os.environ.get('MP3TOM4B_COVER_WEB')!r}")
 
     # --- summary ------------------------------------------------------------
     # Flat verification: this suite runs ONLY its own checks. Cross-suite

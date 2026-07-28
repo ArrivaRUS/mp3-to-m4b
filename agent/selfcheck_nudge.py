@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -127,6 +128,9 @@ def _confirm_build_cmd(manifest: dict) -> dict:
         "book_id": bid,
         "source_rev": rev,
         "confirm_token": manifest["confirm_token"],
+        # D17: the app echoes the build_token it saw, proving the command was
+        # minted from a COMPLETE manifest and not from the early-nudge skeleton.
+        "build_token": manifest.get("build_token"),
         "idempotency_key": f"{bid}:{rev[:16]}",
         "params": dict(manifest.get("params", {})),
         "ts": time.time(),
@@ -274,7 +278,8 @@ def run() -> int:
     # === group E10: unstable changed loose set → no arm, no nudge ============
     real_stable = scan._files_are_stable
     try:
-        scan._files_are_stable = lambda mp3s: False  # simulate mid-copy
+        # (mp3s, folder=None) — the debounce re-lists the directory now (M-E).
+        scan._files_are_stable = lambda mp3s, folder=None: False  # simulate mid-copy
         _make_mp3(watch / "loose-3.mp3", tags={"title": "Loose 3"})
         scan.run_scan()
         grp_mid = _pending_group(state)
@@ -566,6 +571,61 @@ def run() -> int:
           f"count={_nudge_count(nudge_log)}")
     check("grouping-ledger migration: the v2 key is back-filled into the ledger",
           v2_key in (st.get("grouping_processed") or []))
+
+    # === (d17) TWO PUBLICATIONS, ONE NUDGE — и оба канала считают одинаково ===
+    # D17 публикует книгу ДВАЖДЫ: скелет на ~0.8 с, потом дозаполненный манифест.
+    # Инвариант I2 держится не дисциплиной, а тем, что confirm_token чеканится ОДИН
+    # раз (на скелете) и переносится всеми фазами ⇒ ключ ребра у скелета и у ready
+    # один и тот же. Здесь это проверяется на ПРОДАКШН-пути через тестовый шов
+    # MP3TOM4B_HALT_AFTER_PHASE, который останавливает дозаполнение так, как это
+    # сделал бы краш.
+    base_d17 = _nudge_count(nudge_log)
+    os.environ["MP3TOM4B_HALT_AFTER_PHASE"] = "skeleton"
+    _make_mp3(watch / "Книга Фаза" / "01.mp3", tags={"album": "Книга Фаза"})
+    scan.run_scan()
+    os.environ.pop("MP3TOM4B_HALT_AFTER_PHASE")
+    man_skel = _manifest_for(config, state, "Книга Фаза")
+    key_skel = _book_key(man_skel) if isinstance(man_skel, dict) else "?"
+    check("D17: публикация СКЕЛЕТА поднимает окно ровно один раз",
+          isinstance(man_skel, dict)
+          and scan.manifest_phase(man_skel) == "skeleton"
+          and _nudge_count(nudge_log) == base_d17 + 1,
+          f"count={_nudge_count(nudge_log)} phase="
+          f"{scan.manifest_phase(man_skel) if isinstance(man_skel, dict) else '?'}")
+    scan.run_scan()                       # вторая публикация: та же книга, ready
+    man_ready = _manifest_for(config, state, "Книга Фаза")
+    key_ready = _book_key(man_ready) if isinstance(man_ready, dict) else "?!"
+    check("D17: ключ ребра у ready СОВПАДАЕТ с ключом скелета (I2 — по построению)",
+          key_ready == key_skel, f"{key_skel} vs {key_ready}")
+    check("D17: вторая публикация той же книги НЕ поднимает окно",
+          _nudge_count(nudge_log) == base_d17 + 1
+          and scan.manifest_phase(man_ready) == "ready",
+          f"count={_nudge_count(nudge_log)}")
+    check("D17: в леджере одно ребро на книгу, а не два",
+          sum(1 for k in _ledger_keys(config, state)
+              if k.startswith(f"book:{man_ready['book_id']}:")) == 1)
+
+    # ВТОРОЙ КАНАЛ. У приложения свой rising-edge по state.json, мимо агентского
+    # леджера. Он не поднимет окно во второй раз ровно потому, что считает новизну
+    # ТОЙ ЖЕ функцией — `NudgeEdge.bookKey` в app/StateModel.swift. До сих пор это
+    # держалось комментарием «byte-for-byte mirror»; здесь форма приложения
+    # ВЫВОДИТСЯ из его исходника и сравнивается с ключом, который агент только что
+    # записал. Разъедутся молча — вернётся второй подъём окна.
+    swift_src = (repo_root / "app" / "StateModel.swift").read_text(encoding="utf-8")
+    m_key = re.search(r'"book:\\\(([A-Za-z]+)\):\\\(([A-Za-z]+)\.prefix\((\d+)\)\):'
+                      r'\\\(([A-Za-z]+)\.prefix\((\d+)\)\)"', swift_src)
+    check("второй канал: формула ключа найдена в app/StateModel.swift "
+          "(промах якоря = красное, не «нечего проверять»)", m_key is not None)
+    if m_key is not None:
+        app_key = (f"book:{man_ready['book_id']}:"
+                   f"{man_ready['source_rev'][:int(m_key.group(3))]}:"
+                   f"{man_ready['confirm_token'][:int(m_key.group(5))]}")
+        check("второй канал: ключ приложения = ключ агента (окно не поднимут дважды)",
+              app_key == scan._book_edge_key(man_ready),
+              f"app={app_key} agent={scan._book_edge_key(man_ready)}")
+        check("второй канал: ключ приложения уже лежит в агентском леджере ⇒ "
+              "для приложения это ребро НЕ новое",
+              app_key in _ledger_keys(config, state))
 
     return _finish(root)
 

@@ -1,24 +1,45 @@
-"""Cover-art resolution chain: embedded → web search → generated fallback.
+"""Cover-art resolution chain: LOCAL (embedded → generated) now, web later.
 
-M1 (arch/synthesis.md §C, decision R-S3 + D7/D9). The agent guarantees a cover
-for **100 % of books** (PRD G4), without ever needing the network:
+M1 (arch/synthesis.md §C, decision R-S3 + D7/D9), re-cut by D17/M-B. The agent
+guarantees a cover for **100 % of books** (PRD G4) without ever needing the
+network, and — since M-B — without ever *waiting* for it either:
 
   1. ``cover_state=="embedded"`` — already extracted in :mod:`agent.scan`
-     (``probe.extract_cover`` → ``covers/<id>-embedded.jpg``); we just surface it.
-  2. :func:`search_web` — best-effort, graceful: query DuckDuckGo / Yandex images
-     for "{author} {title} аудиокнига" via stdlib :mod:`urllib`, download a few
-     candidates, keep only the *square* ones, save under ``covers/``. The network
-     may be down / rate-limited / the markup may change → this NEVER raises and
-     returns ``[]`` on any trouble. Every request carries a hard timeout.
-  3. :func:`generate_variants` — the **guarantee**: 3–4 *square* (≥1400×1400)
+     (``probe.extract_cover`` → ``covers/<id>-<gen>-embedded.jpg``); we surface it.
+  2. :func:`generate_variants` — the **guarantee**: 3–4 *square* (≥1400×1400)
      covers rendered with **Pillow** (brand gradient D9 + title/author text in a
      Cyrillic-capable system font). No cairosvg (avoids the Cyrillic thin-stroke
      trap) and no WKWebView. This always succeeds as long as Pillow imports, so a
      book is never coverless even fully offline.
+  3. :func:`search_web` — best-effort, graceful: query DuckDuckGo / Yandex images
+     for "{author} {title} аудиокнига" via stdlib :mod:`urllib`, download a few
+     candidates, keep only the *square* ones, save under ``covers/``. The network
+     may be down / rate-limited / the markup may change → this NEVER raises and
+     returns ``[]`` on any trouble. Every request carries a hard timeout.
 
-:func:`resolve_cover_options` assembles the ordered candidate list
-(embedded → web → generated), writes it to the manifest as ``cover_options`` and
-picks ``cover_selected`` (embedded if present, else the first generated). The
+**Steps 1–2 are the critical path; step 3 is NOT.** Until M-B the web lookup sat
+between "the book was read" and ``phase=ready``, so «Собрать» went live only once
+the network had answered — up to ~12 s on a dead one (two sources × the 6 s
+timeout). It now runs as a separate pass AFTER the scan and the drain
+(:func:`agent.scan.enrich_covers_web`), and its results are APPENDED to a list the
+human is already looking at:
+
+    scan (local) → drain → web enrichment
+    ─ ready / «Собрать» ──┘        └─ лента обложек дополняется
+
+Two rules make that safe, and both are load-bearing:
+
+  · **APPEND-ONLY** (the human's choice, synthesis §4.2). The order is
+    встроенная → сгенерированные → найденные в сети, and a late arrival may only
+    be added at the END. Nothing already on screen changes id, path, label,
+    position — or the current selection — while the search is running.
+  · **GENERATION-SCOPED FILE NAMES** (:func:`cover_generation`, найдено
+    Архитектором #2). A late web worker belongs to the preparation that started
+    it; if the book has been re-armed since, the worker must not be able to write
+    into the new preparation's paths.
+
+:func:`resolve_cover_options` assembles the LOCAL candidate list and picks
+``cover_selected``; :func:`web_options_for` produces the late additions. The
 manifest is still written ONLY by the agent (:mod:`agent.scan`); this module just
 produces the data and the image files. ``source_rev`` / ``confirm_token`` are
 NEVER touched — cover data is display payload, not part of the book revision.
@@ -32,6 +53,7 @@ import json
 import re
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import config
@@ -76,10 +98,96 @@ WEB_TIMEOUT_S = 6          # per-request socket timeout
 WEB_MAX_CANDIDATES = 4     # at most this many images downloaded
 WEB_MAX_BYTES = 6_000_000  # skip anything larger than ~6 MB
 WEB_SQUARE_TOL = 0.12      # |w/h - 1| must be ≤ this to count as "square"
+#: Candidate images fetched concurrently per wave in :func:`search_web`. These
+#: are independent GETs whose cost is round-trip, not bandwidth, so a wave turns
+#: N waits into one. Kept small (and joined per wave) so the early stop still
+#: bounds how much we ever ask for: at most one wave past the last useful hit.
+WEB_FETCH_WORKERS = 6
 _UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+
+# ---------------------------------------------------------------------------
+# Generation: the namespace one PREPARATION of a book owns on disk
+# ---------------------------------------------------------------------------
+#: Length of the generation segment in a cover file name. 8 hex characters of a
+#: SHA-256 — the same order of collision safety the 16-char ``book_id`` already
+#: relies on, scoped to a single book's own files.
+GENERATION_LEN = 8
+
+
+def cover_generation(manifest: dict) -> str:
+    """Short id of the book's CURRENT preparation — the namespace of its cover files.
+
+    Cover files used to be named after the book alone (``<book_id>-web-0.jpg``),
+    which is safe exactly as long as nothing writes them LATE. Since M-B the web
+    leg runs after the scan and the drain, so a slow search can still be finishing
+    for a book that has meanwhile been re-armed (new files dropped, «Собрать
+    заново») — and with a book-only name it would write its image straight into
+    the path the NEW preparation just published: the manifest says «Из сети 1» and
+    the bytes underneath belong to a different edition of the book. Found by
+    Архитектор #2; the fix is to make the collision impossible rather than to
+    police it, so the name carries the preparation it was made for.
+
+    Derived from ``book_id`` + ``source_rev`` + ``confirm_token``: the rev changes
+    when the files change, the token is re-minted on every re-arm (including a
+    forced reconvert at an unchanged rev), so every preparation gets its own
+    namespace. Deterministic — a resumed or repeated preparation of the SAME
+    generation reuses its own files instead of littering. Never raises: a manifest
+    missing the fields simply hashes the empty strings.
+    """
+    h = hashlib.sha256()
+    for part in ("book_id", "source_rev", "confirm_token"):
+        h.update(str(manifest.get(part) or "").encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()[:GENERATION_LEN]
+
+
+def cover_file_stem(book_id: str, generation: str | None) -> str:
+    """``<book_id>-<generation>`` — the prefix every cover file of one preparation shares.
+
+    ``generation=None`` yields the bare ``<book_id>``: the pre-M-B naming, kept for
+    direct callers (self-checks) that have no manifest to scope by.
+    """
+    return f"{book_id}-{generation}" if generation else str(book_id)
+
+
+def sweep_stale_cover_files(book_id: str, generation: str) -> int:
+    """Delete this book's cover files from OTHER generations; return how many.
+
+    Call this AFTER the manifest naming the current generation is on disk —
+    publish first, delete second, so no reader can ever see a manifest pointing at
+    a file we just removed.
+
+    Deliberately narrow. Only entries of the form ``<book_id>-<8 hex>-…`` are
+    considered, so a user's custom pick (``<book_id>-custom.jpg``) and any
+    pre-generation file (``<book_id>-gen-grad-diag.png``, possibly still named by
+    an older manifest) are left strictly alone. Never raises — a cover file we
+    could not delete is a wasted megabyte, not a broken book.
+    """
+    prefix = f"{book_id}-"
+    removed = 0
+    try:
+        entries = list(config.covers_dir().glob(f"{book_id}-*"))
+    except OSError:
+        return 0
+    for path in entries:
+        tail = path.name[len(prefix):]
+        seg, sep, _ = tail.partition("-")
+        if not sep or len(seg) != GENERATION_LEN:
+            continue                      # not a generation-scoped name
+        if any(c not in "0123456789abcdef" for c in seg):
+            continue                      # …or not a generation at all
+        if seg == generation:
+            continue                      # the live one
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -295,14 +403,16 @@ def _accent_dot(img, draw, style: dict) -> None:
 
 
 def generate_variants(author: str, title: str, out_dir: Path, book_id: str,
-                      *, count: int = 4) -> list:
+                      *, count: int = 4, generation: str | None = None) -> list:
     """Render ``count`` square brand covers for (author, title); return file paths.
 
     GUARANTEE of the chain (PRD G4): this works fully offline. Each variant uses
     a distinct gradient permutation/angle (D9) plus a corner vignette and a text
     scrim, then the title (large, auto-fit, wrapped) and author (smaller) centered
     on the lower half. Cyrillic renders for real (Arial/Arial-Unicode). Files are
-    deterministic: ``<book_id>-gen-<style_id>.png``. ``out_dir`` is created.
+    deterministic: ``<book_id>-<generation>-gen-<style_id>.png`` (see
+    :func:`cover_generation`; without a generation, the bare ``<book_id>-gen-…``).
+    ``out_dir`` is created.
 
     Returns the list of written ``Path``s (length ``count`` on success). Raises
     only if Pillow / a Cyrillic font is entirely unavailable (a real environment
@@ -354,7 +464,7 @@ def generate_variants(author: str, title: str, out_dir: Path, book_id: str,
             _draw_centered_block(draw, author_lines, author_font, author_lh, y,
                                  CANVAS, ON_ACCENT)
 
-        out_path = out_dir / f"{book_id}-gen-{style['id']}.png"
+        out_path = out_dir / f"{cover_file_stem(book_id, generation)}-gen-{style['id']}.png"
         img.convert("RGB").save(out_path, "PNG", optimize=True)
         paths.append(out_path)
     return paths
@@ -456,16 +566,27 @@ def _is_square_image(data: bytes) -> bool:
 
 
 def search_web(author: str, title: str, out_dir: Path, book_id: str,
-               *, exclude: list | None = None) -> list:
+               *, exclude: list | None = None, generation: str | None = None,
+               start_index: int = 0) -> list:
     """Best-effort web search for SQUARE cover candidates; never raises.
 
     Queries "{author} {title} аудиокнига" (D7) on DuckDuckGo then Yandex, downloads
     up to :data:`WEB_MAX_CANDIDATES` images, keeps only the square ones, and saves
-    them under ``out_dir`` as ``<book_id>-web-<n>.<ext>``. Returns the list of
-    written ``Path``s — possibly empty (no net / nothing square / markup changed).
+    them under ``out_dir`` as ``<book_id>-<generation>-web-<n>.<ext>``. Returns the
+    list of written ``Path``s — possibly empty (no net / nothing square / markup
+    changed).
 
-    This is the "по возможности" link: the guarantee is :func:`generate_variants`.
-    Any network/parse/decoding failure degrades to ``[]`` silently.
+    ``generation`` scopes the file names to ONE preparation of the book, so a
+    search that finishes after the book was re-armed writes into names nothing
+    points at (see :func:`cover_generation`). ``start_index`` continues the
+    numbering past whatever web candidates a previous attempt already saved, which
+    is what lets the caller APPEND results without ever renaming or replacing an
+    option the human can already see.
+
+    This is the "по возможности" link, and since M-B it is also entirely off the
+    critical path: the guarantee is :func:`generate_variants`, which has already
+    run by the time anyone calls this. Any network/parse/decoding failure degrades
+    to ``[]`` silently.
     """
     out_dir = Path(out_dir)
     query = " ".join(p for p in (author, title, "аудиокнига") if p).strip()
@@ -488,25 +609,43 @@ def search_web(author: str, title: str, out_dir: Path, book_id: str,
     except OSError:
         return []
 
-    n = 0
-    for url in candidates:
-        if len(saved) >= WEB_MAX_CANDIDATES:
-            break
-        data = _http_get(url)
-        if not data or not _is_square_image(data):
-            continue
-        digest = hashlib.sha256(data).hexdigest()
-        if digest in seen_hashes:
-            continue
-        seen_hashes.add(digest)
-        ext = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
-        dest = out_dir / f"{book_id}-web-{n}.{ext}"
-        try:
-            dest.write_bytes(data)
-        except OSError:
-            continue
-        saved.append(dest)
-        n += 1
+    # Candidate bodies are fetched a WAVE at a time and then consumed in the
+    # ORIGINAL candidate order, so the chosen files (and their -web-N names) are
+    # exactly what the one-request-at-a-time loop produced — only the waiting is
+    # shared. These are ~12 independent GETs of a few hundred KB each: serially
+    # they cost ~2.8 s of pure round-trip, which was ~30 % of the whole scan.
+    # Waves rather than "submit everything": the early stop below is preserved,
+    # so at most one wave beyond the last useful candidate is ever requested, and
+    # each wave is joined before the next starts — no request outlives the call.
+    n = max(0, int(start_index))
+    i = 0
+    while i < len(candidates) and len(saved) < WEB_MAX_CANDIDATES:
+        wave = candidates[i:i + WEB_FETCH_WORKERS]
+        i += len(wave)
+        if len(wave) == 1:
+            bodies = [_http_get(wave[0])]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=len(wave), thread_name_prefix="mp3tom4b-cover"
+            ) as pool:
+                bodies = list(pool.map(_http_get, wave))
+        for data in bodies:
+            if len(saved) >= WEB_MAX_CANDIDATES:
+                break
+            if not data or not _is_square_image(data):
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+            ext = "png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "jpg"
+            dest = out_dir / f"{cover_file_stem(book_id, generation)}-web-{n}.{ext}"
+            try:
+                dest.write_bytes(data)
+            except OSError:
+                continue
+            saved.append(dest)
+            n += 1
     return saved
 
 
@@ -525,20 +664,29 @@ def _option(kind: str, path, label: str, index: int) -> dict:
     }
 
 
-def resolve_cover_options(manifest: dict, *, do_web: bool = True) -> dict:
-    """Build the ordered cover-candidate list + default for one book.
+def resolve_cover_options(manifest: dict) -> dict:
+    """Build the LOCAL cover-candidate list + default for one book. No network.
 
-    Priority is **embedded → web → generated** (D7). Always ends with ≥1 generated
-    variant so the list is never empty (PRD G4). Returns a dict to MERGE into the
+    Order is **embedded → generated**, and it always ends with ≥1 generated variant
+    so the list is never empty (PRD G4). Returns a dict to MERGE into the
     manifest::
 
         {"cover_options": [ {id,kind,path,label}, ... ],
          "cover_selected": "<option id>"}
 
     The default (``cover_selected``) is the embedded cover if present, otherwise
-    the first generated variant — a real cover on day one, the user can re-pick
-    later via the (next-substep) ``cover-choice`` command. ``do_web=False`` skips
-    the network entirely (used by tests / offline determinism).
+    the first generated variant — a real cover on day one; the user can re-pick in
+    the confirm window.
+
+    **This function no longer touches the network, and that is the point of M-B.**
+    It used to run :func:`search_web` in the middle of the list (embedded → web →
+    generated), which put the whole cover chain — and therefore ``phase=ready``,
+    ``build_token`` and an active «Собрать» — behind the round-trip time of two
+    image search engines. Web candidates are now produced by
+    :func:`web_options_for` in a later pass and APPENDED to the end of this list,
+    so what the human waits for is only ever local work: a file read and a Pillow
+    render. Ordering is unchanged for everything that was already here, which is
+    what makes the append safe (see the module docstring).
 
     Does NOT write the manifest itself — the caller (:mod:`agent.scan`) owns that,
     keeping "agent is the single writer" intact. Never touches ``source_rev`` /
@@ -548,10 +696,11 @@ def resolve_cover_options(manifest: dict, *, do_web: bool = True) -> dict:
     author = str(manifest.get("author") or "")
     title = str(manifest.get("title") or "")
     covers = config.covers_dir()
+    generation = cover_generation(manifest)
 
     options: list = []
 
-    # 1) embedded (already extracted by scan into covers/<id>-embedded.jpg).
+    # 1) embedded (already extracted by scan into covers/<id>-<gen>-embedded.jpg).
     embedded_default = None
     if manifest.get("cover_state") == "embedded":
         preview = manifest.get("cover_preview")
@@ -560,21 +709,16 @@ def resolve_cover_options(manifest: dict, *, do_web: bool = True) -> dict:
             options.append(opt)
             embedded_default = opt["id"]
 
-    # 2) web (best-effort; [] when offline / nothing square).
-    if do_web:
-        try:
-            web_paths = search_web(author, title, covers, bid)
-        except Exception:  # noqa: BLE001 — defensive; search_web already guards
-            web_paths = []
-        for i, wp in enumerate(web_paths):
-            options.append(_option("web", wp, f"Из сети {i + 1}", i))
-
-    # 3) generated (the guarantee — always present).
-    gen_default = None
+    # 2) generated (the guarantee — always present). Runs inline: with the web leg
+    # gone there is nothing left to overlap it with, and the thread that used to
+    # hide the drawing behind the network would now only add a handoff.
     try:
-        gen_paths = generate_variants(author, title, covers, bid)
-    except Exception:  # noqa: BLE001
+        gen_paths = generate_variants(author, title, covers, bid,
+                                      generation=generation)
+    except Exception:  # noqa: BLE001 — a coverless book is worse than a bare list
         gen_paths = []
+
+    gen_default = None
     for i, gp in enumerate(gen_paths):
         opt = _option("generated", gp, f"Вариант {i + 1}", i)
         options.append(opt)
@@ -586,6 +730,36 @@ def resolve_cover_options(manifest: dict, *, do_web: bool = True) -> dict:
         selected = options[0]["id"]
 
     return {"cover_options": options, "cover_selected": selected}
+
+
+def web_options_for(manifest: dict, *, start_index: int = 0) -> list:
+    """Search the web for this book's cover and return the options to APPEND.
+
+    The late half of the chain (D7 «по возможности»), run by
+    :func:`agent.scan.enrich_covers_web` after the scan and the drain. Returns
+    option dicts in the same shape :func:`resolve_cover_options` produces, for the
+    images that were actually saved — numbered from ``start_index`` so their ids
+    (``web-N``) cannot collide with anything already in the list.
+
+    The caller appends these and writes nothing else: no existing option is
+    reordered, renamed or re-pathed, and ``cover_selected`` is left exactly where
+    the human (or the default) put it. A tile that is on screen stays where it is
+    while the search runs — the reason the list is append-only at all.
+
+    Never raises: no network, no results, a wedged source → ``[]``.
+    """
+    bid = str(manifest.get("book_id", "book"))
+    author = str(manifest.get("author") or "")
+    title = str(manifest.get("title") or "")
+    start = max(0, int(start_index))
+    try:
+        paths = search_web(author, title, config.covers_dir(), bid,
+                           generation=cover_generation(manifest),
+                           start_index=start)
+    except Exception:  # noqa: BLE001 — defensive; search_web already guards
+        return []
+    return [_option("web", p, f"Из сети {start + i + 1}", start + i)
+            for i, p in enumerate(paths)]
 
 
 def selected_cover_path(manifest: dict) -> Path | None:

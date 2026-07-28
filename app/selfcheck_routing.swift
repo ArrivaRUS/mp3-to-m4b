@@ -4,6 +4,11 @@
 //   3. (M5) WHICH SURFACE owns the window — the fail-closed install-truth gate,
 //      the single-flight over the installer, and the tolerant decode of
 //      `folder_access`. See `checkInstallTruth` and friends at the bottom.
+//   4. that the window is actually SHOWN TO THE HUMAN — the escalation ladder in
+//      WindowPresentation. Ordering a window is not showing it: on macOS 26
+//      activation is cooperative and a programmatically launched app is refused,
+//      so the window can exist, fully occluded, while the user sees nothing
+//      (.patches/006 — measured at 85 seconds). See `checkWindowPresentation`.
 //
 // This guards the contract behind the queue's «Подтвердить» button (QueueView :41):
 // pressing it on a ROW must open THAT book's confirm window. It shipped broken in
@@ -222,6 +227,600 @@ struct RoutingSelfCheck {
               WindowGeometry.contentOverflows(desired: cardOpen, cap: oldHardCap)
                   && !WindowGeometry.contentOverflows(desired: cardOpen + chrome,
                                                       cap: ceiling(1050)))
+    }
+
+    // MARK: «окно создано» ≠ «человек его видит» — лестница показа (.patches/006)
+    //
+    // Замеренный инцидент: агент нуджит приложение (`open -b`, rc=0), окно рождается
+    // за 0.6 с — и 85 секунд стоит ПОЛНОСТЬЮ перекрытым чужим окном, пока человек не
+    // кликнет сам. На macOS 26 активация кооперативная: программно поднятому процессу
+    // WindowServer отказывает («activation count being 0 … window count = 1»), а
+    // deprecated-флаг `ignoringOtherApps` — no-op. Лечится не «ещё одним вызовом», а
+    // лестницей с самопроверкой на КАЖДОЙ ступени; правило лестницы вынесено чистой
+    // функцией в app/WindowPresentation.swift ровно затем, чтобы его можно было
+    // закрыть юнитом (сами вызовы AppKit юнитом не проверяются — см. checkRefitWiring
+    // про честные границы такой проверки).
+    //
+    // Таблица здесь ИСЧЕРПЫВАЮЩАЯ (4 ступени × 4 комбинации фактов = 16), а не
+    // выборочная: цена дырки в ней несимметрична, но плоха с обеих сторон — лишняя
+    // эскалация даёт подскок дока у уже показанного окна, пропущенная возвращает
+    // человеку пустой экран, с которого вся эпопея и началась.
+
+    /// Порядок ступеней, заданный ЗДЕСЬ отдельным списком, а не выведенный из самого
+    /// правила. Это принципиально: инварианты «не идёт назад» и «не перепрыгивает
+    /// ступень» должны сверяться с независимой фикстурой — ранг, вычисленный из
+    /// проверяемого кода, согласится с ним всегда, в том числе когда тот сломан.
+    static let ladder: [PresentationStep] = [
+        .ordered, .orderedRegardless, .attentionRequested, .done,
+    ]
+
+    static func rung(_ step: PresentationStep) -> Int {
+        ladder.firstIndex(of: step) ?? -1
+    }
+
+    static func name(_ step: PresentationStep) -> String {
+        switch step {
+        case .ordered:            return "ordered"
+        case .orderedRegardless:  return "orderedRegardless"
+        case .attentionRequested: return "attentionRequested"
+        case .done:               return "done"
+        }
+    }
+
+    static func name(_ outcome: PresentationOutcome) -> String {
+        switch outcome {
+        case .satisfied:            return "satisfied"
+        case .escalate(let step):   return "escalate(\(name(step)))"
+        }
+    }
+
+    /// Все три комбинации, в которых хотя бы один признак показа истинен.
+    static let shownCombos: [(isActive: Bool, isVisible: Bool)] = [
+        (true, false), (false, true), (true, true),
+    ]
+
+    static func checkWindowPresentation() {
+        checkPresentationMatrix()
+        checkPresentationShortCircuit()
+        checkPresentationMonotonic()
+        checkPresentationTerminal()
+        checkPresentationDelays()
+        checkPresentationTermination()
+        checkPresentationWiring()
+    }
+
+    /// 1. ПОЛНАЯ матрица решателя: ожидание задано явно для каждого из 16 случаев.
+    static func checkPresentationMatrix() {
+        let matrix: [(step: PresentationStep, isActive: Bool, isVisible: Bool,
+                      expected: PresentationOutcome, why: String)] = [
+            // .ordered — makeKeyAndOrderFront + activate() уже выполнены.
+            (.ordered, false, false, .escalate(.orderedRegardless),
+             "ФАКТ ИНЦИДЕНТА: не впереди и не видно → поднять поверх чужих окон"),
+            (.ordered, false, true, .satisfied,
+             "активации не дали, но окно видно — цель достигнута, эскалировать незачем"),
+            (.ordered, true, false, .satisfied,
+             "приложение впереди: occlusion мог не успеть пересчитаться, дёргать док рано"),
+            (.ordered, true, true, .satisfied,
+             "и впереди, и видно — показ состоялся"),
+
+            // .orderedRegardless — окно подняли поверх чужих приложений.
+            (.orderedRegardless, false, false, .escalate(.attentionRequested),
+             "подняли поверх всех и всё равно не видно → дело не в порядке окон, зовём человека"),
+            (.orderedRegardless, false, true, .satisfied,
+             "ступень сработала: окно видно без активации — ровно то, ради чего она есть"),
+            (.orderedRegardless, true, false, .satisfied,
+             "приложение вышло вперёд — подскок дока был бы навязчивостью"),
+            (.orderedRegardless, true, true, .satisfied,
+             "видно и впереди"),
+
+            // .attentionRequested — иконка в доке уже подскочила один раз.
+            (.attentionRequested, false, false, .escalate(.done),
+             "человека позвали и он не пришёл: звать второй раз — навязчивость, лестница исчерпана"),
+            (.attentionRequested, false, true, .satisfied,
+             "окно показалось после запроса внимания → гасим лестницу и снимаем запрос"),
+            (.attentionRequested, true, false, .satisfied,
+             "человек переключился на нас — дальше эскалировать нечего и незачем"),
+            (.attentionRequested, true, true, .satisfied,
+             "пришёл и видит"),
+
+            // .done — лестница исчерпана или не начиналась.
+            (.done, false, false, .escalate(.done),
+             "терминал: ноль действий, ноль таймеров — поздний тик отменённого таймера безвреден"),
+            (.done, false, true, .satisfied,
+             "окно видно на терминале → satisfied, а не «мы уже сдались»"),
+            (.done, true, false, .satisfied,
+             "приложение впереди на терминале → satisfied"),
+            (.done, true, true, .satisfied,
+             "видно и впереди на терминале"),
+        ]
+
+        // Мета-проверка самой фикстуры: «исчерпывающая» — это утверждение о таблице,
+        // и оно тоже должно ломаться, если строку удалят или задвоят.
+        let keys = Set(matrix.map { "\(name($0.step))|\($0.isActive)|\($0.isVisible)" })
+        check("матрица исчерпывающая: 4 ступени × 4 комбинации = 16 случаев, каждый ровно один раз",
+              matrix.count == 16 && keys.count == 16,
+              "строк \(matrix.count), уникальных \(keys.count)")
+
+        for row in matrix {
+            let got = WindowPresentation.next(after: row.step,
+                                              isActive: row.isActive,
+                                              isVisible: row.isVisible)
+            check("[\(name(row.step)) · active=\(row.isActive) · visible=\(row.isVisible)] "
+                  + "→ \(name(row.expected)) — \(row.why)",
+                  got == row.expected, "got \(name(got))")
+        }
+    }
+
+    /// 2. Короткое замыкание: любой признак показа гасит лестницу на ЛЮБОЙ ступени.
+    ///
+    /// Дизъюнкция, а не конъюнкция, и это не небрежность: `isVisible` — прямое
+    /// доказательство цели, `isActive` нужен отдельно, потому что окно может стать
+    /// активным раньше, чем система пересчитает occlusion.
+    static func checkPresentationShortCircuit() {
+        for step in ladder {
+            let ok = shownCombos.allSatisfy {
+                WindowPresentation.next(after: step,
+                                        isActive: $0.isActive,
+                                        isVisible: $0.isVisible) == .satisfied
+            }
+            check("короткое замыкание на ступени \(name(step)): isActive || isVisible → satisfied",
+                  ok)
+        }
+        // Терминал назван отдельно: именно сюда прилетает поздний тик уже отменённого
+        // таймера у окна, которое человек тем временем увидел, — и он обязан гасить
+        // лестницу (снять запрос внимания), а не «доводить её до конца».
+        check("короткое замыкание работает и на ТЕРМИНАЛЬНОЙ .done (поздний тик у видимого окна)",
+              WindowPresentation.next(after: .done, isActive: false, isVisible: true) == .satisfied
+                  && WindowPresentation.next(after: .done, isActive: true, isVisible: false) == .satisfied)
+        let all = ladder.allSatisfy { step in
+            shownCombos.allSatisfy {
+                WindowPresentation.next(after: step,
+                                        isActive: $0.isActive,
+                                        isVisible: $0.isVisible) == .satisfied
+            }
+        }
+        check("ни одна из 12 «показанных» комбинаций не эскалирует (0 лишних подскоков дока)",
+              all)
+    }
+
+    /// 3. Монотонность: эскалация не идёт назад и не перепрыгивает ступень.
+    ///
+    /// Обе половины нужны порознь. «Назад» вернуло бы лестницу в цикл; «перепрыгнуть»
+    /// — это подскок дока вместо тихого `orderFrontRegardless()`, то есть заметное
+    /// человеку действие там, где хватило бы незаметного.
+    static func checkPresentationMonotonic() {
+        for step in ladder {
+            let outcome = WindowPresentation.next(after: step, isActive: false, isVisible: false)
+            guard case .escalate(let target) = outcome else {
+                check("невидимое окно на ступени \(name(step)) → эскалация, а не satisfied",
+                      false, "got \(name(outcome))")
+                continue
+            }
+            check("монотонность: \(name(step)) → \(name(target)) не идёт НАЗАД",
+                  rung(target) >= rung(step),
+                  "ранги \(rung(step)) → \(rung(target))")
+            check("монотонность: \(name(step)) → \(name(target)) не ПЕРЕПРЫГИВАЕТ ступень",
+                  rung(target) - rung(step) <= 1,
+                  "ранги \(rung(step)) → \(rung(target))")
+        }
+        // Ровно один шаг за раз для непустых ступеней; терминал остаётся на месте.
+        let advances = ladder.map { step -> Int in
+            guard case .escalate(let t) = WindowPresentation.next(after: step,
+                                                                  isActive: false,
+                                                                  isVisible: false)
+            else { return -99 }
+            return rung(t) - rung(step)
+        }
+        check("лестница проходится ровно по одной ступени за раз, терминал стоит на месте",
+              advances == [1, 1, 1, 0], "шаги: \(advances)")
+    }
+
+    /// 4. Идемпотентный терминал: из `.done` некуда идти, и повтор безвреден.
+    static func checkPresentationTerminal() {
+        let terminal = WindowPresentation.next(after: .done, isActive: false, isVisible: false)
+        check("терминал: из .done при невидимом окне → escalate(.done), а не откат на ступень",
+              terminal == .escalate(.done), "got \(name(terminal))")
+
+        var step = PresentationStep.done
+        var stayed = true
+        for _ in 0..<10 {
+            let outcome = WindowPresentation.next(after: step, isActive: false, isVisible: false)
+            guard case .escalate(let t) = outcome, t == .done else { stayed = false; break }
+            step = t
+        }
+        check("терминал идемпотентен: 10 повторных входов не меняют исход и не поднимают ступень",
+              stayed && step == .done)
+        check("терминал не заводит таймер (ноль действий, ноль ретейнов без адресата)",
+              WindowPresentation.recheckDelay(after: .done) == nil)
+    }
+
+    /// 5. `recheckDelay` — таймер ровно там, где есть куда подниматься.
+    ///
+    /// Значения сверяются С КОНСТАНТАМИ, а не с литералами 1.0/1.5: подстройка паузы
+    /// — это настройка, а не регрессия, и тест не имеет права её ловить. Ловит он
+    /// другое: НАЛИЧИЕ таймера, его конечность и порядок двух пауз.
+    static func checkPresentationDelays() {
+        check("задержка после .ordered = константа recheckAfterOrdered (не литерал)",
+              WindowPresentation.recheckDelay(after: .ordered)
+                  == WindowPresentation.recheckAfterOrdered,
+              "\(String(describing: WindowPresentation.recheckDelay(after: .ordered)))")
+        check("задержка после .orderedRegardless = константа recheckAfterOrderedRegardless",
+              WindowPresentation.recheckDelay(after: .orderedRegardless)
+                  == WindowPresentation.recheckAfterOrderedRegardless,
+              "\(String(describing: WindowPresentation.recheckDelay(after: .orderedRegardless)))")
+        check("nil РОВНО для .attentionRequested (выше подниматься нечем)",
+              WindowPresentation.recheckDelay(after: .attentionRequested) == nil)
+        check("nil РОВНО для .done (терминал)",
+              WindowPresentation.recheckDelay(after: .done) == nil)
+
+        let silent = ladder.filter { WindowPresentation.recheckDelay(after: $0) == nil }
+        check("таймер не заводится РОВНО у двух ступеней и ровно у этих",
+              silent == [.attentionRequested, .done],
+              "без таймера: \(silent.map(name).joined(separator: ", "))")
+
+        for step in [PresentationStep.ordered, .orderedRegardless] {
+            let delay = WindowPresentation.recheckDelay(after: step)
+            check("задержка после \(name(step)) — конечная положительная величина",
+                  (delay ?? 0) > 0 && (delay ?? .infinity).isFinite,
+                  "\(String(describing: delay))")
+        }
+
+        // Перекрёстный инвариант двух функций: таймер существует ТОГДА И ТОЛЬКО ТОГДА,
+        // когда следующая ступень действительно что-то делает. Расхождение здесь —
+        // это либо живой таймер без адресата, либо ступень, до которой никто не
+        // доедет, и каждая из двух функций по отдельности выглядит корректной.
+        for step in ladder {
+            var leadsToAction = false
+            if case .escalate(let t) = WindowPresentation.next(after: step,
+                                                               isActive: false,
+                                                               isVisible: false) {
+                leadsToAction = (t != .done && t != step)
+            }
+            check("таймер заводится ⇔ есть куда подниматься (\(name(step)))",
+                  (WindowPresentation.recheckDelay(after: step) != nil) == leadsToAction)
+        }
+
+        check("вторая пауза не короче первой (следующая ступень — единственная заметная человеку)",
+              WindowPresentation.recheckAfterOrderedRegardless
+                  >= WindowPresentation.recheckAfterOrdered,
+              "\(WindowPresentation.recheckAfterOrdered) → "
+                  + "\(WindowPresentation.recheckAfterOrderedRegardless)")
+    }
+
+    /// 6. Отсутствие цикла: невидимое окно доводит автомат до `.done` за конечное
+    /// число шагов, и суммарное ожидание человека ограничено.
+    static func checkPresentationTermination() {
+        var step = PresentationStep.ordered
+        var path: [PresentationStep] = []
+        var armed: [TimeInterval] = []
+        var iterations = 0
+        let hardStop = 16          // сторож: цикл в правиле не должен вешать сьюту
+
+        while iterations < hardStop {
+            iterations += 1
+            if let delay = WindowPresentation.recheckDelay(after: step) { armed.append(delay) }
+            guard case .escalate(let target) = WindowPresentation.next(after: step,
+                                                                      isActive: false,
+                                                                      isVisible: false)
+            else { break }         // satisfied — не наш вход, окно невидимо всю дорогу
+            if target == step { break }   // неподвижная точка = терминал
+            step = target
+            path.append(target)
+        }
+
+        let trace = path.map(name).joined(separator: " → ")
+        check("невидимое окно от .ordered: лестница ДОХОДИТ до .done",
+              step == .done, "путь: \(trace)")
+        check("…за конечное число шагов (≤ 4), сторож не сработал",
+              path.count <= 4 && iterations < hardStop,
+              "шагов \(path.count), итераций \(iterations)")
+        check("…ни одна ступень не повторилась — цикла нет",
+              Set(path.map(name)).count == path.count, "путь: \(trace)")
+        check("…путь ровно тот, что задуман: orderedRegardless → attentionRequested → done",
+              path == [.orderedRegardless, .attentionRequested, .done], "путь: \(trace)")
+        check("на всём пути заведено ровно 2 таймера (по числу ступеней, с которых есть подъём)",
+              armed.count == 2, "таймеров \(armed.count)")
+        check("суммарное ожидание человека ограничено и равно сумме двух констант",
+              armed.reduce(0, +) == WindowPresentation.recheckAfterOrdered
+                  + WindowPresentation.recheckAfterOrderedRegardless
+                  && armed.reduce(0, +) <= 5,
+              "\(armed.reduce(0, +)) c")
+
+        // --- НЕГАТИВНЫЙ КОНТРОЛЬ ------------------------------------------------
+        // Правило, которое тут было до .patches/006: «вызвал makeKeyAndOrderFront +
+        // activate и надеюсь». Оно рапортовало успех ровно в той ситуации, где человек
+        // 85 секунд смотрел на чужое окно. Фикстура обязана различать два правила:
+        // при факте инцидента НИ ОДНА ступень не имеет права сказать «показано».
+        check("НЕГ.КОНТРОЛЬ: факт инцидента (не активны И окно перекрыто) не считается показом ни на одной ступени",
+              ladder.allSatisfy {
+                  WindowPresentation.next(after: $0, isActive: false, isVisible: false) != .satisfied
+              })
+        check("НЕГ.КОНТРОЛЬ: базовая ступень не самоуспокаивается — из .ordered есть куда идти",
+              WindowPresentation.next(after: .ordered, isActive: false, isVisible: false)
+                  == .escalate(.orderedRegardless))
+    }
+
+    // MARK: структурные помощники — «провод ВНУТРИ этой функции», а не «слово в файле»
+
+    /// Исходник без строк-комментариев.
+    ///
+    /// Комментарий — не провод. В `main.swift` прозы больше, чем кода, и она цитирует
+    /// ровно те вызовы, которые мы стережём: `orderFrontRegardless` встречается в файле
+    /// ТРИЖДЫ, и два раза — в комментариях; `NSApp.unhide` живёт ТОЛЬКО в комментарии.
+    /// Значит утверждение по всему файлу «вызов есть» удовлетворяется пересказом, а
+    /// «вызова нет» ломается о цитату. Сначала выкидываем комментарии, потом утверждаем.
+    ///
+    /// Выкидываются только ЦЕЛИКОМ комментарные строки (`//` или `///` в начале):
+    /// резать хвостовые `//` нельзя — они неотличимы от `//` внутри строкового литерала,
+    /// а в файле есть URL'ы.
+    static func strippedCode(_ source: String) -> String {
+        source.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+    }
+
+    /// Тело функции `decl` из УЖЕ очищенного исходника: от строки объявления до первой
+    /// строки, состоящей ровно из `}` на том же отступе.
+    ///
+    /// Это не парсер Swift и не претендует им быть: один файл, одно форматирование,
+    /// закрывающая скобка метода — на отступе метода. Промах якоря отдаётся ПУСТЫМ
+    /// телом, то есть в красное для положительных утверждений. Отрицательные («в теле
+    /// НЕТ Х») от пустого тела, наоборот, зазеленели бы — поэтому каждое из них ниже
+    /// склеено с положительным фактом из того же тела, а «все тела найдены» проверяется
+    /// отдельной строкой.
+    static func bodyOfFunction(_ decl: String, in code: String) -> String {
+        let lines = code.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let start = lines.firstIndex(where: { $0.contains(decl) }) else { return "" }
+        let close = String(lines[start].prefix(while: { $0 == " " })) + "}"
+        guard let end = lines[(start + 1)...].firstIndex(of: close) else { return "" }
+        return lines[start...end].joined(separator: "\n")
+    }
+
+    /// Порядок двух вызовов внутри одного тела. Fail-closed: нет любого из них — false.
+    ///
+    /// ⚠️ Сравниваются ПЕРВЫЕ вхождения, поэтому по телу с несколькими однотипными
+    /// блоками этим спрашивать нельзя — сначала вырежи блок через `slice`.
+    static func precedes(_ first: String, _ second: String, in body: String) -> Bool {
+        guard let a = body.range(of: first), let b = body.range(of: second) else { return false }
+        return a.lowerBound < b.lowerBound
+    }
+
+    /// Кусок тела от маркера до следующего `stop` (или до конца, если его нет).
+    ///
+    /// Нужен, чтобы «в обработчике X стоит вызов Y» не удовлетворялось вызовом Y в
+    /// СОСЕДНЕМ обработчике. Это не теория: в `installFocusObservers` четыре
+    /// регистрации, `endPresentationEscalation()` стоит в двух из них, и поиск по
+    /// всему телу их не различает — первая же черновая редакция этих проверок на том
+    /// и споткнулась (покраснела на исправном коде). Границей служит следующая
+    /// регистрация — по коду, не по имени локальной переменной.
+    static func slice(from marker: String, upTo stop: String, in body: String) -> String {
+        guard let start = body.range(of: marker) else { return "" }
+        let tail = body[start.lowerBound...]
+        guard let end = tail.range(of: stop) else { return String(tail) }
+        return String(tail[..<end.lowerBound])
+    }
+
+    static func occurrences(of needle: String, in text: String) -> Int {
+        needle.isEmpty ? 0 : text.components(separatedBy: needle).count - 1
+    }
+
+    /// STRUCTURAL guard, тот же приём и те же честные границы, что в checkRefitWiring:
+    /// чистое правило может быть безупречным, а хост — не спрашивать его или кормить
+    /// не теми фактами, и все проверки выше останутся зелёными. Проверить это
+    /// значением нельзя: `NSApp.isActive` и `occlusionState` существуют только внутри
+    /// живого приложения с окном, а сьюта окон не открывает. Поэтому — чтение
+    /// исходника: инструмент грубый, и он доказывает, что связь ЕСТЬ, а не что она
+    /// срабатывает. Ровно этот разрыв («проверялся факт вызова, а не факт эффекта»)
+    /// и дал инцидент .patches/006.
+    ///
+    /// Утверждения по ТЕЛАМ функций, а не по файлу. Разница не косметическая: «слово
+    /// встречается в main.swift» зеленеет от вызова на мёртвой ветке и от упоминания в
+    /// комментарии, то есть ровно тот тихий зелёный, ради которого весь этот файл и
+    /// написан. Провод считается на месте, только если он стоит в той функции, которая
+    /// его обязана дёргать, и — где порядок несущий — в правильном месте её тела.
+    static func checkPresentationWiring() {
+        let appDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let raw = (try? String(contentsOf: appDir.appendingPathComponent("main.swift"),
+                               encoding: .utf8)) ?? ""
+        check("исходник хоста прочитан", !raw.isEmpty)
+        let host = strippedCode(raw)
+
+        check("самопроверка кормит решатель ДВУМЯ фактами реальности, а не догадкой",
+              host.contains("WindowPresentation.next(")
+                  && host.contains("NSApp.isActive")
+                  && host.contains("occlusionState.contains(.visible)"))
+        check("таймер перепроверки заводится по правилу, а не по литералу в хосте",
+              host.contains("WindowPresentation.recheckDelay(after:"))
+        check("ступень orderedRegardless выполняет orderFrontRegardless() — подъём без активации",
+              host.contains("window.orderFrontRegardless()"))
+        check("ступень attentionRequested — РАЗОВЫЙ informationalRequest",
+              host.contains("requestUserAttention(.informationalRequest)"))
+        check("подскок дока никогда не .criticalRequest (он бился бы до реакции человека)",
+              !host.contains("requestUserAttention(.criticalRequest)"))
+
+        // --- тела-адресаты ------------------------------------------------------
+        // Промах якоря обязан быть КРАСНЫМ, а не «нечего проверять»: без этой строки
+        // одно переименование функции превратило бы каждое отрицательное утверждение
+        // ниже в зелёное по пустому телу.
+        let bodies = [
+            "applicationDidFinishLaunching": bodyOfFunction("func applicationDidFinishLaunching",
+                                                            in: host),
+            "presentWindow": bodyOfFunction("func presentWindow()", in: host),
+            "installFocusObservers": bodyOfFunction("func installFocusObservers()", in: host),
+            "checkWindowVisibility": bodyOfFunction("func checkWindowVisibility()", in: host),
+            "performPresentationStep": bodyOfFunction("func performPresentationStep(", in: host),
+            "withdrawAttentionRequest": bodyOfFunction("func withdrawAttentionRequest()", in: host),
+            "endPresentationEscalation": bodyOfFunction("func endPresentationEscalation()",
+                                                        in: host),
+            "applicationWillTerminate": bodyOfFunction("func applicationWillTerminate", in: host),
+            "applicationShouldHandleReopen": bodyOfFunction("func applicationShouldHandleReopen",
+                                                            in: host),
+        ]
+        let lost = bodies.filter { $0.value.isEmpty }.keys.sorted()
+        check("все 9 тел-адресатов найдены в хосте (промах якоря = красное, не «нечего проверять»)",
+              lost.isEmpty, lost.isEmpty ? "" : "не найдены: \(lost.joined(separator: ", "))")
+        func body(_ name: String) -> String { bodies[name] ?? "" }
+
+        // --- ЛЕСТНИЦА — ЕДИНСТВЕННЫЙ СПОСОБ ПОДНЯТЬ ОКНО ------------------------
+        // Инцидент .patches/006 начался с «подниму окно вот здесь руками»: вызов
+        // сработал, окно осталось перекрытым, и никто этого не заметил, потому что
+        // самопроверки на том пути не было. Считаем ВСЕ подъёмы в хосте и требуем,
+        // чтобы каждый стоял внутри лестницы — presentWindow (ступень 4) или
+        // performPresentationStep (ступени .ordered / .orderedRegardless).
+        //
+        // Образцы БЕЗ получателя (`makeKeyAndOrderFront(`, а не `window.makeKeyAnd…`):
+        // получателей у окна много — `window.`, `window?.`, `self.window!.`, локальная
+        // переменная, — и сторож, привязанный к одному написанию, обходится вторым.
+        // Это не гипотеза: первая редакция ловила только `window.`, и мутант с
+        // `window?.makeKeyAndOrderFront(nil)` в applicationWillTerminate прошёл её
+        // насквозь, 317/317 зелёных.
+        //
+        // `mustExist` = ступень лестницы, которая обязана существовать; false — API,
+        // которого просто не должно быть в обход (0 вхождений — законный ответ).
+        let raises: [(call: String, mustExist: Bool)] = [
+            ("makeKeyAndOrderFront(", true),   // шаг 4 presentWindow + ступень .ordered
+            ("orderFrontRegardless(", true),   // ступень .orderedRegardless
+            (".activate(", true),              // шаг 5 presentWindow (через activateApp)
+            ("orderFront(", false),            // ещё один способ поднять окно мимо лестницы
+            ("deminiaturize(", false),         // и ещё один: развернуть из дока
+        ]
+        for (call, mustExist) in raises {
+            let inFile = occurrences(of: call, in: host)
+            let inLadder = occurrences(of: call, in: body("presentWindow"))
+                + occurrences(of: call, in: body("performPresentationStep"))
+                + occurrences(of: call, in: bodyOfFunction("func activateApp()", in: host))
+            check("подъём окна `\(call)` живёт ТОЛЬКО внутри лестницы, мимо неё окно не поднимают",
+                  inFile == inLadder && (!mustExist || inFile > 0),
+                  "в файле \(inFile), в лестнице \(inLadder)")
+        }
+
+        // --- НАБЛЮДАТЕЛЬ ОККЛЮЗИИ ------------------------------------------------
+        // Единственное ПОЛОЖИТЕЛЬНОЕ доказательство, что человек видит окно (приложению
+        // для этого не обязательно быть активным). Потеряется он — лестница не узнает
+        // об успехе, догонит человека подскоком дока по уже открытому окну, и ни одна
+        // проверка выше не покраснеет: решатель-то останется безупречным.
+        // Обработчики режутся поштучно: утверждение «гасит лестницу» обязано попадать
+        // в СВОЙ блок, а не собирать вызов из соседнего.
+        let occlusionHandler = slice(from: "forName: NSWindow.didChangeOcclusionStateNotification",
+                                     upTo: "nc.addObserver(", in: body("installFocusObservers"))
+        let activeHandler = slice(from: "forName: NSApplication.didBecomeActiveNotification",
+                                  upTo: "nc.addObserver(", in: body("installFocusObservers"))
+        check("наблюдатель окклюзии зарегистрирован ВНУТРИ installFocusObservers",
+              !occlusionHandler.isEmpty)
+        check("окклюзия гасит лестницу по ПОЛОЖИТЕЛЬНОМУ признаку (стало видно), а не на любое событие",
+              precedes("occlusionState.contains(.visible)", "endPresentationEscalation()",
+                       in: occlusionHandler))
+        check("человек посмотрел (приложение стало активным) → лестница гаснет",
+              activeHandler.contains("endPresentationEscalation()"))
+        let registered = occurrences(of: "nc.addObserver(", in: body("installFocusObservers"))
+        let retained = body("installFocusObservers")
+            .components(separatedBy: "focusObservers = [").last?
+            .components(separatedBy: "]").first?
+            .components(separatedBy: ",").count ?? 0
+        check("сколько наблюдателей завели, столько и удерживаем (иначе снять на выходе нечем)",
+              registered > 0 && registered == retained,
+              "заведено \(registered), удержано \(retained)")
+
+        // --- ПОРЯДОК УСТАНОВКИ (несущий) ----------------------------------------
+        // Уведомление, посланное ДО установки наблюдателя, не доставляется никому.
+        // Переставь эти две строки местами — и переход, ради которого лестница
+        // существует (запуск), пройдёт мимо неё; заметить это сможет только поллинг
+        // через 1.0 с. Компилятор такой перестановки не видит, тесты значений — тоже.
+        check("наблюдатели ставятся СТРОГО ДО первого показа окна (уведомление без слушателя — в никуда)",
+              precedes("installFocusObservers()", "presentWindow()",
+                       in: body("applicationDidFinishLaunching")))
+
+        // --- ВХОДЫ В ЛЕСТНИЦУ ----------------------------------------------------
+        // Зеркало проверки выше. Та доказывает, что МИМО лестницы окно не поднимают;
+        // эта — что в неё заходят. Без неё выпавший `presentWindow()` из фронта «пришла
+        // новая книга» оставил бы сьюту полностью зелёной, а человека — опять перед
+        // невидимым окном: подниматься мимо лестницы никто не начал, просто показывать
+        // перестали совсем. Проверяется факт вызова на каждом пути показа; правильность
+        // САМОГО УСЛОВИЯ фронта — не здесь, она значениями в сьютах queue/nudge.
+        let entries = ["applicationDidFinishLaunching",   // запуск
+                       "applicationShouldHandleReopen",   // пинок агента в живое приложение
+                       "refreshNow",                      // фронт: появилась новая книга
+                       "handleInstalled",                 // передача после установки
+                       "requestConsentNotice"]            // карточка согласия
+        let silent = entries.filter {
+            !bodyOfFunction("func \($0)", in: host).contains("presentWindow()")
+        }
+        check("ВСЕ \(entries.count) путей показа заходят в лестницу через presentWindow()",
+              silent.isEmpty, silent.isEmpty ? "" : "показывают мимо неё: \(silent.joined(separator: ", "))")
+
+        // Агент пинает `open -b`; приложение уже запущено, значит LaunchServices
+        // превращает пинок в reopen. Без этого делегата пинок получает дефолтную
+        // обработку AppKit — на Tahoe это ровно то же молчание, что и в инциденте.
+        check("пинок в уже живое приложение (reopen) ведёт в ту же лестницу",
+              body("applicationShouldHandleReopen").contains("presentWindow()"))
+        check("…и не поднимает окно мимо неё своими руками",
+              body("applicationShouldHandleReopen").contains("presentWindow()")
+                  && !body("applicationShouldHandleReopen").contains("makeKeyAndOrderFront")
+                  && !body("applicationShouldHandleReopen").contains("orderFrontRegardless"))
+
+        // --- РАЗ-ПРЯТЫВАНИЕ ------------------------------------------------------
+        // Окна скрытого приложения (Cmd+H, «Скрыть остальные») лежат в слое, которого
+        // никто не видит: без этого шага КАЖДАЯ ступень лестницы отработает вхолостую,
+        // а самопроверка честно доложит «не видно» и дойдёт до подскока дока — с
+        // окном, которое так и осталось скрытым.
+        check("presentWindow снимает скрытость приложения перед подъёмом",
+              body("presentWindow").contains("NSApp.isHidden")
+                  && body("presentWindow").contains("NSApp.unhideWithoutActivation()"))
+        check("раз-прятывание БЕЗ активации: plain unhide протащил бы отказной запрос активации",
+              body("presentWindow").contains("NSApp.unhideWithoutActivation()")
+                  && !body("presentWindow").contains("NSApp.unhide("))
+
+        // --- МОНОТОННОСТЬ ПОВТОРНОГО ВХОДА ---------------------------------------
+        // Одна упавшая книга даёт минимум два показа (reopen от агента + фронт часов
+        // через 0.15–0.5 с). Решатель монотонен — это доказано матрицей выше, — но
+        // хост может отменить его свойство сбоку: перезапустить прогон с базовой
+        // ступени, потеряв уже достигнутый подъём. Зелёный тест над свойством, которого
+        // у работающей системы нет, — тот самый класс, ради которого всё это писалось.
+        check("повторный вход ПОВТОРЯЕТ текущую ступень, а не сбрасывает лестницу вниз",
+              body("presentWindow").contains("if presentationCheck != nil")
+                  && body("presentWindow").contains("performPresentationStep(presentationStep"))
+        check("сброс на базовую ступень в presentWindow РОВНО ОДИН (в ветке нового прогона)",
+              occurrences(of: "enterPresentationStep(", in: body("presentWindow")) == 1
+                  && body("presentWindow").contains("enterPresentationStep(.ordered)"))
+        check("новый прогон отзывает унаследованный подскок ДО подъёма (иначе своего он не получит)",
+              precedes("withdrawAttentionRequest()", "enterPresentationStep(.ordered)",
+                       in: body("presentWindow")))
+
+        // --- ЗАКРЫТОЕ ОКНО ОСТАНАВЛИВАЕТ ЛЕСТНИЦУ --------------------------------
+        // Человек закрыл окно, пока проверка была в воздухе. occlusionState не отличает
+        // закрытое окно от перекрытого — оба «не видно», — поэтому решателю такой случай
+        // показывать НЕЛЬЗЯ: он честно эскалирует, и orderFrontRegardless вернёт на
+        // экран окно, которое человек только что убрал. Отсюда и порядок: guard раньше
+        // решателя, иначе он бесполезен.
+        check("закрытое окно останавливает лестницу насмерть (isVisible, не occlusion)",
+              body("checkWindowVisibility").contains("guard window.isVisible else")
+                  && body("checkWindowVisibility").contains("presentationStep = .done"))
+        check("…и этот guard стоит СТРОГО ДО решателя (после — окно вернулось бы на экран)",
+              precedes("guard window.isVisible else", "WindowPresentation.next(",
+                       in: body("checkWindowVisibility")))
+
+        // --- СНЯТИЕ ЗАПРОСА ВНИМАНИЯ ---------------------------------------------
+        // Было: `host.contains("cancelUserAttentionRequest")` — слово где-то в файле.
+        // Стало: цепочка целиком, каждое звено отдельно. Снятие живёт в одном месте, к
+        // нему ведут ровно два пути, и путь выхода из приложения — один из них.
+        check("снятие запроса внимания живёт РОВНО В ОДНОМ месте — withdrawAttentionRequest",
+              occurrences(of: "NSApp.cancelUserAttentionRequest(", in: host) == 1
+                  && body("withdrawAttentionRequest").contains("NSApp.cancelUserAttentionRequest("))
+        check("…и идемпотентно: guard на сохранённый id + обнуление, двойного снятия быть не может",
+              precedes("guard let request = presentationAttentionRequest else { return }",
+                       "NSApp.cancelUserAttentionRequest(", in: body("withdrawAttentionRequest"))
+                  && body("withdrawAttentionRequest").contains("presentationAttentionRequest = nil"))
+        check("человек посмотрел → лестница гаснет И снимает невыполненный запрос внимания",
+              body("endPresentationEscalation").contains("withdrawAttentionRequest()")
+                  && body("endPresentationEscalation").contains("presentationCheck?.cancel()"))
+        check("ВЫХОД из приложения ведёт в то же снятие (terminate → лестница → отзыв), а не мимо",
+              body("applicationWillTerminate").contains("endPresentationEscalation()")
+                  && body("endPresentationEscalation").contains("withdrawAttentionRequest()")
+                  && body("withdrawAttentionRequest").contains("NSApp.cancelUserAttentionRequest("))
+        check("…и гасит лестницу ДО снятия наблюдателей (иначе работа останется в очереди)",
+              precedes("endPresentationEscalation()", "removeObserver",
+                       in: body("applicationWillTerminate")))
     }
 
     // MARK: M5 — the fail-closed install-truth gate (plan v2 B3 / §6.3)
@@ -1063,6 +1662,625 @@ struct RoutingSelfCheck {
               EngineVersion.atLeast("1.0-beta", "1.0"))
     }
 
+    // MARK: - D17 «ранний нудж» — сторона приложения (M-D)
+    //
+    // Что здесь охраняется. D17 разрезал публикацию книги на фазы
+    // (skeleton → chapters → ready) ради окна за ~0.8 с вместо ~12 с, и это дало
+    // приложению три новые возможности молча всё испортить:
+    //
+    //   1. СОБРАТЬ НЕПОЛНУЮ КНИГУ. Гейт «Собрать» обязан спрашивать «видел ли
+    //      отправитель ПОЛНУЮ книгу», а не «готова ли книга сейчас» — иначе
+    //      команда, рождённая по скелету, дождётся дренажа и соберёт обрезанную
+    //      аудиокнигу (TOCTOU). Ответ — наличие `build_token`, см. `isBuildReady`.
+    //   2. СЪЕСТЬ ДАННЫЕ ЧЕЛОВЕКА. SwiftUI держит `@State` живым между
+    //      обновлениями, так что ТО ЖЕ окно получает более новый манифест той же
+    //      книги. Оба архитектора назвали это главной опасностью на стороне
+    //      приложения. Ответ — одна чистая функция `ConfirmMerge.merge`, и она
+    //      здесь проверяется всей матрицей pristine/dirty.
+    //   3. ПОДНЯТЬ ОКНО ДВАЖДЫ. У приложения свой канал подъёма (rising-edge по
+    //      state.json) мимо агентского леджера. Ответ — `NudgeEdge`: те же ключи,
+    //      что у агента, побайтово. Скелет и ready дают ОДИН ключ ⇒ второго
+    //      подъёма нет. Зеркальность проверяется ЧТЕНИЕМ `agent/scan.py`, а не
+    //      комментарием (см. `checkNudgeEdgeMirror`).
+
+    /// Фикстура-манифест для проверок фаз/слияния.
+    static func d17Manifest(phase: String, token: String, title: String, author: String,
+                            rev: String = "rev-aaaaaaaaaaaaaaaaaaaa", bid: String = "book1",
+                            options: [CoverOption] = [], selected: String? = nil,
+                            params: BookParams = .defaults,
+                            chapters: [ChapterEntry] = []) -> BookManifest {
+        BookManifest(bookID: bid, srcDir: "/src", status: "pending-confirm",
+                     sourceRev: rev, confirmToken: "tok-bbbbbbbbbbbbbbbbbbbb",
+                     title: title, author: author, chapters: chapters,
+                     totalDurationMS: 0, coverState: "none", coverPreview: nil,
+                     coverOptions: options, coverSelected: selected, params: params,
+                     phase: phase, buildToken: token)
+    }
+
+    /// Манифест ИЗ JSON — единственный честный способ проверить «поля нет вовсе»
+    /// (до-D17 манифест, манифест от более нового агента). Промах разбора отдаётся
+    /// `nil` и краснеет у вызывающего, а не превращается в «нечего проверять».
+    static func d17Decode(_ json: String) -> BookManifest? {
+        try? JSONDecoder().decode(BookManifest.self, from: Data(json.utf8))
+    }
+
+    static let d17ManifestJSONFields =
+        "\"book_id\":\"b\",\"src_dir\":\"/s\",\"status\":\"pending-confirm\"," +
+        "\"source_rev\":\"r\",\"confirm_token\":\"t\",\"title\":\"T\",\"author\":\"A\"," +
+        "\"chapters\":[],\"params\":{}"
+
+    /// ФАЗА И ГЕЙТ СБОРКИ: что приложение вправе строить, а что — нет.
+    static func checkManifestPhaseGate() {
+        let skel = d17Manifest(phase: "skeleton", token: "", title: "01 Файл", author: "Папка")
+        let chap = d17Manifest(phase: "chapters", token: "", title: "Война и мир",
+                               author: "Толстой")
+        let ready = d17Manifest(
+            phase: "ready", token: "bt-1", title: "Война и мир", author: "Лев Толстой",
+            options: [CoverOption(optID: "emb-0", kind: "embedded", path: "/a.jpg", label: "a"),
+                      CoverOption(optID: "gen-0", kind: "generated", path: "/b.jpg", label: "b")],
+            selected: "emb-0")
+
+        check("D17: скелет не даёт собирать", !skel.isBuildReady)
+        check("D17: фаза chapters не даёт собирать (главы есть, обложки нет)",
+              !chap.isBuildReady)
+        check("D17: ready даёт собирать", ready.isBuildReady)
+        check("D17: гейт читает НАЛИЧИЕ build_token, а не имя фазы",
+              !d17Manifest(phase: "ready", token: "", title: "T", author: "A").isBuildReady
+                  && d17Manifest(phase: "skeleton", token: "bt",
+                                 title: "T", author: "A").isBuildReady)
+
+        // I8 — до-D17 манифест: поля phase/build_token нет вовсе.
+        let legacy = d17Decode("{\(d17ManifestJSONFields)}")
+        check("I8: до-D17 манифест разобран (иначе проверки ниже пусты)", legacy != nil)
+        check("I8: манифест без phase читается как done", legacy?.phaseValue == .done)
+        check("I8: манифест без build_token НЕ собирается (fail-closed)",
+              legacy?.isBuildReady == false)
+        let upgraded = d17Decode(
+            "{\(d17ManifestJSONFields),\"phase\":\"ready\",\"build_token\":\"xyz\"}")
+        check("I8: поднятый агентом pre-D17 манифест снова собирается",
+              upgraded?.isBuildReady == true)
+
+        // Манифест от БОЛЕЕ НОВОГО агента: незнакомая фаза не имеет права подвесить окно.
+        let future = d17Decode("{\(d17ManifestJSONFields),\"phase\":\"covers-v2\"}")
+        check("незнакомая фаза → done (не зависаем на заметке)", future?.phaseValue == .done)
+        check("незнакомая фаза без токена → всё равно не собираем",
+              future?.isBuildReady == false)
+        check("незнакомая фаза без токена → говорим общее «готовлю»",
+              future.map { ConfirmPreparation.forManifest($0) == .preparing } == true)
+
+        check("подготовка: skeleton → «читаю теги»",
+              ConfirmPreparation.forManifest(skel) == .readingTags)
+        check("подготовка: chapters → «подбираю обложку»",
+              ConfirmPreparation.forManifest(chap) == .resolvingCover)
+        check("подготовка: ready → готово", ConfirmPreparation.forManifest(ready) == .ready)
+        check("у ready нет заметки «ещё едет»",
+              ConfirmPreparation.forManifest(ready).note == nil)
+        check("у скелета заметка есть (окно объясняет, чего ждёт)",
+              ConfirmPreparation.forManifest(skel).note != nil)
+    }
+
+    /// `cover_web` — ЯРЛЫК, а не гейт. Граница, которую поставил M-B: живая сеть
+    /// против мёртвой = 0.022 с на кнопке; дотянись веб до гейта — вся работа M-B
+    /// обнулится, причём молча.
+    static func checkCoverWebIsALabel() {
+        func webManifest(_ raw: String?, phase: String = "ready",
+                         token: String = "bt") -> BookManifest? {
+            let web = raw.map { ",\"cover_web\":\"\($0)\"" } ?? ""
+            return d17Decode("{\(d17ManifestJSONFields),\"phase\":\"\(phase)\"," +
+                             "\"build_token\":\"\(token)\",\"cover_web_tries\":2\(web)}")
+        }
+        guard let webPending = webManifest("pending"),
+              let webDone = webManifest("done"),
+              let webAbsent = webManifest(nil),
+              let webJunk = webManifest("что-то новое"),
+              let pendingSkeleton = webManifest("pending", phase: "skeleton", token: "") else {
+            check("cover_web: фикстуры разобраны", false, "JSON не разобрался")
+            return
+        }
+        check("cover_web=pending → показываем строку «ищем обложку»",
+              webPending.isCoverWebPending)
+        check("cover_web=done → строки нет", !webDone.isCoverWebPending)
+        check("cover_web отсутствует (старый манифест) → ведём себя как done",
+              !webAbsent.isCoverWebPending)
+        check("незнакомое значение cover_web → как done (не врём про поиск)",
+              !webJunk.isCoverWebPending)
+        check("лишнее поле cover_web_tries не ломает разбор манифеста",
+              webPending.title == "T")
+
+        // ГЛАВНОЕ: веб-поиск не имеет права дотянуться до гейта сборки.
+        check("ГЕЙТ: cover_web=pending НЕ гасит «Собрать» (веб вне критического пути)",
+              webPending.isBuildReady)
+        check("ГЕЙТ: build_token решает в одиночку — pending и done одинаково собираемы",
+              webPending.isBuildReady == webDone.isBuildReady)
+        check("ГЕЙТ: подготовка («ещё едет») слепа к cover_web",
+              ConfirmPreparation.forManifest(webPending) == .ready
+                  && ConfirmPreparation.forManifest(webPending)
+                      == ConfirmPreparation.forManifest(webDone))
+        check("ГЕЙТ: скелет с pending не собирается — из-за ТОКЕНА, а не из-за веба",
+              !pendingSkeleton.isBuildReady
+                  && ConfirmPreparation.forManifest(pendingSkeleton) == .readingTags)
+    }
+
+    /// МАТРИЦА pristine/dirty + три правила идентичности (`ConfirmMerge`).
+    static func checkConfirmMerge() {
+        let skel = d17Manifest(phase: "skeleton", token: "", title: "01 Файл", author: "Папка")
+        let ready = d17Manifest(
+            phase: "ready", token: "bt-1", title: "Война и мир", author: "Лев Толстой",
+            options: [CoverOption(optID: "emb-0", kind: "embedded", path: "/a.jpg", label: "a"),
+                      CoverOption(optID: "gen-0", kind: "generated", path: "/b.jpg", label: "b")],
+            selected: "emb-0")
+
+        let seeded = ConfirmMerge.seed(manifest: skel, fallbackTitle: "Из очереди")
+        check("посев: title из манифеста", seeded.title == "01 Файл")
+        check("посев: ничего не тронуто", seeded.touched == [])
+        check("посев: обложки нет (у скелета нет вариантов)", seeded.coverSelectedID == nil)
+        check("посев: пустой title подменяется строкой очереди, а не остаётся пустым",
+              ConfirmMerge.seed(manifest: d17Manifest(phase: "skeleton", token: "",
+                                                      title: "", author: "A"),
+                                fallbackTitle: "Из очереди").title == "Из очереди")
+
+        // pristine — всё обновляется из нового манифеста
+        let m1 = ConfirmMerge.merge(seeded, with: ready, fallbackTitle: "Из очереди")
+        check("pristine title ← манифест (скелетное имя файла уступает ID3)",
+              m1.title == "Война и мир")
+        check("pristine author ← манифест", m1.author == "Лев Толстой")
+        check("pristine cover ← cover_selected", m1.coverSelectedID == "emb-0")
+
+        // dirty — правка человека выигрывает
+        var edited = seeded
+        edited.title = "Моё название"
+        edited.touched.insert(.title)
+        let m2 = ConfirmMerge.merge(edited, with: ready, fallbackTitle: "Из очереди")
+        check("dirty title переживает обновление манифеста", m2.title == "Моё название")
+        check("…а pristine author всё равно обновился", m2.author == "Лев Толстой")
+
+        var editedP = seeded
+        editedP.params.bitrate = 64
+        editedP.touched.insert(.params)
+        let readyHi = d17Manifest(phase: "ready", token: "bt", title: "T", author: "A",
+                                  params: BookParams(bitrate: 256, channels: "mono",
+                                                     samplerate: 48000, split: true))
+        let m3 = ConfirmMerge.merge(editedP, with: readyHi)
+        check("dirty params переживают манифест ЦЕЛИКОМ (одно решение — один флаг)",
+              m3.params.bitrate == 64 && !m3.params.split)
+        let m3p = ConfirmMerge.merge(seeded, with: readyHi)
+        check("pristine params ← манифест", m3p.params.bitrate == 256 && m3p.params.split)
+
+        let preset = ParamsPreset(params: BookParams(bitrate: 96, channels: "mono",
+                                                     samplerate: nil, split: false),
+                                  bookIDs: ["book1"])
+        check("pristine params ← пресет «ко всем», если он покрывает книгу",
+              ConfirmMerge.merge(seeded, with: readyHi, preset: preset).params.bitrate == 96)
+        let presetOther = ParamsPreset(params: preset.params, bookIDs: ["другая"])
+        check("пресет чужой книги игнорируется",
+              ConfirmMerge.merge(seeded, with: readyHi,
+                                 preset: presetOther).params.bitrate == 256)
+
+        let wild = d17Manifest(phase: "ready", token: "b", title: "T", author: "A",
+                               params: BookParams(bitrate: 192, channels: "stereo",
+                                                  samplerate: nil, split: true,
+                                                  splitThresholdMB: 9000))
+        check("порог нарезки зажат в 250…700 при посеве",
+              ConfirmMerge.seed(manifest: wild).params.splitThresholdMB
+                  == ConfirmMerge.thresholdRangeMB.upperBound)
+        var wildDirty = seeded
+        wildDirty.params.splitThresholdMB = 9000
+        wildDirty.touched.insert(.params)
+        check("правило 3: порог зажимается на КАЖДОМ merge, не только при посеве",
+              ConfirmMerge.merge(wildDirty, with: ready).params.splitThresholdMB
+                  == ConfirmMerge.thresholdRangeMB.upperBound)
+
+        // Правило 2: выбор обложки не имеет права зависнуть.
+        var pickedGen = ConfirmMerge.merge(seeded, with: ready)
+        pickedGen.coverSelectedID = "gen-0"
+        pickedGen.touched.insert(.cover)
+        check("dirty cover переживает обновление манифеста",
+              ConfirmMerge.merge(pickedGen, with: ready).coverSelectedID == "gen-0")
+        let regenerated = d17Manifest(
+            phase: "ready", token: "bt-2", title: "Война и мир", author: "Лев Толстой",
+            options: [CoverOption(optID: "web-7", kind: "web", path: "/w.jpg", label: "w")],
+            selected: "web-7")
+        let m7 = ConfirmMerge.merge(pickedGen, with: regenerated)
+        check("исчезнувший выбор обложки не зависает → дефолт агента",
+              m7.coverSelectedID == "web-7")
+        check("…и флаг .cover снят, поле снова живое", !m7.touched.contains(.cover))
+
+        var pickedCustom = pickedGen
+        pickedCustom.coverSelectedID = "custom-0"
+        let m8 = ConfirmMerge.merge(pickedCustom, with: ready, extraCoverIDs: ["custom-0"])
+        check("custom-обложка переживает манифест (её знает только клиент)",
+              m8.coverSelectedID == "custom-0" && m8.touched.contains(.cover))
+        check("…но без объявленного extraCoverIDs она считается протухшей",
+              ConfirmMerge.merge(pickedCustom, with: ready).coverSelectedID == "emb-0")
+
+        // Правило 1: смена source_rev при ТОЙ ЖЕ книге — обычная матрица.
+        // Решение человека 2026-07-28: набранный им текст не должен исчезать из-за
+        // фонового события (в папку доехал ещё один файл).
+        var dirtyAll = seeded
+        dirtyAll.title = "Моё"
+        dirtyAll.author = "Мой"
+        dirtyAll.touched = [.title, .author]
+        let newRev = d17Manifest(phase: "skeleton", token: "", title: "Новое", author: "Новый",
+                                 rev: "rev-ZZZZZZZZZZZZZZZZZZZZ")
+        let m10 = ConfirmMerge.merge(dirtyAll, with: newRev)
+        check("смена source_rev: правка человека ПЕРЕЖИВАЕТ (title)", m10.title == "Моё")
+        check("смена source_rev: правка человека ПЕРЕЖИВАЕТ (author)", m10.author == "Мой")
+        check("смена source_rev: флаги touched сохранены", m10.touched == [.title, .author])
+        check("смена source_rev: черновик записал НОВУЮ ревизию",
+              m10.sourceRev == newRev.sourceRev)
+        var halfDirty = seeded
+        halfDirty.title = "Моё"
+        halfDirty.touched = [.title]
+        let m10b = ConfirmMerge.merge(halfDirty, with: newRev)
+        check("смена source_rev: pristine поле всё же обновилось из нового манифеста",
+              m10b.author == "Новый" && m10b.title == "Моё")
+
+        var dirtyCover = ConfirmMerge.merge(seeded, with: ready)
+        dirtyCover.coverSelectedID = "gen-0"
+        dirtyCover.touched.insert(.cover)
+        let newRevReady = d17Manifest(
+            phase: "ready", token: "bt-9", title: "Новое", author: "Новый",
+            rev: "rev-ZZZZZZZZZZZZZZZZZZZZ",
+            options: [CoverOption(optID: "emb-9", kind: "embedded", path: "/n.jpg", label: "n")],
+            selected: "emb-9")
+        let m10c = ConfirmMerge.merge(dirtyCover, with: newRevReady)
+        check("смена source_rev: протухший выбор обложки НЕ зависает",
+              m10c.coverSelectedID == "emb-9" && !m10c.touched.contains(.cover))
+        let presetSameBook = ParamsPreset(params: BookParams(bitrate: 96, channels: "mono",
+                                                             samplerate: nil, split: false),
+                                          bookIDs: ["book1"])
+        check("смена source_rev: пресет привязан к book_id и остаётся применим",
+              ConfirmMerge.merge(seeded, with: newRevReady,
+                                 preset: presetSameBook).params.bitrate == 96)
+        var dirtyParams = seeded
+        dirtyParams.params.bitrate = 64
+        dirtyParams.touched.insert(.params)
+        check("смена source_rev: правка параметров переживает и пресет её не перебивает",
+              ConfirmMerge.merge(dirtyParams, with: newRevReady,
+                                 preset: presetSameBook).params.bitrate == 64)
+
+        // Единственный полный сброс — другая книга.
+        let otherBook = d17Manifest(phase: "ready", token: "t", title: "Другая", author: "X",
+                                    bid: "book2")
+        let m11 = ConfirmMerge.merge(dirtyAll, with: otherBook)
+        check("смена book_id → черновик пересеян целиком (единственный полный сброс)",
+              m11.title == "Другая" && m11.bookID == "book2" && m11.touched == [])
+        let a = ConfirmMerge.merge(seeded, with: ready)
+        check("merge идемпотентен (повторное применение того же манифеста — no-op)",
+              ConfirmMerge.merge(a, with: ready) == a)
+    }
+
+    /// РЁБРА ПОДЪЁМА ОКНА (I2). Ключ приложения обязан совпадать с ключом агента —
+    /// иначе два канала отвечают на «это новое?» РАЗНЫМИ функциями и окно встаёт
+    /// дважды: один раз от агентского нуджа по скелету, второй — от собственного
+    /// rising-edge приложения, когда манифест перевернулся в ready.
+    static func checkNudgeEdgeKeys() {
+        let skel = d17Manifest(phase: "skeleton", token: "", title: "01 Файл", author: "Папка")
+        let ready = d17Manifest(phase: "ready", token: "bt-1", title: "Война и мир",
+                                author: "Лев Толстой")
+
+        func edgeState(_ rows: [BookSummary], groups: [PendingGroup] = []) -> ShowcaseState {
+            var s = ShowcaseState.empty
+            s.books = rows
+            s.pendingGroups = groups
+            return s
+        }
+        let st = edgeState([BookSummary(bookID: "book1", title: "Война и мир",
+                                        status: "pending-confirm")])
+
+        let kSkeleton = NudgeEdge.keys(state: st) { _ in skel }
+        let kReady = NudgeEdge.keys(state: st) { _ in ready }
+        check("I2: скелет → ready даёт ТОТ ЖЕ ключ ребра (второго подъёма окна нет)",
+              kSkeleton == kReady, "\(kSkeleton) vs \(kReady)")
+        check("I2: …и он непустой (иначе равенство было бы пустым)", !kSkeleton.isEmpty)
+        check("I2: после скелета новых рёбер не появляется",
+              kReady.subtracting(kSkeleton).isEmpty)
+
+        // reconvert чеканит свежий confirm_token ⇒ ЗАКОННО новое ребро.
+        let reconverted = BookManifest(
+            bookID: "book1", srcDir: "/src", status: "pending-confirm",
+            sourceRev: skel.sourceRev, confirmToken: "tok-НОВЫЙ", title: "T", author: "A",
+            chapters: [], totalDurationMS: 0, coverState: "none", coverPreview: nil,
+            params: .defaults, phase: "ready", buildToken: "bt")
+        check("«Собрать заново» (новый confirm_token) → новое ребро, один законный подъём",
+              !NudgeEdge.keys(state: st) { _ in reconverted }.subtracting(kReady).isEmpty)
+
+        check("книга в сборке ребром не считается",
+              NudgeEdge.keys(state: edgeState([BookSummary(bookID: "book1", title: "T",
+                                                           status: "converting")]))
+                  { _ in ready }.isEmpty)
+        check("нечитаемый манифест → ребро всё равно есть (иначе подъём на каждом обновлении)",
+              NudgeEdge.keys(state: st) { _ in nil } == ["book:book1::"])
+
+        let g = PendingGroup(groupID: "g1", rev: "r1", token: "t1", files: ["a.mp3"],
+                             count: 1, totalDurationMS: 0)
+        let kg = NudgeEdge.keys(state: edgeState([], groups: [g])) { _ in nil }
+        check("группировочный запрос даёт своё ребро", kg == ["group:g1:r1:t1"])
+        check("книжные и групповые рёбра различимы",
+              NudgeEdge.containsGroup(kg) && !NudgeEdge.containsBook(kg))
+    }
+
+    // MARK: - Сторожа по исходнику (значением не проверяются)
+
+    /// Питоновский исходник без комментариев и докстрингов.
+    ///
+    /// Нужен именно для зеркала ключей: докстринг `_book_edge_key` СОДЕРЖИТ
+    /// образец `book:<id>:<rev[:16]>:<token[:16]>`, и наивный разбор насчитывает
+    /// в теле четыре среза вместо двух. Разбирать надо код, а не заметку о коде.
+    static func pyStripped(_ source: String) -> String {
+        var out: [String] = []
+        var inDoc = false
+        for line in source.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let quotes = occurrences(of: "\"\"\"", in: line)
+            if inDoc {
+                if quotes % 2 == 1 { inDoc = false }
+                continue
+            }
+            if trimmed.hasPrefix("#") { continue }
+            if quotes % 2 == 1 { inDoc = true; continue }
+            if quotes >= 2 && trimmed.hasPrefix("\"\"\"") { continue }
+            out.append(line)
+        }
+        return out.joined(separator: "\n")
+    }
+
+    /// Тело функции Python верхнего уровня: от `def <name>(` до следующего
+    /// объявления нулевого отступа. Не парсер — и не претендует; промах якоря
+    /// отдаётся пустой строкой, то есть красным у вызывающего.
+    static func pyFunctionBody(_ decl: String, in code: String) -> String {
+        guard let start = code.range(of: decl) else { return "" }
+        let tail = code[start.lowerBound...]
+        let stops = [tail.range(of: "\ndef "), tail.range(of: "\nclass ")].compactMap { $0 }
+        guard let end = stops.min(by: { $0.lowerBound < $1.lowerBound }) else {
+            return String(tail)
+        }
+        return String(tail[..<end.lowerBound])
+    }
+
+    /// Все длины срезов `[:N]` в порядке появления.
+    static func pySliceLengths(in body: String) -> [Int] {
+        var out: [Int] = []
+        var rest = Substring(body)
+        while let r = rest.range(of: "[:") {
+            let after = rest[r.upperBound...]
+            let digits = after.prefix(while: { $0.isNumber })
+            if !digits.isEmpty, after.dropFirst(digits.count).first == "]",
+               let n = Int(digits) {
+                out.append(n)
+            }
+            rest = after
+        }
+        return out
+    }
+
+    /// Содержимое f-строки из `return f"…"`.
+    static func pyReturnTemplate(in body: String) -> String {
+        guard let r = body.range(of: "return f\"") else { return "" }
+        let tail = body[r.upperBound...]
+        guard let end = tail.firstIndex(of: "\"") else { return "" }
+        return String(tail[..<end])
+    }
+
+    /// Пути вида `<root>.a.b`, которым в теле ПРИСВАИВАЮТ (чтения не считаются).
+    ///
+    /// Отличать чтение от записи обязательно: `draft.params.bitrate` встречается в
+    /// хосте десяток раз как чтение, и запрет «слова draft.params» покраснел бы на
+    /// исправном коде — сторож, который приходится ослаблять, чтобы он не мешал,
+    /// перестаёт быть сторожем.
+    static func assignedPaths(of root: String, in body: String) -> [String] {
+        var found: [String] = []
+        for part in body.components(separatedBy: root + ".").dropFirst() {
+            let path = part.prefix(while: { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." })
+            let rest = part.dropFirst(path.count).drop(while: { $0 == " " })
+            if rest.first == "=" && rest.dropFirst().first != "=" {
+                found.append(String(path))
+            }
+        }
+        return found
+    }
+
+    /// Тело члена: однострочное вычисляемое свойство отдаётся СВОЕЙ строкой.
+    ///
+    /// `bodyOfFunction` ищет закрывающую `}` на отступе объявления, а у
+    /// `var isBuildReady: Bool { !buildToken.isEmpty }` такой строки нет — он
+    /// проглатывал следующий член вместе с его комментарием, и отрицательное
+    /// утверждение краснело на исправном коде (поймано первым же прогоном).
+    static func memberBody(_ decl: String, in code: String) -> String {
+        let lines = code.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let i = lines.firstIndex(where: { $0.contains(decl) }) else { return "" }
+        let line = lines[i]
+        if line.contains("{") && line.trimmingCharacters(in: .whitespaces).hasSuffix("}") {
+            return line
+        }
+        return bodyOfFunction(decl, in: code)
+    }
+
+    static func fill(_ template: String, _ values: [String: String]) -> String {
+        var out = template
+        for (k, v) in values { out = out.replacingOccurrences(of: "{\(k)}", with: v) }
+        return out
+    }
+
+    /// ЗЕРКАЛО КЛЮЧЕЙ: формы `NudgeEdge` против ЖИВОГО `agent/scan.py`.
+    ///
+    /// До сегодняшнего дня побайтовое совпадение двух реализаций держалось
+    /// КОММЕНТАРИЕМ («deliberate, byte-for-byte mirror»). На нём стоит инвариант I2:
+    /// разъедутся молча — и вернётся второй подъём окна, причём ни одна проверка
+    /// значением этого не заметит, потому что каждая сторона внутренне согласована.
+    ///
+    /// Поэтому ожидание не зашито здесь литералом, а ВЫВОДИТСЯ из питоновского
+    /// исходника: шаблон берётся из `return f"…"`, длины отсечения — из срезов
+    /// `[:N]` того же тела. Меняется питон — меняется ожидание, и Swift обязан
+    /// поменяться следом (или покраснеть). Меняется Swift — краснеет сразу.
+    static func checkNudgeEdgeMirror() {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let scanPy = pyStripped(
+            (try? String(contentsOf: repo.appendingPathComponent("agent/scan.py"),
+                         encoding: .utf8)) ?? "")
+        check("зеркало: agent/scan.py прочитан", !scanPy.isEmpty)
+
+        let bookBody = pyFunctionBody("def _book_edge_key(", in: scanPy)
+        let groupBody = pyFunctionBody("def _group_edge_key(", in: scanPy)
+        check("зеркало: тела _book_edge_key / _group_edge_key найдены",
+              !bookBody.isEmpty && !groupBody.isEmpty)
+
+        let bookTpl = pyReturnTemplate(in: bookBody)
+        let bookCuts = pySliceLengths(in: bookBody)
+        check("зеркало: книжный шаблон разобран (3 подстановки + 2 отсечения)",
+              bookTpl.contains("{bid}") && bookTpl.contains("{rev}")
+                  && bookTpl.contains("{token}") && bookCuts.count == 2,
+              "tpl=\(bookTpl) cuts=\(bookCuts)")
+        if bookCuts.count == 2 {
+            let rev = "0123456789abcdefXXXXXXXX"
+            let token = "fedcba9876543210YYYYYYYY"
+            let expected = fill(bookTpl, ["bid": "abc",
+                                          "rev": String(rev.prefix(bookCuts[0])),
+                                          "token": String(token.prefix(bookCuts[1]))])
+            check("зеркало: в ожидании не осталось неподставленных мест",
+                  !expected.contains("{") && !expected.contains("}"), expected)
+            check("книжный ключ приложения = agent/scan.py::_book_edge_key (побайтово)",
+                  NudgeEdge.bookKey(bookID: "abc", sourceRev: rev, confirmToken: token)
+                      == expected,
+                  "swift=\(NudgeEdge.bookKey(bookID: "abc", sourceRev: rev, confirmToken: token)) "
+                      + "python=\(expected)")
+            check("зеркало: отсечение действительно РЕЖЕТ (фикстура длиннее лимита)",
+                  rev.count > bookCuts[0] && token.count > bookCuts[1])
+        }
+
+        let groupTpl = pyReturnTemplate(in: groupBody)
+        let groupCuts = pySliceLengths(in: groupBody)
+        check("зеркало: групповой шаблон разобран",
+              groupTpl.contains("{gid}") && groupTpl.contains("{rev}")
+                  && groupTpl.contains("{token}") && groupCuts.count == 2,
+              "tpl=\(groupTpl) cuts=\(groupCuts)")
+        if groupCuts.count == 2 {
+            let rev = "rev0123456789abcdefZZ"
+            let token = "tok0123456789abcdefZZ"
+            let expected = fill(groupTpl, ["gid": "g1",
+                                           "rev": String(rev.prefix(groupCuts[0])),
+                                           "token": String(token.prefix(groupCuts[1]))])
+            check("групповой ключ приложения = agent/scan.py::_group_edge_key (побайтово)",
+                  NudgeEdge.groupKey(groupID: "g1", rev: rev, token: token) == expected,
+                  "swift=\(NudgeEdge.groupKey(groupID: "g1", rev: rev, token: token)) "
+                      + "python=\(expected)")
+        }
+    }
+
+    /// ЧЕРНОВИК ПИШЕТСЯ ТОЛЬКО ЧЕРЕЗ `edit(...)` И ОДНО `.onChange`.
+    ///
+    /// Без этого сторожа любое `draft.title = …`, дописанное завтра мимо правила,
+    /// пройдёт зелёным: все проверки `ConfirmMerge` выше останутся безупречными —
+    /// чистая функция-то не изменится, её просто перестанут спрашивать. Ровно этот
+    /// разрыв («правило идеально, а хост его обходит») и есть то, ради чего в этом
+    /// файле вообще есть сторожа по исходнику.
+    static func checkConfirmDraftWiring() {
+        let appDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let raw = (try? String(contentsOf: appDir.appendingPathComponent("main.swift"),
+                               encoding: .utf8)) ?? ""
+        check("черновик: исходник хоста прочитан", !raw.isEmpty)
+        let view = bodyOfFunction("private struct ConfirmView: View", in: strippedCode(raw))
+        check("черновик: тело ConfirmView найдено (промах якоря = красное)", !view.isEmpty)
+
+        check("черновик: посев идёт той же чистой функцией (ConfirmMerge.seed в init)",
+              occurrences(of: "_draft = State(initialValue: ConfirmMerge.seed(", in: view) == 1)
+        check("черновик: ЕДИНСТВЕННОЕ присваивание draft — результат ConfirmMerge.merge",
+              occurrences(of: "draft = ConfirmMerge.merge(", in: view) == 1
+                  && occurrences(of: "draft = ", in: view)
+                      == occurrences(of: "draft = ConfirmMerge.merge(", in: view)
+                          + occurrences(of: "_draft = State(", in: view),
+              "всего присваиваний \(occurrences(of: "draft = ", in: view))")
+        let onChange = slice(from: ".onChange(of: manifest)", upTo: "\n        .", in: view)
+        check("черновик: слияние живёт РОВНО в одном .onChange(of: manifest)",
+              occurrences(of: ".onChange(of: manifest)", in: view) == 1
+                  && onChange.contains("draft = ConfirmMerge.merge(draft, with: newManifest"))
+        check("черновик: правки полей идут через ОДНУ функцию edit(...) с флагом",
+              occurrences(of: "private func edit<T: Equatable>(", in: view) == 1)
+        let editBody = bodyOfFunction("private func edit<T: Equatable>(", in: strippedCode(raw))
+        check("черновик: только edit(...) пишет по keyPath и ставит флаг touched",
+              occurrences(of: "draft[keyPath: path] = new", in: editBody) == 1
+                  && occurrences(of: "draft.touched.insert(", in: editBody) == 1
+                  && occurrences(of: "draft[keyPath:", in: view)
+                      == occurrences(of: "draft[keyPath:", in: editBody)
+                  && occurrences(of: "draft.touched.insert(", in: view) == 1)
+        check("черновик: edit(...) ставит флаг только на НАСТОЯЩЕЕ изменение",
+              editBody.contains("guard draft[keyPath: path] != new else { return }"))
+
+        // Ни одного присваивания ПОЛЮ черновика в обход правила — ни верхнему
+        // (`draft.title = …`), ни вложенному (`draft.params.bitrate = …`). Это тот
+        // самый способ, которым дрейф возвращается: чистая функция остаётся
+        // безупречной, её просто перестают спрашивать.
+        let stray = assignedPaths(of: "draft", in: view)
+        check("черновик: ни одного присваивания полю в обход правила",
+              stray.isEmpty, stray.isEmpty ? "" : "найдено: \(stray.joined(separator: ", "))")
+        // Мета: детектор действительно ловит запись и не считает чтение записью —
+        // иначе «ничего не найдено» означало бы сломанный парсер, а не чистый код.
+        let fixture = [
+            "draft.title = x",
+            "let y = draft.params.bitrate",
+            "if draft.author == z { }",
+            "draft.touched.insert(.cover)",
+            "draft.params.split = true",
+        ].joined(separator: "\n")
+        let detected = assignedPaths(of: "draft", in: fixture)
+        check("черновик: детектор присваиваний проверен на фикстуре "
+              + "(ловит запись, не считает записью чтение и вызов)",
+              detected == ["title", "params.split"], "\(detected)")
+    }
+
+    /// ГРАНИЦА M-B: `cover_web` не смеет попасть в решение о сборке.
+    ///
+    /// Замерено: живая сеть против мёртвой = 0.022 с на активной кнопке. Веб-нога
+    /// ушла с критического пути на стороне агента; если ярлык «ищем обложку»
+    /// протянут в `buildDisabled` или в `ConfirmPreparation`, вся эта работа
+    /// обнуляется — кнопка снова ждёт сеть, и ни одна проверка ЗНАЧЕНИЕМ этого не
+    /// увидит: манифест-фикстура с `cover_web=pending` просто станет несобираемой
+    /// «по делу». Поэтому — по исходнику, по ТЕЛАМ, а не по файлу.
+    static func checkCoverWebNotAGate() {
+        let appDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let host = strippedCode((try? String(contentsOf: appDir.appendingPathComponent("main.swift"),
+                                             encoding: .utf8)) ?? "")
+        let model = strippedCode((try? String(
+            contentsOf: appDir.appendingPathComponent("StateModel.swift"),
+            encoding: .utf8)) ?? "")
+        check("граница: оба исходника прочитаны", !host.isEmpty && !model.isEmpty)
+
+        let gate = memberBody("private var buildDisabled: Bool", in: host)
+        let hint = memberBody("private var buildDisabledHint: String", in: host)
+        let ready = memberBody("var isBuildReady: Bool", in: model)
+        let prep = memberBody("static func forManifest(", in: model)
+        let note = memberBody("private var coverWebNote: some View", in: host)
+        check("граница: все четыре тела найдены (промах якоря = красное)",
+              !gate.isEmpty && !hint.isEmpty && !ready.isEmpty && !prep.isEmpty)
+
+        // Положительные якоря: тела действительно те, иначе отрицания ниже пусты.
+        check("граница: гейт «Собрать» опирается на isBuildReady",
+              gate.contains("manifest.isBuildReady"))
+        check("граница: isBuildReady читает НАЛИЧИЕ build_token",
+              ready.contains("buildToken.isEmpty"))
+        check("граница: подготовка решает по build_token и фазе",
+              prep.contains("buildToken") || prep.contains("isBuildReady")
+                  || prep.contains("phaseValue"))
+
+        for (label, body) in [("гейт «Собрать»", gate), ("подсказка гейта", hint),
+                              ("isBuildReady", ready), ("ConfirmPreparation", prep)] {
+            check("граница: \(label) слеп к cover_web",
+                  !body.contains("coverWeb") && !body.contains("isCoverWebPending")
+                      && !body.contains("cover_web"))
+        }
+        // …и ярлык при этом ЖИВ — иначе отрицания выше зеленели бы от того, что
+        // поля просто нет в приложении.
+        check("граница: ярлык «ищем обложку» существует и висит на isCoverWebPending",
+              !note.isEmpty && note.contains("manifest.isCoverWebPending"))
+        check("граница: isCoverWebPending спрашивают ровно в одном месте — в ярлыке",
+              occurrences(of: "isCoverWebPending", in: host)
+                  == occurrences(of: "isCoverWebPending", in: note),
+              "в хосте \(occurrences(of: "isCoverWebPending", in: host)), "
+                  + "в ярлыке \(occurrences(of: "isCoverWebPending", in: note))")
+    }
+
     // MARK: checks
 
     static func main() {
@@ -1124,6 +2342,19 @@ struct RoutingSelfCheck {
               onlyDone.presentedBook(selectedID: nil) == nil)
 
         checkWindowGeometry()
+        // «Окно создано» ≠ «человек его видит»: the escalation ladder (.patches/006).
+        checkWindowPresentation()
+
+        // D17 «ранний нудж» (M-D, сторона приложения): фазы и гейт сборки, ярлык
+        // cover_web, чистое слияние черновика, рёбра подъёма окна — и три сторожа
+        // по исходнику на то, что чистые правила действительно СПРАШИВАЮТ.
+        checkManifestPhaseGate()
+        checkCoverWebIsALabel()
+        checkConfirmMerge()
+        checkNudgeEdgeKeys()
+        checkNudgeEdgeMirror()
+        checkConfirmDraftWiring()
+        checkCoverWebNotAGate()
 
         // M5 — the install-truth gate and everything hanging off it.
         checkAccessGate()

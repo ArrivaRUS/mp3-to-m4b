@@ -398,6 +398,45 @@ def run() -> int:
     check("guard: «Пропустить» с несуществующим book_id — отказ, без падения",
           bool(bogus) and not list(config.commands_dir().glob("*.json")))
 
+    # === H. D17: пропустить можно и НЕДОЗАПОЛНЕННУЮ книгу ====================
+    # Ранний нудж поднимает окно на СКЕЛЕТЕ — значит человек может нажать
+    # «Пропустить» раньше, чем агент дочитал теги. Пропущенный скелет обязан быть
+    # ровно так же инертен, как пропущенная готовая книга: агент не достраивает
+    # его следующим тиком (иначе статус переписался бы обратно), не поднимает окно
+    # и — что важнее всего — НЕ выдаёт ему build_token. Токен на снятой с конвейера
+    # книге был бы заряженным ружьём: «Вернуть» идёт через reconvert со свежим
+    # токеном, а старый обязан остаться невыданным.
+    book_e = watch / "Пропуск - Книга Д"
+    _make_book(book_e, chapters=2, album="Книга Д")
+    os.environ["MP3TOM4B_HALT_AFTER_PHASE"] = "skeleton"
+    scan.run_scan()
+    os.environ.pop("MP3TOM4B_HALT_AFTER_PHASE")
+    man_e = _manifest_for(config, state, "Пропуск - Книга Д")
+    check("D17: книга поднялась СКЕЛЕТОМ (окно уже открыто, теги ещё читаются)",
+          isinstance(man_e, dict) and scan.manifest_phase(man_e) == "skeleton"
+          and not scan.manifest_build_token(man_e),
+          f"phase={scan.manifest_phase(man_e or {})}")
+    _drop_command(config.commands_dir(), _skip_cmd(man_e["book_id"]))
+    dispatcher.drain_commands()
+    path_e = config.books_dir() / f"{man_e['book_id']}.json"
+    check("D17: «Пропустить» принимается и для скелета",
+          state.read_json(path_e).get("status") == "skipped",
+          f"status={state.read_json(path_e).get('status')}")
+    raises_before = _nudge_count(nudge_log)
+    scan.run_scan()
+    after_e = state.read_json(path_e)
+    check("D17: скан НЕ достраивает пропущенный скелет (статус не переписан)",
+          after_e.get("status") == "skipped"
+          and scan.manifest_phase(after_e) == "skeleton",
+          f"status={after_e.get('status')} phase={scan.manifest_phase(after_e)}")
+    check("D17: пропущенному скелету НЕ выдан build_token",
+          not scan.manifest_build_token(after_e))
+    check("D17: и окно из-за него не поднималось",
+          _nudge_count(nudge_log) == raises_before,
+          f"{raises_before} → {_nudge_count(nudge_log)}")
+    check("D17: исходники пропущенной книги целы",
+          _mp3s_intact(book_e, 2))
+
     return _finish(root)
 
 

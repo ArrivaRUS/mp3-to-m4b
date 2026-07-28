@@ -40,8 +40,10 @@ now proves the whole M1 contract (arch/plan-binrunner-mp3-v2.md §7.1):
   latch           the test overrides (SUPPORT_DIR / LABEL / LAUNCHAGENTS_DIR) are
                   refused unless the test latch is armed — one forgotten env var
                   must never rewrite the production agent (neighbor .patches/015)
-  blast_radius    the suite itself left the LIVE system untouched: no throwaway job
-                  loaded, no real App Support tree, no real log, no real plist
+  blast_radius    the suite itself left the LIVE system untouched — verdict by the
+                  SHARED guard (``agent/selfcheck_blast_radius.py``), so a real
+                  300 s launchd tick is attributed to the user's agent instead of
+                  being read as damage, while anything unattributable stays red
 
 NEGATIVE CONTROLS. Every load-bearing guard is also proven to be LOAD-BEARING: the
 suite builds a MUTANT installer with that guard's line(s) deleted (they carry a
@@ -75,6 +77,11 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+
+# The production guard lives in ONE place for every suite (.patches/005 rule 2):
+# it is what the runner takes around each suite, and it is the only code that
+# knows how to tell a live 300 s launchd tick from a self-check's leak.
+from . import selfcheck_blast_radius as blast_radius
 
 # --- tiny assertion harness (same shape as the sibling self-checks) ----------
 
@@ -1084,28 +1091,16 @@ def scenario_downgrade(root: Path) -> None:
           proc4.returncode == 0, f"rc={proc4.returncode}; {_tail(proc4)}")
 
 
-SELFCHECK_LABEL_PREFIX = "com.arrivarus.mp3tom4b.selfcheck"
-REAL_SUPPORT = Path.home() / "Library" / "Application Support" / "mp3-to-m4b"
-REAL_LOG = Path.home() / "Library" / "Logs" / "mp3-to-m4b.log"
-REAL_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.arrivarus.mp3tom4b.agent.plist"
-
-
-def _loaded_selfcheck_jobs() -> list[str]:
-    """Labels of OUR throwaway jobs that are actually loaded in the user's gui domain."""
-    proc = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-    return [ln.split("\t")[-1].strip() for ln in (proc.stdout or "").splitlines()
-            if SELFCHECK_LABEL_PREFIX in ln]
-
-
 def _blast_radius_snapshot() -> dict:
-    def stamp(p: Path):
-        return (p.exists(), p.stat().st_mtime_ns if p.exists() else 0)
-    return {
-        "support": stamp(REAL_SUPPORT),
-        "log": stamp(REAL_LOG),
-        "plist": stamp(REAL_PLIST),
-        "jobs": sorted(_loaded_selfcheck_jobs()),
-    }
+    """The production snapshot, taken by the SHARED guard.
+
+    Deliberately not a private stat() of a few paths: this suite used to compare
+    the live log's mtime verbatim, which turned a 300 s launchd tick into a random
+    red check (~7 % per run — the suite runs ~21 s inside a 300 s tick window).
+    :mod:`agent.selfcheck_blast_radius` is where that problem is already solved,
+    and it is the same snapshot the runner takes around every suite.
+    """
+    return blast_radius.snapshot()
 
 
 def scenario_blast_radius(before: dict) -> None:
@@ -1114,22 +1109,31 @@ def scenario_blast_radius(before: dict) -> None:
     Not a nicety: a negative control once bootstrapped a real launchd job under a
     throwaway label, which started the real agent against the real App Support
     tree. That class of accident is now a red check instead of a surprise.
+
+    The verdict comes from :func:`agent.selfcheck_blast_radius.diff`, so it is
+    ATTRIBUTED rather than verbatim: the user's own agent ticking every 300 s is
+    accounted for by the ``mp3-to-m4b agent alive`` banner launchd writes to
+    ``StandardOutPath``, which a self-check child can never produce (its stdout
+    goes into the runner's pipe). Everything structural — a plist, the helper
+    bytes, the receipt, the set of loaded jobs — stays byte-for-byte strict, and
+    anything the guard cannot ATTRIBUTE to a real agent run is still red. This is
+    fail-closed: "could not prove somebody else wrote it" fails the suite.
     """
     after = _blast_radius_snapshot()
-    stray = [j for j in after["jobs"] if j not in before["jobs"]]
+    # Suite-specific hygiene: this is the suite that can bootstrap a throwaway
+    # job, so it also unloads any it left behind — even while failing. The stray
+    # itself is reported by the shared diff below (jobs are a structural fact).
+    stray = [j for j in after["structural"]["jobs"]
+             if j not in before["structural"]["jobs"]]
     check("blast_radius: no throwaway job was loaded into the real launchd domain",
           not stray, f"stray jobs: {stray}")
     for job in stray:   # never leave one behind, even while failing
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{job}"],
                        capture_output=True)
-    check("blast_radius: the real App Support tree was not created/modified",
-          after["support"] == before["support"],
-          f"before={before['support']} after={after['support']}")
-    check("blast_radius: the real agent log was not created/modified",
-          after["log"] == before["log"], f"before={before['log']} after={after['log']}")
-    check("blast_radius: the real production plist was not created/modified",
-          after["plist"] == before["plist"],
-          f"before={before['plist']} after={after['plist']}")
+    damage = blast_radius.diff(before, after)
+    check("blast_radius: the user's live install is exactly as this suite found it "
+          "(attributed — a launchd tick is not damage, anything unattributable is)",
+          not damage, "; ".join(damage))
 
 
 def _sha256(path: Path) -> str:

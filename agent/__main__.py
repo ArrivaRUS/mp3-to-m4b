@@ -10,13 +10,20 @@ On launch the agent (M0.6 scope, plans.md):
      the ``state.json`` showcase (behind the M4 access gate — the scan refuses to
      touch the folder until the probe says it may);
   4. **drains** queued commands in ``queue/commands/`` → validate + real engine
-     (``confirm-build`` builds the book), then refreshes the showcase.
+     (``confirm-build`` builds the book), then refreshes the showcase;
+  5. **enriches** covers from the web (``scan.enrich_covers_web``) — the one pass
+     that may be slow, and the only one nobody is waiting for (D17/M-B).
 
 Recover-before-scan keeps an orphaned ``converting`` from being read as in-flight;
 scan-before-drain is deliberate: a freshly seen book must have its manifest (and
 ``confirm_token``/``source_rev``) on disk before a command that references it can
-validate. Then we exit — launchd re-launches on the next ``WatchPaths`` event
-(the watched folder OR ``queue/commands/``), so a run-once-and-exit shape fits.
+validate. Enrich-after-drain is the same kind of ordering claim, made about the
+network: the scan produces a buildable book from LOCAL data only, so the window,
+the «Собрать» button and the build itself take the same time on a dead network as
+on a live one, and the web lookup happens afterwards with the human already
+looking at the book. Then we exit — launchd re-launches on the next ``WatchPaths``
+event (the watched folder OR ``queue/commands/``), so a run-once-and-exit shape
+fits.
 
 Signals (M3, arch/plan-binrunner-mp3-v2.md §M3 · risk M4f · Codex MAJOR-9).
 ``launchctl bootout`` — which the installer runs on EVERY update — sends SIGTERM
@@ -271,6 +278,28 @@ def main(argv: list[str] | None = None) -> int:
             # command boundary, so those books keep pending-confirm and their
             # commands wait on disk for the next tick.
             return _stop_now("drain")
+
+    # 6. Cover WEB enrichment — LAST, and deliberately so (D17/M-B). The lookup
+    #    used to sit inside the scan, which put an active «Собрать» behind the
+    #    round-trip time of two image search engines: ~12 s on a dead network. It
+    #    now runs here, after everything the human is actually waiting for, and
+    #    only appends tiles to a cover strip that is already on screen.
+    #
+    #    Two placements matter and neither is incidental. It is AFTER the drain, so
+    #    a queued «Собрать» never waits on a cover search. And it is outside the
+    #    phase watchdog — disarmed back in step 4 — so a network timeout can no
+    #    longer be mistaken for a wedged folder and publish a false
+    #    ``folder_access=blocked`` card (synthesis I6). It never raises: an
+    #    enrichment failure must not change this run's exit code, which launchd and
+    #    the installer read as the truth about the tick.
+    if do_scan:
+        try:
+            enriched = scan.enrich_covers_web()
+        except Exception as exc:  # noqa: BLE001 — best-effort by contract
+            state.append_event("cover_web_pass_failed", error=repr(exc)[:200])
+        else:
+            if enriched:
+                print(f"  books enriched with web covers: {enriched}")
 
     return 0
 
